@@ -75,6 +75,43 @@ class OpenRouterProvider(Provider):
         return generate_json(self.store, prompt, model=model or self.model)
 
 
+class OpenAIProvider(Provider):
+    name = "openai"
+
+    def __init__(self, store):
+        super().__init__(store)
+        from ragapp.config import resolve_model
+        self.model = resolve_model(
+            store,
+            CHAT_MODEL,
+            DEFAULT_CHAT_MODEL,
+            provider=self.name,
+        )
+
+    def generate(
+        self,
+        contents,
+        system_instruction="",
+        function_declarations=None,
+        model=None,
+    ):
+        from ragapp.llm.tool_calling.openai import generate_step
+        return generate_step(
+            self.store,
+            contents,
+            system_instruction=system_instruction,
+            function_declarations=function_declarations,
+            model=model or self.model,
+        )
+
+    def generate_json(self, prompt, model=None):
+        from ragapp.llm.tool_calling.openai import generate_json
+        return generate_json(
+            self.store,
+            prompt,
+            model=model or self.model,
+        )
+
 def get_provider(store):
     name = (
         load_project_config(store)
@@ -87,7 +124,9 @@ def get_provider(store):
         return GeminiProvider(store)
     if name == "openrouter":
         return OpenRouterProvider(store)
-    if name in {"openai", "anthropic", "azure"}:
+    if name == "openai":
+        return OpenAIProvider(store)
+    if name in {"anthropic", "azure"}:
         raise ProviderError(
             f"{name} is configured but its adapter is not enabled in this installation."
         )

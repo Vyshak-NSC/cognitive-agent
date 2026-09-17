@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 CHAT_API_KEY=os.getenv('CHAT_API_KEY') or os.getenv('GEMINI_API_KEY')
-DEFAULT_CHAT_MODEL='liquid/lfm-2.5-2.6b:free'
+DEFAULT_CHAT_MODEL='gemini-3.5-flash-lite'
 
 CHAT_MODEL=os.getenv('CHAT_MODEL') or None
 JWT_SECRET=os.getenv('JWT_SECRET','change-me-in-production')

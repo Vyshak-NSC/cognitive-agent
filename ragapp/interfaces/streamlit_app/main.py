@@ -111,9 +111,9 @@ PROVIDERS = [
 ]
 
 DEFAULT_MODELS = {
-    "gemini": "gemini-3.5-flash",
-    "openrouter": "openrouter/free",
-    "openai": "",
+    "gemini": "gemini-3.5-flash-lite",
+    "openrouter": "liquid/lfm-2.5-2.6b:free",
+    "openai": "gpt-5.6-luna",
     "anthropic": "",
     "azure": "",
 }
@@ -2149,12 +2149,12 @@ if nav_section == "settings":
     if provider != old_provider:
         if provider == "openrouter":
             prov["model"] = (
-                "openrouter/free"
+                "liquid/lfm-2.5-2.6b:free"
             )
 
         elif provider == "gemini":
             prov["model"] = (
-                "gemini-3.5-flash"
+                "gemini-3.5-flash-lite"
             )
 
         else:

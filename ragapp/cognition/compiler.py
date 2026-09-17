@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import tempfile
+from pathlib import Path
 
 from google.genai import types
 
@@ -430,6 +433,59 @@ def _build_artifact_ids(store, files):
 
 
 def compile_project(
+    store: CognitionStore,
+    progress_callback=None,
+    selected_files=None,
+    reconcile_selected=True,
+):
+    """Compile project files with rollback for selective replacement.
+
+    Selective compilation replaces the source projection for the selected
+    files. A snapshot is taken before that replacement so an API, parsing, or
+    persistence failure cannot leave the project with its previous cognition
+    deleted. Full-project compilation keeps the existing behavior without the
+    extra snapshot.
+    """
+    if selected_files is not None:
+        selected_files = list(selected_files)
+
+    needs_rollback = (
+        reconcile_selected
+        and selected_files is not None
+        and any(area == "source" for area, _ in selected_files)
+    )
+
+    if not needs_rollback:
+        return _compile_project_impl(
+            store,
+            progress_callback=progress_callback,
+            selected_files=selected_files,
+            reconcile_selected=reconcile_selected,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="cognition-compile-") as tmp:
+        backup = Path(tmp) / "cognition"
+        # The SQLite metadata connection may be open on Windows, so snapshot
+        # only the authoritative file-backed cognition state. The SQLite index
+        # is derived from that state and is synchronized after rollback.
+        shutil.copytree(store.cognition, backup)
+
+        try:
+            return _compile_project_impl(
+                store,
+                progress_callback=progress_callback,
+                selected_files=selected_files,
+                reconcile_selected=reconcile_selected,
+            )
+        except Exception:
+            if store.cognition.exists():
+                shutil.rmtree(store.cognition)
+            shutil.copytree(backup, store.cognition)
+            sync_store(store)
+            raise
+
+
+def _compile_project_impl(
     store: CognitionStore,
     progress_callback=None,
     selected_files=None,

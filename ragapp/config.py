@@ -12,8 +12,8 @@ _ENV_KEYS = {
 }
 _DEFAULT_MODELS = {
     "gemini": "gemini-3.5-flash-lite",
-    "openrouter": "liquid/lfm-2.5-2.6b:free",
-    "openai": "",
+    "openrouter": "openrouter/free",
+    "openai": "gpt-5.6-luna",
     "anthropic": "",
     "azure": "",
 }
