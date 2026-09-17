@@ -43,109 +43,87 @@ from ragapp.config import resolve_model
 from ragapp.cognition.code_compiler import CodeCognitionCompiler
 from ragapp.cognition.code_parser import detect_language
 
-SCHEMA_PROMPT = """You are the one-time compiler for a persistent cognition system.
+SCHEMA_PROMPT = """You are the semantic compiler for a persistent cognition system.
 
 Read the supplied source material and compile durable structured knowledge.
-Do not write prose summaries as the primary representation.
+Return ONLY valid JSON. Do not write a prose summary as the primary representation.
 
-Return ONLY valid JSON with this shape:
+The cognition model has three separate layers:
+1. Entities: durable things and their state.
+2. Relationships: durable links between entities.
+3. Events: first-class narrative/domain occurrences that anchor change over time.
 
+JSON shape:
 {
-  "project_type": "string",
-
-  "instructions": "domain rules and user axioms, concise",
-
+  "project_type": "fiction|software|research|business|other",
+  "timeline": {
+    "label": "source-native chapter/section/version/date label or null",
+    "sequence": 1,
+    "story_time": "source-native story time or null"
+  },
+  "instructions": "durable domain rules/axioms, concise",
   "entities": {
     "stable_id": {
-      "type": "character|artifact|file|module|concept|location|rule|other",
+      "type": "character|artifact|file|module|function|class|location|concept|rule|ability|event|other",
       "name": "human-readable name",
       "tags": [],
-      "summary": "",
-      "attributes": {},
-      "provenance": "user_stated|source_derived|inferred",
-      "source_files": [
-        "exact/relative/path.py"
-      ]
+      "summary": "compact retrieval summary",
+      "attributes": {
+        "field": {
+          "value": "value",
+          "summary": "optional interpretation",
+          "timeline": "source-native temporal label or null",
+          "valid_from": "source-native temporal value or null",
+          "valid_to": "source-native temporal value or null",
+          "valid_from_event": "event id or null",
+          "valid_to_event": "event id or null",
+          "locator": "page/section/line or null"
+        }
+      },
+      "sections": {},
+      "events": [{"id": "event_id"}],
+      "source_files": ["exact/relative/path.ext"]
     }
   },
-
-  "ledger": {
-    "stable_id": {
-      "field": "current value"
-    }
-  },
-
-  "relationships": {
-    "stable_relationship_id": {
-      "type": "relationship|dependency|derivation",
-      "tags": [],
-      "source": "stable entity id",
-      "target": "stable entity id",
-      "state": "",
-      "provenance": "user_stated|source_derived|inferred",
-      "source_files": [
-        "exact/relative/path.py"
-      ]
-    }
-  },
-
+  "ledger": {},
+  "relationships": {},
   "events": [
     {
-      "event": "",
-      "entities": [],
+      "id": "stable_event_id",
+      "type": "event|decision|change|discovery|conflict|resolution|other",
+      "title": "short title",
+      "description": "what happened",
+      "entities": ["stable_id"],
+      "location": "location or null",
+      "narrative_position": {
+        "label": "Chapter 20 / section / version",
+        "sequence": 20,
+        "story_time": "source-native story time or null"
+      },
+      "sequence": 20,
+      "previous_events": ["event_id"],
+      "next_events": ["event_id"],
       "provenance": "source_derived",
-      "source_files": [
-        "exact/relative/path.py"
-      ]
+      "source_files": ["exact/relative/path.ext"],
+      "locator": "page/section/line or null"
     }
   ]
 }
 
 Rules:
-
-1. Create stable IDs that can be referenced later.
-
-2. Preserve explicit facts.
-
-3. Do not invent facts.
-
-4. If a KNOWN ENTITIES section is provided, reuse an existing stable_id
-   whenever the same entity appears again.
-
-5. Every entity MUST contain source_files.
-
-6. Every relationship MUST contain source_files.
-
-7. Every event MUST contain source_files.
-
-8. source_files MUST contain only files that directly support the
-   corresponding entity, relationship, or event.
-
-9. Do NOT assign an entity to every file in the current batch merely because
-   those files were supplied together.
-
-10. The supplied material contains headers such as:
-
-    --- SOURCE ARTIFACT: calculator.py ---
-
-    or:
-
-    --- SOURCE ARTIFACT: billing.py ---
-
-    Use those exact relative paths in source_files.
-
-11. If an entity is supported by calculator.py only, return:
-
-    "source_files": ["calculator.py"]
-
-12. If an entity is supported by billing.py and calculator.py, return:
-
-    "source_files": ["billing.py", "calculator.py"]
-
-13. Never invent a source_files path.
-
-14. Do not omit source_files. If you cannot determine the supporting file
-    from the supplied material, do not fabricate one.
+1. Events are FIRST-CLASS cognition objects. Create an event whenever the source describes a meaningful occurrence, state transition, decision, discovery, conflict, resolution, creation, destruction, arrival, departure, or other change that matters to later reasoning.
+2. Do NOT reconstruct events from entity attributes. The compiler must emit events directly in the events array.
+3. Every event must have a stable id. Reuse an existing event id from KNOWN EVENTS when the same event is encountered again.
+4. Entity state changes should reference the event that caused the change with valid_from_event/valid_to_event when the event is known. A state that begins at an event and remains valid should have valid_to_event=null.
+5. Use narrative_position/sequence for ordering. Use absolute dates only when the source provides them. Do not invent chronology.
+6. Keep source provenance exact. source_files must contain only files that directly support the record.
+7. The supplied material contains headers such as --- SOURCE ARTIFACT: calculator.py ---. Copy the exact relative path into source_files.
+8. If an entity is supported by calculator.py only, use ["calculator.py"]. If supported by multiple files, list those files. Never invent a path.
+9. If KNOWN ENTITIES or KNOWN EVENTS are supplied, reuse their ids instead of creating duplicates.
+10. Create separate entities for reusable concepts/artifacts/modules/classes/functions/locations/etc.; use relationships instead of duplicating shared information.
+11. Preserve all useful sections and interpreted content. Keep them concise but do not discard material merely because it is not an attribute.
+12. Do not omit source_files. If provenance cannot be determined, omit the record rather than fabricating provenance.
+13. Return empty arrays/objects where appropriate.
 
 Return ONLY JSON. No markdown. No explanation.
 """
@@ -810,6 +788,17 @@ def _compile_project_impl(
             for sid, e in entities.items()
             if isinstance(e, dict)
         }
+        known_events = [
+            {
+                "id": e.get("id"),
+                "type": e.get("type"),
+                "title": e.get("title"),
+                "description": e.get("description", ""),
+                "entities": e.get("entities", []),
+                "sequence": e.get("sequence"),
+            }
+            for e in store.events(limit=500)
+        ]
 
         prompt_parts = [
             SCHEMA_PROMPT,
@@ -822,6 +811,11 @@ def _compile_project_impl(
                     known_summary,
                     ensure_ascii=False,
                 )
+            )
+        if known_events:
+            prompt_parts.append(
+                "\nKNOWN EVENTS SO FAR (reuse ids when the same event recurs):\n"
+                + json.dumps(known_events, ensure_ascii=False)
             )
 
         prompt_parts.append(
@@ -910,6 +904,11 @@ def _compile_project_impl(
             instructions_text,
             data.get("instructions", ""),
         )
+        timeline = data.get("timeline") or {}
+        if not isinstance(timeline, dict):
+            timeline = {}
+        default_timeline = timeline.get("label") or timeline.get("story_time") or f"chunk {i}"
+        default_sequence = timeline.get("sequence")
 
         new_events = data.get(
             "events",
@@ -922,7 +921,70 @@ def _compile_project_impl(
             else []
         )
 
-        events.extend(new_events)
+        # Normalize every event before entity updates so attribute state can
+        # safely reference the canonical event id in this same batch.
+        normalized_events = []
+        seen_event_ids = set()
+        for raw_event in new_events:
+            if not isinstance(raw_event, dict):
+                continue
+            event = dict(raw_event)
+            description = str(event.get("description") or event.get("event") or "").strip()
+            if not description:
+                continue
+            if not event.get("id") and not event.get("event_id"):
+                event["id"] = f"event_{store._event_key(event)}"
+            event["id"] = str(event.get("id") or event.get("event_id"))
+            if event["id"] in seen_event_ids:
+                continue
+            seen_event_ids.add(event["id"])
+            normalized_events.append(event)
+
+        # Events nested under entities are also first-class events. Promote
+        # them into the canonical event collection instead of storing duplicate
+        # event bodies inside entity JSON.
+        chunk_entities = data.get("entities", {}) or {}
+        if isinstance(chunk_entities, dict):
+            for sid, entity_data in chunk_entities.items():
+                if not isinstance(entity_data, dict):
+                    continue
+                for raw_event in entity_data.get("events") or []:
+                    if not isinstance(raw_event, dict):
+                        continue
+                    event = dict(raw_event)
+                    event.setdefault("entities", [str(sid)])
+                    if not event.get("id") and not event.get("event_id"):
+                        event["id"] = f"event_{store._event_key(event)}"
+                    event["id"] = str(event.get("id") or event.get("event_id"))
+                    if event["id"] not in seen_event_ids:
+                        normalized_events.append(event)
+                        seen_event_ids.add(event["id"])
+
+        events.extend(normalized_events)
+
+        # Persist canonical events before entity state so valid_from_event /
+        # valid_to_event references can resolve immediately.
+        for event_index, event in enumerate(normalized_events, 1):
+            source_artifacts = _resolve_source_artifacts(
+                event.get("source_files", []),
+                artifact_ids,
+                batch_artifacts,
+            )
+            if not source_artifacts:
+                skipped_chunks.append({"chunk": i, "reason": "event_missing_source_provenance", "event_id": event.get("id")})
+                continue
+            position = event.get("narrative_position") if isinstance(event.get("narrative_position"), dict) else {}
+            position = dict(position)
+            position.setdefault("label", default_timeline if 'default_timeline' in locals() else f"chunk {i}")
+            position.setdefault("sequence", i * 1000 + event_index)
+            for source_artifact in source_artifacts:
+                store.add_event(
+                    event,
+                    timeline=position.get("label") or f"chunk {i}",
+                    source_artifact=source_artifact,
+                    sequence=position.get("sequence"),
+                    narrative_position=position,
+                )
 
         # --------------------------------------------------------------
         # ENTITIES
@@ -959,18 +1021,27 @@ def _compile_project_impl(
                 continue
 
             for source_artifact in source_artifacts:
+                entity_payload = {
+                    "id": sid,
+                    "type": e.get("type", "other"),
+                    "name": e.get("name", sid),
+                    "summary": e.get("summary", ""),
+                    "tags": e.get("tags", []),
+                    "attributes": e.get("attributes", {}),
+                    "sections": e.get("sections", {}),
+                    "relationships": e.get("relationships", []),
+                    "events": [
+                        {"id": str(ev.get("id") or ev.get("event_id"))}
+                        for ev in (e.get("events") or [])
+                        if isinstance(ev, dict) and (ev.get("id") or ev.get("event_id"))
+                    ],
+                }
                 store.upsert_entity_update(
-                    {
-                        "id": sid,
-                        "type": e.get("type", "other"),
-                        "name": e.get("name", sid),
-                        "summary": e.get("summary", ""),
-                        "tags": e.get("tags", []),
-                        "attributes": e.get("attributes", {}),
-                    },
+                    entity_payload,
                     source_artifact=source_artifact,
                     chunk_index=i,
-                    default_timeline=f"chunk {i}",
+                    default_timeline=default_timeline,
+                    default_sequence=default_sequence,
                 )
 
             entities.setdefault(sid, {})["summary"] = e.get(
@@ -1039,30 +1110,8 @@ def _compile_project_impl(
                     source_artifact=source_artifact,
                 )
 
-        # --------------------------------------------------------------
-        # EVENTS
-        # --------------------------------------------------------------
-
-        for event in new_events:
-            if not isinstance(event, dict):
-                continue
-
-            source_artifacts = _resolve_source_artifacts(
-                event.get("source_files", []),
-                artifact_ids,
-                batch_artifacts,
-            )
-
-            if not source_artifacts:
-                skipped_chunks.append(i)
-                continue
-
-            for source_artifact in source_artifacts:
-                store.add_event(
-                    event,
-                    timeline=f"chunk {i}",
-                    source_artifact=source_artifact,
-                )
+        # Events were persisted before entity updates so state references can
+        # resolve to canonical event objects.
 
         # Persist project-level compiler state after each successful batch.
         store.set_project_type(project_type)

@@ -173,10 +173,6 @@ class MetadataDB:
                 (entity_id,),
             )
             c.execute(
-                "DELETE FROM events WHERE ? IN (entities)",
-                (entity_id,),
-            )
-            c.execute(
                 "DELETE FROM entities WHERE id=?",
                 (entity_id,),
             )
@@ -229,6 +225,21 @@ class MetadataDB:
             c.execute("""INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?,?)""",
             (ident,e.get("description",e.get("event","")),self._json(e.get("entities",[])),e.get("timeline"),e.get("source_artifact"),e.get("source_locator"),e.get("created_at",now())))
         return ident
+    def rebuild_event_index(self, store):
+        """Rebuild the derived SQLite event index from canonical event JSON files."""
+        with self.conn() as c:
+            c.execute("DELETE FROM events")
+        for event in store.events(limit=100000):
+            self.add_event({
+                "id": event.get("id"),
+                "description": event.get("description", ""),
+                "entities": event.get("entities", []),
+                "timeline": (event.get("narrative_position") or {}).get("label") or event.get("timeline"),
+                "source_artifact": event.get("source_artifact"),
+                "source_locator": event.get("source_locator"),
+                "created_at": event.get("created_at", now()),
+            })
+
     def delete_events_for_artifact(self, artifact_id):
         with self.conn() as c:
             c.execute("DELETE FROM events WHERE source_artifact=?", (artifact_id,))

@@ -31,9 +31,9 @@ class CognitionStore:
         self.username=slug(username.lower()); self.project_id=slug(project_id)
         self.root = Path(settings.PROJECTS_ROOT) / slug(username.lower()) / slug(project_id)
         self.root = self.root.resolve()
-        self.cognition=self.root/"cognition"; self.entities_root=self.cognition/"entities"; self.index_root=self.cognition/"_index"
+        self.cognition=self.root/"cognition"; self.entities_root=self.cognition/"entities"; self.index_root=self.cognition/"_index"; self.events_root=self.cognition/"events"
         self.timeline=self.cognition/"timeline"; self.source=self.root/"source"; self.workspace=self.root/"workspace"; self.sessions=self.root/"sessions"; self.log=self.root/"log"
-        for p in (self.cognition,self.entities_root,self.index_root,self.timeline,self.source,self.workspace,self.sessions,self.log): p.mkdir(parents=True,exist_ok=True)
+        for p in (self.cognition,self.entities_root,self.index_root,self.timeline,self.events_root,self.source,self.workspace,self.sessions,self.log): p.mkdir(parents=True,exist_ok=True)
         self.master_metadata_path=self.index_root/"master_metadata.json"
         self.state_map_path=self.cognition/"state_map.json"  # compatibility view only
         self.ledger_path=self.cognition/"ledger.json"        # compatibility view only
@@ -58,7 +58,7 @@ class CognitionStore:
         self._write_json(self.relationships_path,{})
         self._write_json(self.summaries_path,{})
         self.instructions_path.write_text("",encoding="utf-8")
-        self.events_path.touch(exist_ok=True)
+        self.events_path.touch(exist_ok=True); self.events_root.mkdir(parents=True,exist_ok=True)
         return 
     def reset_source_derived_cognition(self):
         """
@@ -402,13 +402,15 @@ class CognitionStore:
                     "timeline": rel.get("timeline", timeline),
                 })
 
+        # Event records are first-class cognition objects stored under
+        # cognition/events/*.json. Entity JSON stores only references to those
+        # canonical event objects; it never embeds a second copy of an event.
         for event in update.get("events") or []:
-            if isinstance(event, dict):
-                data.setdefault("events", []).append({
-                    **event,
-                    "source_artifact": source_artifact,
-                    "timeline": event.get("timeline", timeline),
-                })
+            if isinstance(event, dict) and (event.get("id") or event.get("event_id")):
+                event_id = str(event.get("id") or event.get("event_id"))
+                refs = data.setdefault("events", [])
+                if not any(isinstance(ref, dict) and ref.get("id") == event_id for ref in refs):
+                    refs.append({"id": event_id})
 
     def _rebuild_entity_from_projections(self, eid, data):
         projections = data.get("source_projections") or {}
@@ -630,8 +632,43 @@ class CognitionStore:
 
         self._write_master(master)
 
+        # Reconcile canonical event provenance with the replaced source artifacts.
+        # Events supported by another source survive; otherwise the event object
+        # itself is removed.
+        for event_path in list(self.events_root.glob("*.json")):
+            event = self._read_json(event_path, {})
+            event_sources = list(dict.fromkeys(
+                [str(x) for x in (event.get("source_artifacts") or []) if x]
+                + ([str(event["source_artifact"])] if event.get("source_artifact") else [])
+            ))
+            remaining_sources = [x for x in event_sources if x not in source_artifacts]
+            if len(remaining_sources) != len(event_sources):
+                if remaining_sources:
+                    event["source_artifacts"] = remaining_sources
+                    event["source_artifact"] = remaining_sources[0]
+                    event["updated_at"] = now_iso()
+                    self._write_json(event_path, event)
+                else:
+                    event_path.unlink(missing_ok=True)
+
         # Remove source-scoped relational/index records, then rebuild the
         # entity/section/attribute projection from the remaining JSON.
+        # Remove dangling event references from entity JSONs after canonical
+        # event records for replaced artifacts have been removed.
+        remaining_event_ids = {str(e.get("id")) for e in self.events(limit=100000) if e.get("id")}
+        for eid, meta in list(self.master_metadata().get("entities", {}).items()):
+            path = meta.get("path")
+            if not path:
+                continue
+            entity_path = self.root / path
+            entity = self._read_json(entity_path, {})
+            refs = entity.get("events") or []
+            filtered = [ref for ref in refs if isinstance(ref, dict) and str(ref.get("id")) in remaining_event_ids]
+            if len(filtered) != len(refs):
+                entity["events"] = filtered
+                entity["updated_at"] = now_iso()
+                self._write_json(entity_path, entity)
+
         for aid in source_artifacts:
             self.db.delete_relations_for_artifact(aid)
             self.db.delete_events_for_artifact(aid)
@@ -645,6 +682,7 @@ class CognitionStore:
         )
 
         self.db.rebuild_entity_index(self)
+        self.db.rebuild_event_index(self)
 
     def _append_attribute(self,data,eid,attr,value,timeline,source_artifact,locator,summary="",valid_from=None,valid_to=None,sequence_hint=None):
         states=data.setdefault("attributes",{}).setdefault(attr,[]); vf=valid_from or timeline
@@ -694,11 +732,153 @@ class CognitionStore:
         # relationship index. Both ends get the edge so loading either entity
         # directly exposes its graph context.
         self._sync_relationships_for_entities((frm, to))
-    def add_event(self,event,source_artifact=None,timeline=None,default_entity=None,data=None):
-        if not isinstance(event,dict):return
-        ents=event.get("entities") or ([default_entity] if default_entity else []); desc=event.get("event") or event.get("description",""); loc=event.get("locator")
-        rec={"description":desc,"entities":ents,"timeline":event.get("timeline",timeline),"source_artifact":source_artifact,"source_locator":loc,"created_at":now_iso()}; self.db.add_event(rec)
-        if data is not None:data.setdefault("events",[]).append(rec)
+    def _event_path(self, event_id):
+        return self.events_root / f"{slug(event_id)}.json"
+
+    @staticmethod
+    def _event_key(event):
+        payload = {
+            "type": event.get("type") or event.get("event_type") or "event",
+            "title": event.get("title") or "",
+            "description": event.get("description") or event.get("event") or "",
+            "entities": sorted(str(x) for x in (event.get("entities") or [])),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:20]
+
+    def add_event(
+        self,
+        event,
+        source_artifact=None,
+        timeline=None,
+        default_entity=None,
+        data=None,
+        sequence=None,
+        narrative_position=None,
+    ):
+        """Persist one narrative event as a first-class cognition object.
+
+        The canonical record lives in ``cognition/events/<event_id>.json``.
+        Entity files contain only event references. SQLite is a derived index.
+        """
+        if not isinstance(event, dict):
+            return None
+
+        entities = [
+            str(x)
+            for x in (event.get("entities") or ([default_entity] if default_entity else []))
+            if x
+        ]
+        description = str(event.get("description") or event.get("event") or "").strip()
+        if not description:
+            return None
+
+        event_id = str(
+            event.get("id")
+            or event.get("event_id")
+            or f"event_{self._event_key(event)}"
+        )
+        path = self._event_path(event_id)
+        existing = self._read_json(path, {}) if path.exists() else {}
+
+        pos = event.get("narrative_position")
+        if not isinstance(pos, dict):
+            pos = {}
+        if narrative_position:
+            pos = {**narrative_position, **pos}
+        if timeline and not pos.get("label"):
+            pos["label"] = timeline
+        if sequence is not None and pos.get("sequence") is None:
+            pos["sequence"] = sequence
+
+        source_artifacts = list(dict.fromkeys(
+            [str(x) for x in (existing.get("source_artifacts") or []) if x]
+            + ([str(existing["source_artifact"])] if existing.get("source_artifact") else [])
+            + ([str(source_artifact)] if source_artifact else [])
+            + [str(x) for x in (event.get("source_artifacts") or []) if x]
+            + ([str(event["source_artifact"])] if event.get("source_artifact") else [])
+        ))
+
+        rec = {**existing, **event}
+        rec.update({
+            "schema_version": 2,
+            "id": event_id,
+            "type": event.get("type") or event.get("event_type") or existing.get("type", "event"),
+            "title": event.get("title") or existing.get("title") or description[:120],
+            "description": description,
+            "entities": list(dict.fromkeys(entities)),
+            "source_artifacts": source_artifacts,
+            "location": event.get("location", existing.get("location")),
+            "narrative_position": pos,
+            "sequence": event.get("sequence", existing.get("sequence", sequence)),
+            "previous_events": list(dict.fromkeys(str(x) for x in (event.get("previous_events") or existing.get("previous_events") or []))),
+            "next_events": list(dict.fromkeys(str(x) for x in (event.get("next_events") or existing.get("next_events") or []))),
+            "provenance": event.get("provenance", existing.get("provenance", "source_derived")),
+            "source_artifact": existing.get("source_artifact") or source_artifact or event.get("source_artifact") or (source_artifacts[0] if source_artifacts else None),
+            "source_locator": event.get("source_locator") or event.get("locator") or existing.get("source_locator"),
+            "created_at": existing.get("created_at", now_iso()),
+            "updated_at": now_iso(),
+        })
+        self._write_json(path, rec)
+        self.db.add_event({
+            "id": event_id,
+            "description": rec["description"],
+            "entities": rec["entities"],
+            "timeline": (rec.get("narrative_position") or {}).get("label") or timeline,
+            "source_artifact": rec.get("source_artifact"),
+            "source_locator": rec.get("source_locator"),
+            "created_at": rec["created_at"],
+        })
+
+        for entity_id in rec["entities"]:
+            self.link_event_to_entity(entity_id, event_id)
+
+        if data is not None:
+            refs = data.setdefault("events", [])
+            if not any(isinstance(ref, dict) and ref.get("id") == event_id for ref in refs):
+                refs.append({"id": event_id})
+        return event_id
+
+    def link_event_to_entity(self, entity_id, event_id):
+        """Attach a canonical event reference to an entity without duplicating the event."""
+        meta = self.master_metadata().get("entities", {}).get(str(entity_id))
+        if not meta or not meta.get("path"):
+            return
+        path = self.root / meta["path"]
+        entity = self._read_json(path, {})
+        if not entity:
+            return
+        refs = entity.setdefault("events", [])
+        event_id = str(event_id)
+        if not any(isinstance(ref, dict) and ref.get("id") == event_id for ref in refs):
+            refs.append({"id": event_id})
+            entity["updated_at"] = now_iso()
+            self._write_json(path, entity)
+
+    def events(self, limit=1000):
+        records = []
+        if self.events_root.exists():
+            for path in self.events_root.glob("*.json"):
+                rec = self._read_json(path, {})
+                if rec:
+                    records.append(rec)
+
+        def key(rec):
+            pos = rec.get("narrative_position") or {}
+            seq = rec.get("sequence", pos.get("sequence"))
+            try:
+                seq_key = int(seq)
+            except (TypeError, ValueError):
+                seq_key = 10**12
+            return (seq_key, str(rec.get("created_at", "")), str(rec.get("id", "")))
+
+        records.sort(key=key)
+        return records[:limit]
+
+    def event(self, event_id):
+        return self._read_json(self._event_path(str(event_id)), {})
+
     def append_event(self,event):
         with self.events_path.open("a",encoding="utf-8") as f:f.write(json.dumps({"timestamp":now_iso(),**event},ensure_ascii=False)+"\n")
     def record_compilation_chunk(self,artifact,chunk_index,content,summary="",locator=None):
@@ -808,7 +988,13 @@ class CognitionStore:
                             val={**val,"content":content}
                         item["sections"][key]=val
                 if detail=="full":
-                    item["relationships"]=entity.get("relationships",[]); item["events"]=entity.get("events",[])
+                    item["relationships"]=entity.get("relationships",[])
+                    event_refs=entity.get("events",[]) or []
+                    item["events"]=[
+                        self.event(ref.get("id"))
+                        for ref in event_refs
+                        if isinstance(ref,dict) and ref.get("id") and self.event(ref.get("id"))
+                    ]
                     if req.get("include_source"):
                         item["source_content"]={}
                         for a in item.get("source_artifacts",[]):
