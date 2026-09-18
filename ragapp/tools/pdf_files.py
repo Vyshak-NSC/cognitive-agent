@@ -66,7 +66,33 @@ def delete_pdf(username, relative_path):
 def build_pdf_tools(username):
     return [
         Tool("read_pdf", "Read PDF text and page structure. Use start_page/end_page for specific pages.", {"type":"object","properties":{"relative_path":{"type":"string"},"start_page":{"type":"integer"},"end_page":{"type":"integer"}},"required":["relative_path"]}, lambda relative_path, start_page=None, end_page=None: read_pdf(username, relative_path, start_page, end_page)),
-        Tool("write_pdf", "Create a real PDF from page specifications. Use when creating a new PDF.", {"type":"object","properties":{"relative_path":{"type":"string"},"pages":{"type":"array","items":{"type":"object"}}},"required":["relative_path","pages"]}, lambda relative_path, pages: write_pdf(username, relative_path, pages)),
+        Tool(
+            "write_pdf",
+            "Create a real PDF from page specifications. Use when creating a new PDF.",
+            {
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "pages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string", "description": "Page body text. Use \\n for line breaks."},
+                                "x": {"type": "number", "description": "Left margin in points. Default 54."},
+                                "y": {"type": "number", "description": "Top starting baseline in points. Default 738."},
+                                "width": {"type": "number", "description": "Page width in points. Default 612 (US Letter)."},
+                                "height": {"type": "number", "description": "Page height in points. Default 792 (US Letter)."},
+                                "line_height": {"type": "number", "description": "Vertical spacing between lines in points. Default 14."},
+                            },
+                            "required": ["text"],
+                        },
+                    },
+                },
+                "required": ["relative_path", "pages"],
+            },
+            lambda relative_path, pages: write_pdf(username, relative_path, pages),
+        ),
         Tool("edit_pdf", "Perform structural PDF edits while preserving existing page content. Supports deleting a page or adding text as an overlay.", {"type":"object","properties":{"relative_path":{"type":"string"},"operation":{"type":"string","enum":["delete_page","add_text"]},"page":{"type":"integer"},"text":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"}},"required":["relative_path","operation"]}, lambda relative_path, operation, page=None, text=None, x=54, y=738: edit_pdf(username, relative_path, operation, page, text, x, y)),
         Tool("copy_pdf_pages", "Copy a page range from one PDF to another without flattening or re-rendering the pages; original PDF page formatting is preserved.", {"type":"object","properties":{"source_relative_path":{"type":"string"},"destination_relative_path":{"type":"string"},"start_page":{"type":"integer"},"end_page":{"type":"integer"}},"required":["source_relative_path","destination_relative_path","start_page","end_page"]}, lambda source_relative_path, destination_relative_path, start_page, end_page: copy_pdf_pages(username, source_relative_path, destination_relative_path, start_page, end_page)),
         Tool("delete_pdf", "Delete an existing PDF from the AI workspace.", {"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]}, lambda relative_path: delete_pdf(username, relative_path)),

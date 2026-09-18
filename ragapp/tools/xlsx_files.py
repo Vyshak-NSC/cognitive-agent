@@ -39,7 +39,42 @@ def delete_xlsx(username,relative_path):
 def build_xlsx_tools(username):
     return [
       Tool("read_xlsx","Read workbook sheets and cell values without flattening the workbook to plain text.",{"type":"object","properties":{"relative_path":{"type":"string"},"sheet":{"type":"string"},"max_rows":{"type":"integer"},"max_cols":{"type":"integer"}},"required":["relative_path"]},lambda relative_path,sheet=None,max_rows=100,max_cols=30:read_xlsx(username,relative_path,sheet,max_rows,max_cols)),
-      Tool("write_xlsx","Create a real .xlsx workbook from sheet/row specifications.",{"type":"object","properties":{"relative_path":{"type":"string"},"sheets":{"type":"array","items":{"type":"object"}}},"required":["relative_path","sheets"]},lambda relative_path,sheets:write_xlsx(username,relative_path,sheets)),
+      Tool(
+          "write_xlsx",
+          "Create a real .xlsx workbook from sheet/row specifications.",
+          {
+              "type": "object",
+              "properties": {
+                  "relative_path": {"type": "string"},
+                  "sheets": {
+                      "type": "array",
+                      "items": {
+                          "type": "object",
+                          "properties": {
+                              "name": {"type": "string", "description": "Sheet tab name."},
+                              "rows": {
+                                  "type": "array",
+                                  "description": "Each inner array is one row; each element is one cell value.",
+                                  "items": {
+                                      "type": "array",
+                                      "items": {
+                                          "anyOf": [
+                                              {"type": "string"},
+                                              {"type": "number"},
+                                              {"type": "boolean"},
+                                          ]
+                                      },
+                                  },
+                              },
+                          },
+                          "required": ["name", "rows"],
+                      },
+                  },
+              },
+              "required": ["relative_path", "sheets"],
+          },
+          lambda relative_path,sheets:write_xlsx(username,relative_path,sheets),
+      ),
       Tool("edit_xlsx","Edit an individual Excel cell while retaining the existing workbook and cell formatting.",{"type":"object","properties":{"relative_path":{"type":"string"},"sheet":{"type":"string"},"cell":{"type":"string"},"value":{},"operation":{"type":"string","enum":["set","clear"]}},"required":["relative_path","sheet","cell","operation"]},lambda relative_path,sheet,cell,value=None,operation="set":edit_xlsx(username,relative_path,sheet,cell,value,operation)),
       Tool("delete_xlsx","Delete an existing Excel workbook from the AI workspace.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:delete_xlsx(username,relative_path)),
     ]

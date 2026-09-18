@@ -119,7 +119,7 @@ EXTENSION_LANGUAGE = {
     ".yaml": "yaml",
     ".yml": "yaml",
 
-    ".xml": "xml",
+    # ".xml": "xml",
 }
 
 

@@ -56,7 +56,52 @@ def delete_pptx(username,relative_path):
 def build_pptx_tools(username):
     return [
       Tool("read_pptx","Read a PowerPoint as slides and shapes, including text and positions.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:read_pptx(username,relative_path)),
-      Tool("write_pptx","Create a real .pptx from slide/shape specifications.",{"type":"object","properties":{"relative_path":{"type":"string"},"slides":{"type":"array","items":{"type":"object"}}},"required":["relative_path","slides"]},lambda relative_path,slides:write_pptx(username,relative_path,slides)),
+      Tool(
+          "write_pptx",
+          "Create a real .pptx from slide/shape specifications.",
+          {
+              "type": "object",
+              "properties": {
+                  "relative_path": {"type": "string"},
+                  "slides": {
+                      "type": "array",
+                      "items": {
+                          "type": "object",
+                          "properties": {
+                              "shapes": {
+                                  "type": "array",
+                                  "items": {
+                                      "type": "object",
+                                      "properties": {
+                                          "left": {"type": "number", "description": "Position from left edge, in inches. Default 1."},
+                                          "top": {"type": "number", "description": "Position from top edge, in inches. Default 1."},
+                                          "width": {"type": "number", "description": "Textbox width, in inches. Default 8."},
+                                          "height": {"type": "number", "description": "Textbox height, in inches. Default 1."},
+                                          "text": {"type": "string", "description": "Shorthand: plain text for the shape if 'runs' is not used."},
+                                          "runs": {
+                                              "type": "array",
+                                              "items": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                      "text": {"type": "string"},
+                                                      "bold": {"type": "boolean"},
+                                                      "italic": {"type": "boolean"},
+                                                  },
+                                                  "required": ["text"],
+                                              },
+                                          },
+                                      },
+                                  },
+                              },
+                          },
+                          "required": ["shapes"],
+                      },
+                  },
+              },
+              "required": ["relative_path", "slides"],
+          },
+          lambda relative_path,slides:write_pptx(username,relative_path,slides),
+      ),
       Tool("edit_pptx","Edit text in an existing PowerPoint run so the surrounding slide objects and run formatting are retained.",{"type":"object","properties":{"relative_path":{"type":"string"},"slide_index":{"type":"integer"},"shape_index":{"type":"integer"},"operation":{"type":"string","enum":["replace_run","replace_text_in_runs"]},"run_index":{"type":"integer"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["relative_path","slide_index","shape_index","operation"]},lambda relative_path,slide_index,shape_index,operation,run_index=None,old_text=None,new_text=None:edit_pptx(username,relative_path,slide_index,shape_index,operation,run_index,old_text,new_text)),
       Tool("delete_pptx","Delete an existing PowerPoint file from the AI workspace.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:delete_pptx(username,relative_path)),
     ]

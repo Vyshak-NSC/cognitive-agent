@@ -103,7 +103,60 @@ def _edit_docx_handler(username, **args):
 def build_docx_tools(username):
     return [
         Tool("read_docx", "Read raw paragraph/table structure from a DOCX file. Only use this when editing the file or when compiled cognition entities do not contain the needed information. Do NOT use this to answer general questions about project content when the project is already compiled — use request_cognition_context instead.", {"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]}, lambda relative_path: read_docx(username, relative_path)),
-        Tool("write_docx", "Create a real .docx from a structured document specification containing paragraphs/runs and tables.", {"type":"object","properties":{"relative_path":{"type":"string"},"document_spec":{"type":"object"}},"required":["relative_path","document_spec"]}, lambda relative_path, document_spec: write_docx(username, relative_path, document_spec)),
+        Tool(
+            "write_docx",
+            "Create a real .docx from a structured document specification containing paragraphs/runs and tables.",
+            {
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "document_spec": {
+                        "type": "object",
+                        "properties": {
+                            "paragraphs": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "style": {"type": "string", "description": "Optional Word style name, e.g. 'Heading 1'."},
+                                        "runs": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "text": {"type": "string"},
+                                                    "bold": {"type": "boolean"},
+                                                    "italic": {"type": "boolean"},
+                                                    "underline": {"type": "boolean"},
+                                                },
+                                                "required": ["text"],
+                                            },
+                                        },
+                                    },
+                                    "required": ["runs"],
+                                },
+                            },
+                            "tables": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "rows": {
+                                            "type": "array",
+                                            "items": {"type": "array", "items": {"type": "string"}},
+                                        },
+                                    },
+                                    "required": ["rows"],
+                                },
+                            },
+                        },
+                        "required": ["paragraphs"],
+                    },
+                },
+                "required": ["relative_path", "document_spec"],
+            },
+            lambda relative_path, document_spec: write_docx(username, relative_path, document_spec),
+        ),
         Tool(
             "edit_docx",
             "Edit an existing DOCX while retaining its existing Word structure and formatting where possible. "
