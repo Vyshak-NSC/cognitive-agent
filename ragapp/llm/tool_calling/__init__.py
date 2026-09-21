@@ -9,6 +9,9 @@ def _module(store):
     if name == "gemini":
         from ragapp.llm.tool_calling import gemini
         return gemini
+    if name in {"azure", "azure_openai"}:
+        from ragapp.llm.tool_calling import azure_openai
+        return azure_openai
     raise RuntimeError(
         f"Provider '{name}' is configured but no tool-calling adapter is enabled."
     )

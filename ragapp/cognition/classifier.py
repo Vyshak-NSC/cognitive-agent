@@ -504,13 +504,17 @@ def compile_project(
         provider=provider_name,
     )
 
-    if provider_name in ("openrouter", "gemini"):
+    if provider_name in ("openrouter", "gemini", "azure"):
         if provider_name == "openrouter":
             from ragapp.llm.tool_calling.openrouter import (
                 generate_json as _adapter_generate_json,
             )
-        else:
+        elif provider_name == "gemini":
             from ragapp.llm.tool_calling.gemini import (
+                generate_json as _adapter_generate_json,
+            )
+        else:
+            from ragapp.llm.tool_calling.azure_openai import (
                 generate_json as _adapter_generate_json,
             )
 

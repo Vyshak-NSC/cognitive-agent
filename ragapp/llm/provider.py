@@ -121,6 +121,36 @@ class OpenAIProvider(Provider):
             model=model or self.model,
         )
 
+class AzureOpenAIProvider(Provider):
+    name = "azure"
+
+    def __init__(self, store):
+        super().__init__(store)
+        from ragapp.llm.tool_calling.azure_openai import _settings
+        _, _, _, _, self.model = _settings(store)
+
+    def generate(
+        self,
+        contents,
+        system_instruction="",
+        function_declarations=None,
+        model=None,
+    ):
+        from ragapp.llm.tool_calling.azure_openai import generate_step
+        self.throttle()
+        return generate_step(
+            self.store,
+            contents,
+            system_instruction=system_instruction,
+            function_declarations=function_declarations,
+            model=model or self.model,
+        )
+
+    def generate_json(self, prompt, model=None):
+        from ragapp.llm.tool_calling.azure_openai import generate_json
+        self.throttle()
+        return generate_json(self.store, prompt, model=model or self.model)
+    
 def get_provider(store):
     name = (
         load_project_config(store)
@@ -135,7 +165,9 @@ def get_provider(store):
         return OpenRouterProvider(store)
     if name == "openai":
         return OpenAIProvider(store)
-    if name in {"anthropic", "azure"}:
+    if name in {"azure", "azure_openai"}:
+        return AzureOpenAIProvider(store)
+    if name in {"anthropic"}:
         raise ProviderError(
             f"{name} is configured but its adapter is not enabled in this installation."
         )
@@ -148,8 +180,8 @@ def generate_step(contents, function_declarations, system_instruction=None, stor
         raise ProviderError("A project store is required for provider resolution.")
     return get_provider(store).generate(
         contents,
-        function_declarations,
         system_instruction=system_instruction,
+        function_declarations=function_declarations,
     )
 
 

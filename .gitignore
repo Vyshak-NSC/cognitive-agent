@@ -10,3 +10,4 @@ projects/
 *.sqlite
 *.sqlite3
 .streamlit/secrets.toml
+*.zip

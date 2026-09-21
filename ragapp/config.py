@@ -15,7 +15,7 @@ _DEFAULT_MODELS = {
     "openrouter": "openrouter/free",
     "openai": "gpt-5.6-luna",
     "anthropic": "",
-    "azure": "",
+    "azure": "gpt-5.6-luna",
 }
 
 def project_config(store):

@@ -115,7 +115,7 @@ DEFAULT_MODELS = {
     "openrouter": "liquid/lfm-2.5-2.6b:free",
     "openai": "gpt-5.6-luna",
     "anthropic": "",
-    "azure": "",
+    "azure": "gpt-5.6-luna",
 }
 
 
