@@ -504,69 +504,22 @@ def compile_project(
         provider=provider_name,
     )
 
-    if provider_name == "openrouter":
-        from openai import OpenAI
-
-        _client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=key,
-            timeout=120.0,
-            max_retries=0,
-        )
-
-        def _generate_json(prompt_text):
-            resp = _client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt_text,
-                    }
-                ],
-                response_format={
-                    "type": "json_object",
-                },
-                max_tokens=8000,
+    if provider_name in ("openrouter", "gemini"):
+        if provider_name == "openrouter":
+            from ragapp.llm.tool_calling.openrouter import (
+                generate_json as _adapter_generate_json,
+            )
+        else:
+            from ragapp.llm.tool_calling.gemini import (
+                generate_json as _adapter_generate_json,
             )
 
-            content = resp.choices[0].message.content
-
-            if content is None:
-                raise RuntimeError(
-                    "OpenRouter returned no text content. "
-                    f"finish_reason="
-                    f"{getattr(resp.choices[0], 'finish_reason', None)}, "
-                    f"message={resp.choices[0].message!r}"
-                )
-
-            return content
-
-    elif provider_name == "gemini":
-        from google import genai
-
-        llm = genai.Client(
-            api_key=key,
-        )
-
         def _generate_json(prompt_text):
-            resp = llm.models.generate_content(
+            return _adapter_generate_json(
+                store,
+                prompt_text,
                 model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(
-                                text=prompt_text,
-                            )
-                        ],
-                    )
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
             )
-
-            return resp.text
 
     else:
         raise RuntimeError(

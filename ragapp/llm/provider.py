@@ -1,10 +1,16 @@
 from __future__ import annotations
+import threading
 import time
 from ragapp.config import get_api_key, load_project_config, resolve_model
 from ragapp.settings import CHAT_MODEL, DEFAULT_CHAT_MODEL
 
 class ProviderError(RuntimeError):
     pass
+
+# Provider objects are rebuilt on every call (see get_provider), so the
+# throttle state must live at module level or it is reset each time.
+_LAST_CALL = {}
+_THROTTLE_LOCK = threading.Lock()
 
 class Provider:
     name = "base"
@@ -17,10 +23,13 @@ class Provider:
     def throttle(self):
         rpm = float(self.cfg.get("limits", {}).get("requests_per_minute", 15))
         gap = 60.0 / max(rpm, 1.0)
-        wait = gap - (time.monotonic() - self._last)
-        if wait > 0:
-            time.sleep(wait)
-        self._last = time.monotonic()
+        key = (self.name, str(getattr(self.store, "root", id(self.store))))
+        with _THROTTLE_LOCK:
+            now = time.monotonic()
+            slot = max(now, _LAST_CALL.get(key, 0.0) + gap)
+            _LAST_CALL[key] = slot  # reserve the slot so concurrent calls queue up
+        if slot > now:
+            time.sleep(slot - now)
 
     def key(self):
         return get_api_key(self.store, self.name)
@@ -62,7 +71,7 @@ class OpenRouterProvider(Provider):
     def __init__(self, store):
         super().__init__(store)
         from ragapp.llm.tool_calling.openrouter import _settings
-        _, self.model, _ = _settings(store)
+        _, self.model = _settings(store)
 
     def generate(self, *args, **kwargs):
         from ragapp.llm.tool_calling.openrouter import generate_step

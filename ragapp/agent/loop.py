@@ -666,16 +666,24 @@ def run_agent(
                 "args",
                 {},
             )
-            try:
-                result = registry.call(
-                    tool_name,
-                    tool_args,
-                )
-            except Exception as exc:
+            if call.get("args_error"):
+                # The model sent malformed arguments; report it back instead
+                # of executing the tool with empty/default arguments.
                 result = {
-                    "error": str(exc),
+                    "error": call["args_error"],
                     "tool": tool_name,
                 }
+            else:
+                try:
+                    result = registry.call(
+                        tool_name,
+                        tool_args,
+                    )
+                except Exception as exc:
+                    result = {
+                        "error": str(exc),
+                        "tool": tool_name,
+                    }
             safe_result = _json_safe(
                 result
             )
