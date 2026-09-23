@@ -352,7 +352,7 @@ wheels = [
 
 [[package]]
 name = "cognitive-persistence-agent"
-version = "7.3.0"
+version = "8.4.0"
 source = { virtual = "." }
 dependencies = [
     { name = "anthropic" },

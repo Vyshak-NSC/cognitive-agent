@@ -125,7 +125,17 @@ class MetadataDB:
             """)
     @staticmethod
     def _json(value):
-        return json.dumps(value if value is not None else {}, ensure_ascii=False)
+        """Serialize structured values at the SQLite boundary.
+
+        Canonical cognition remains native JSON in the filesystem. SQLite is
+        only a derived index, so dict/list values must never be passed to
+        sqlite3 bindings directly.
+        """
+        if value is None:
+            return None
+        if isinstance(value, (dict, list, tuple, set)):
+            return json.dumps(value, ensure_ascii=False, default=str)
+        return value
     def upsert_artifact(self, a):
         ident = a.get("id") or uuid.uuid4().hex
         t = now()
@@ -213,19 +223,19 @@ class MetadataDB:
         with self.conn() as c:
             c.execute("""INSERT OR REPLACE INTO attribute_states VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (ident,s["entity_id"],s["attribute"],self._json(s.get("value")),s.get("summary",""),s.get("valid_from"),s.get("valid_to"),
-             s.get("sequence",0),s.get("source_artifact"),s.get("source_locator"),s.get("created_at",now())))
+             s.get("sequence",0),s.get("source_artifact"),self._json(s.get("source_locator")),s.get("created_at",now())))
         return ident
     def add_relation(self,r):
         ident=r.get("id") or uuid.uuid4().hex
         with self.conn() as c:
             c.execute("""INSERT OR REPLACE INTO relations VALUES(?,?,?,?,?,?,?,?,?)""",
-            (ident,r["from_id"],r["to_id"],r.get("relation_type","related_to"),r.get("description",""),r.get("timeline"),r.get("source_artifact"),r.get("created_at",now()),now()))
+            (ident,r["from_id"],r["to_id"],r.get("relation_type","related_to"),self._json(r.get("description","")),self._json(r.get("timeline")),r.get("source_artifact"),r.get("created_at",now()),now()))
         return ident
     def add_event(self,e):
         ident=e.get("id") or uuid.uuid4().hex
         with self.conn() as c:
             c.execute("""INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?,?)""",
-            (ident,e.get("description",e.get("event","")),self._json(e.get("entities",[])),e.get("timeline"),e.get("source_artifact"),e.get("source_locator"),e.get("created_at",now())))
+            (ident,self._json(e.get("description",e.get("event",""))),self._json(e.get("entities",[])),self._json(e.get("timeline")),e.get("source_artifact"),self._json(e.get("source_locator")),e.get("created_at",now())))
         return ident
     def rebuild_event_index(self, store):
         """Rebuild the derived SQLite event index from canonical event JSON files."""
@@ -344,7 +354,7 @@ class MetadataDB:
         ident=cdata.get("id") or uuid.uuid4().hex
         with self.conn() as c:
             c.execute("""INSERT OR REPLACE INTO source_chunks VALUES(?,?,?,?,?,?,?,?,?)""",
-            (ident,cdata.get("artifact_id"),cdata.get("area"),cdata.get("path"),cdata.get("chunk_index",0),cdata.get("locator"),cdata.get("summary",""),cdata.get("content",""),cdata.get("created_at",now())))
+            (ident,cdata.get("artifact_id"),cdata.get("area"),cdata.get("path"),cdata.get("chunk_index",0),self._json(cdata.get("locator")),cdata.get("summary",""),cdata.get("content",""),cdata.get("created_at",now())))
         return ident
     def entities(self,limit=1000):
         with self.conn() as c: rows=c.execute("SELECT * FROM entities ORDER BY name LIMIT ?",(limit,)).fetchall()

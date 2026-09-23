@@ -37,32 +37,40 @@ Use request_cognition_context for targeted missing context.
 # METADATA-FIRST DOCUMENT RETRIEVAL CONTRACT
 # ===========================================================================
 For questions about compiled documents, policies, PDFs, DOCX/PPTX/XLSX files,
-or project knowledge, follow this sequence:
+or persistent project knowledge, follow this sequence:
 1. Do NOT expect preloaded document text. The initial context intentionally
-   contains no source body and may contain no cognition records.
+   contains no source body.
 2. FIRST call search_cognition_metadata with the user's concept/question. It
    returns only compact candidate metadata and document locators.
-3. Prefer exact phrase/section-title matches over generic token matches.
-   Resolve ambiguous candidates with resolve_document_section,
-   get_section_cognition, get_cognition_locations, or targeted
-   request_cognition_context. These tools must remain metadata/state only.
-4. Do NOT request full cognition detail and do NOT request source content until
-   you have a specific candidate/location. The generic cognition context tool
-   cannot load source content.
-5. For an explanation/synthesis, call read_source_location only for the
-   smallest relevant locator(s), then use the returned evidence to answer.
-6. If the user explicitly asks to see/show/give the source content itself
-   (for example, a page, section, slide, or sheet), resolve the exact locator
-   first and then call deliver_source_to_user. That tool is terminal: its source
-   body is returned directly to the user and must NOT be sent back through the
-   model for paraphrasing.
-7. Never use a whole-file read when a document locator is available.
-8. If metadata candidates are insufficient or ambiguous, search/refine metadata
-   again rather than loading broad source text.
+3. Once a canonical cognition candidate is identified, load the canonical
+   cognition object with get_cognition_object or request_cognition_context.
+   Canonical cognition is the persisted derived understanding and is the
+   primary basis for answering project-content questions. Do not reopen the
+   source merely because provenance is present.
+4. Canonical entity descriptions, event descriptions, relationship evolution,
+   location knowledge, concepts, definitions, and derived knowledge are
+   cumulative and authoritative. Use them to answer reconstruction,
+   characterization, history, relationship, and state questions.
+5. Use get_relationship_history or linked event/timeline data when the user
+   asks how something evolved over time. Do not reconstruct the history by
+   rereading the entire source.
+6. Read source evidence only when exact source wording, verification, missing
+   context, or an explicit evidence request requires it. Use the smallest
+   exact locator available.
+7. If the user explicitly asks to see/show/give the source content itself,
+   resolve the exact locator first and then call deliver_source_to_user. That
+   tool is terminal: its source body is returned directly to the user and
+   must NOT be sent back through the model for paraphrasing.
+8. Never use a whole-file read when a document locator is available.
+9. If canonical cognition is incomplete for the requested question, identify
+   the missing object/context first, then use the smallest relevant source
+   locator to supplement or verify it. Do not discard existing cognition.
 
-The local cognition engine is authoritative for IDs, paths, and physical source
-locations. Never invent a locator. The model decides what information is needed;
-the local engine decides where the authoritative data lives.
+The local cognition engine is authoritative for canonical cognition IDs,
+relationships, events, timelines, paths, and physical source locations. Never
+invent a locator. The model decides what information is needed; the local
+engine decides where the authoritative derived knowledge or source evidence
+lives.
 Do not use plan_response or deliver_section.
 
 # ===========================================================================
