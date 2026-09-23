@@ -38,10 +38,100 @@ def _timeline_rank(value: Any):
     return int(m.group(1)) if m else None
 
 
+def _coerce_int(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_chapter_reference(value):
+    """Extract a chapter/scene/part ordinal without treating it as story time."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    patterns = (
+        ("chapter", r"\bchapter\s*([0-9]+)\b"),
+        ("scene", r"\bscene\s*([0-9]+)\b"),
+        ("part", r"\bpart\s*([0-9]+)\b"),
+    )
+    for kind, pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return {"kind": kind, "ordinal": int(m.group(1)), "label": m.group(0)}
+    return None
+
+
+def _normalize_temporal_position(narrative=None, story_time=None, sequence=None):
+    """Return the canonical two-axis temporal position.
+
+    Narrative position answers where information entered the document/chat
+    progression. Story time answers when the represented event/state exists in
+    the story world. They are intentionally independent; narrative position is
+    never used as a proxy for story time.
+    """
+    narrative = narrative if isinstance(narrative, dict) else {"label": narrative} if narrative is not None else {}
+    story = story_time if isinstance(story_time, dict) else {"label": story_time} if story_time is not None else {}
+
+    n = {
+        "sequence": _coerce_int(narrative.get("sequence", sequence)),
+        "label": narrative.get("label") or narrative.get("timeline"),
+        "chapter": _coerce_int(narrative.get("chapter")),
+        "scene": _coerce_int(narrative.get("scene")),
+        "session": narrative.get("session"),
+        "turn": _coerce_int(narrative.get("turn")),
+    }
+    if n["chapter"] is None:
+        ref = _parse_chapter_reference(n.get("label"))
+        if ref and ref["kind"] == "chapter":
+            n["chapter"] = ref["ordinal"]
+    if n["scene"] is None:
+        ref = _parse_chapter_reference(n.get("label"))
+        if ref and ref["kind"] == "scene":
+            n["scene"] = ref["ordinal"]
+    n = {k: v for k, v in n.items() if v is not None}
+
+    s = {
+        "label": story.get("label"),
+        "kind": story.get("kind"),
+        "ordinal": _coerce_int(story.get("ordinal")),
+        "chapter": _coerce_int(story.get("chapter")),
+        "scene": _coerce_int(story.get("scene")),
+        "anchor": story.get("anchor"),
+        "relation": story.get("relation"),
+    }
+    # A structured story-time input is authoritative. For a free-form string,
+    # preserve it verbatim and only extract an explicit relation/anchor.
+    if s.get("label") and not s.get("relation"):
+        text = str(s["label"]).strip()
+        m = re.search(r"\b(before|after|during|at|between)\b", text, re.I)
+        if m:
+            s["relation"] = m.group(1).lower()
+        ref = _parse_chapter_reference(text)
+        if ref:
+            s.setdefault("kind", ref["kind"])
+            s.setdefault("ordinal", ref["ordinal"])
+            if ref["kind"] == "chapter":
+                s.setdefault("chapter", ref["ordinal"])
+            if s.get("anchor") is None:
+                s["anchor"] = ref["label"]
+    s = {k: v for k, v in s.items() if v is not None}
+
+    return {
+        "model_version": 2,
+        "narrative": n,
+        "story": s,
+    }
+
+
 class CognitionStore:
     """Filesystem-authoritative canonical cognition with SQLite as an index only."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 9
+    TEMPORAL_MODEL_VERSION = 2
+    TIMELINE_SCHEMA_VERSION = 2
     CANONICAL_KINDS = ("entities", "relationships", "events", "locations", "concepts", "definitions", "knowledge")
 
     def __init__(self, username: str, project_id: str):
@@ -117,6 +207,7 @@ class CognitionStore:
             return False
         self._write_master({
             "schema_version": self.SCHEMA_VERSION,
+            "temporal_model_version": self.TEMPORAL_MODEL_VERSION,
             "project_id": self.project_id,
             "project_type": "domain",
             "current_version": 0,
@@ -124,6 +215,13 @@ class CognitionStore:
             "entities": {},
             "counts": {},
             "timelines": [],
+            "temporal_model": {
+                "version": self.TEMPORAL_MODEL_VERSION,
+                "timeline_schema_version": self.TIMELINE_SCHEMA_VERSION,
+                "axes": ["narrative", "story"],
+                "narrative": "document/chat progression; independent from story chronology",
+                "story": "in-story chronology; may diverge from narrative order",
+            },
             "compiled": False,
         })
         return True
@@ -136,6 +234,7 @@ class CognitionStore:
                 shutil.rmtree(root, ignore_errors=True)
         self._write_master({
             "schema_version": self.SCHEMA_VERSION,
+            "temporal_model_version": self.TEMPORAL_MODEL_VERSION,
             "project_id": self.project_id,
             "project_type": "domain",
             "current_version": 0,
@@ -143,6 +242,13 @@ class CognitionStore:
             "entities": {},
             "counts": {},
             "timelines": [],
+            "temporal_model": {
+                "version": self.TEMPORAL_MODEL_VERSION,
+                "timeline_schema_version": self.TIMELINE_SCHEMA_VERSION,
+                "axes": ["narrative", "story"],
+                "narrative": "document/chat progression; independent from story chronology",
+                "story": "in-story chronology; may diverge from narrative order",
+            },
             "compiled": False,
         })
         if self._db is not None:
@@ -185,6 +291,7 @@ class CognitionStore:
 
         m = {
             "schema_version": self.SCHEMA_VERSION,
+            "temporal_model_version": self.TEMPORAL_MODEL_VERSION,
             "project_id": self.project_id,
             "project_type": "domain",
             "current_version": 0,
@@ -192,6 +299,13 @@ class CognitionStore:
             "entities": {},
             "counts": {},
             "timelines": [],
+            "temporal_model": {
+                "version": self.TEMPORAL_MODEL_VERSION,
+                "timeline_schema_version": self.TIMELINE_SCHEMA_VERSION,
+                "axes": ["narrative", "story"],
+                "narrative": "document/chat progression; independent from story chronology",
+                "story": "in-story chronology; may diverge from narrative order",
+            },
             "compiled": False,
         }
         self._write_master(m)
@@ -326,6 +440,7 @@ class CognitionStore:
                 "definitions": [],
                 "knowledge_links": [],
                 "timeline": [],
+                "temporal_position": None,
                 "provenance": [],
                 "created_at": now_iso(),
             }
@@ -361,16 +476,75 @@ class CognitionStore:
         self.db.upsert_entity({**m["entities"][eid], "description": data.get("description", "")})
         return data
 
+    @staticmethod
+    def _normalize_provenance_item(item: dict):
+        """Normalize provenance while retaining the most precise supplied locator.
+
+        Precision is represented explicitly rather than inferred from a coarse
+        section label.  The caller/source parser may supply any combination of
+        page, section, line, word/character offsets, source chunk, node/segment,
+        or a source-specific locator.  We retain all supplied locator metadata
+        and record the finest-grained locator actually present.
+        """
+        if not isinstance(item, dict):
+            return None
+        out = dict(item)
+        locator = out.get("locator")
+        if isinstance(locator, dict):
+            locator_data = dict(locator)
+        elif locator is not None:
+            locator_data = {"value": locator}
+        else:
+            locator_data = {}
+
+        aliases = {
+            "page": ("page", "page_number"),
+            "section": ("section", "section_id", "section_title"),
+            "line": ("line", "line_start", "line_number"),
+            "word_offset": ("word_offset", "word_start", "word_index"),
+            "char_offset": ("char_offset", "character_offset", "char_start"),
+            "source_chunk": ("source_chunk", "chunk", "chunk_id", "chunk_index"),
+            "node_id": ("node_id", "node_ids"),
+            "segment_id": ("segment_id",),
+        }
+        for canonical, keys in aliases.items():
+            if canonical in out and out[canonical] is not None:
+                locator_data.setdefault(canonical, out[canonical])
+            for key in keys:
+                if key in out and out[key] is not None:
+                    locator_data.setdefault(canonical, out[key])
+                    break
+
+        precision_order = (
+            ("char_offset", 70),
+            ("word_offset", 60),
+            ("line", 50),
+            ("source_chunk", 40),
+            ("segment_id", 35),
+            ("node_id", 30),
+            ("section", 20),
+            ("page", 10),
+            ("value", 1),
+        )
+        best = next((name for name, _ in precision_order if locator_data.get(name) is not None), None)
+        if locator_data:
+            out["locator"] = locator_data
+            if best:
+                out["locator_precision"] = best
+        return out
+
     def _record_provenance(self, data: dict, provenance):
         if not provenance:
             return
         entries = data.setdefault("provenance", [])
-        for item in provenance if isinstance(provenance, list) else [provenance]:
-            if not isinstance(item, dict):
+        items = provenance if isinstance(provenance, list) else [provenance]
+        for item in items:
+            normalized = self._normalize_provenance_item(item)
+            if normalized is None:
                 continue
-            signature = json.dumps(item, sort_keys=True, ensure_ascii=False)
+            signature = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
             if not any(json.dumps(x, sort_keys=True, ensure_ascii=False) == signature for x in entries):
-                entries.append(item)
+                entries.append(normalized)
 
     def _append_knowledge(self, data: dict, knowledge):
         if not isinstance(knowledge, dict):
@@ -392,18 +566,207 @@ class CognitionStore:
                     bucket.append(value)
                     seen.add(sig)
 
-    def _append_attribute(self, data: dict, attr: str, value, timeline=None, source_artifact=None, locator=None, summary="", sequence=None, valid_from=None, valid_to=None, event_id=None):
+    @staticmethod
+    def _state_axis_keys(state: dict):
+        """Return every independently comparable temporal coordinate on a state.
+
+        A state may have both a narrative position and a story-world position.
+        They are separate indexes over the same canonical state; neither axis
+        is discarded merely because the other one is present.
+        """
+        temporal = state.get("temporal_position") or _normalize_temporal_position(
+            state.get("timeline"), state.get("story_time"), state.get("timeline_sequence")
+        )
+        story = temporal.get("story", {})
+        narrative = temporal.get("narrative", {})
+        keys = []
+        if story.get("ordinal") is not None:
+            kind = str(story.get("kind") or "story")
+            keys.append(("story", (kind, int(story["ordinal"]), int(story.get("scene") or 0))))
+        elif story.get("chapter") is not None:
+            keys.append(("story", ("chapter", int(story["chapter"]), int(story.get("scene") or 0))))
+        if narrative.get("sequence") is not None:
+            keys.append(("narrative", (int(narrative["sequence"]),)))
+        elif narrative.get("chapter") is not None:
+            keys.append(("narrative", (int(narrative["chapter"]), int(narrative.get("scene") or 0))))
+        return keys
+
+    @staticmethod
+    def _state_axis_and_key(state: dict):
+        """Compatibility helper returning the first canonical temporal axis."""
+        keys = CognitionStore._state_axis_keys(state)
+        return keys[0] if keys else (None, None)
+
+    def _recompute_state_intervals(self, states: list[dict]):
+        """Maintain independent half-open intervals for both temporal axes.
+
+        One canonical state can carry both narrative and story coordinates.
+        Their interval boundaries must therefore be stored separately; a later
+        update on one axis must never overwrite the boundary computed for the
+        other axis.
+        """
+        groups = {}
+        for state in states:
+            for axis, key in self._state_axis_keys(state):
+                groups.setdefault(axis, []).append((key, state))
+
+        for axis, items in groups.items():
+            items.sort(key=lambda item: item[0])
+            for idx, (_key, state) in enumerate(items):
+                boundaries = state.setdefault("validity", {})
+                axis_boundary = boundaries.setdefault(axis, {})
+                explicit = bool(state.get("valid_to_explicit"))
+                if explicit:
+                    axis_boundary.setdefault("valid_to", state.get("valid_to"))
+                    axis_boundary.setdefault("valid_to_temporal_position", state.get("valid_to_temporal_position"))
+                    continue
+                next_state = items[idx + 1][1] if idx + 1 < len(items) else None
+                next_temporal = next_state.get("temporal_position") if next_state else None
+                axis_boundary["valid_to"] = next_state.get("valid_from") if next_state else None
+                axis_boundary["valid_to_temporal_position"] = next_temporal
+
+        # Retain legacy top-level fields only as compatibility metadata. They no
+        # longer participate in temporal resolution because they cannot represent
+        # two independent axes without ambiguity.
+        for state in states:
+            validity = state.get("validity") or {}
+            if "story" in validity and "narrative" not in validity:
+                state["validity_axis"] = "story"
+            elif "narrative" in validity and "story" not in validity:
+                state["validity_axis"] = "narrative"
+            else:
+                state["validity_axis"] = "both" if validity else None
+
+    @staticmethod
+    def _temporal_request_axis(position: dict):
+        """Return the requested temporal axis and comparable coordinate.
+
+        Resolution never converts an unstructured story-time string into a
+        guessed coordinate. A story request is resolvable only when it carries
+        an explicit ordinal/chapter/scene coordinate; narrative resolution uses
+        an explicit sequence/chapter/scene coordinate.
+        """
+        if not isinstance(position, dict):
+            return None, None
+        temporal = position.get("temporal_position") if isinstance(position.get("temporal_position"), dict) else position
+        story = temporal.get("story") if isinstance(temporal.get("story"), dict) else None
+        narrative = temporal.get("narrative") if isinstance(temporal.get("narrative"), dict) else None
+        if story:
+            if story.get("ordinal") is not None:
+                return "story", (str(story.get("kind") or "story"), int(story["ordinal"]), int(story.get("scene") or 0))
+            if story.get("chapter") is not None:
+                return "story", ("chapter", int(story["chapter"]), int(story.get("scene") or 0))
+        if narrative:
+            if narrative.get("sequence") is not None:
+                return "narrative", (int(narrative["sequence"]),)
+            if narrative.get("chapter") is not None:
+                return "narrative", (int(narrative["chapter"]), int(narrative.get("scene") or 0))
+        return None, None
+
+    @staticmethod
+    def _state_temporal_position(state: dict):
+        position = state.get("temporal_position")
+        if isinstance(position, dict):
+            return position
+        return _normalize_temporal_position(
+            state.get("timeline"),
+            state.get("story_time"),
+            state.get("timeline_sequence"),
+        )
+
+    def _resolve_states_at(self, states: list[dict], as_of: dict | None = None):
+        """Resolve one historical state using the canonical temporal intervals.
+
+        Intervals are half-open: [valid_from, valid_to). The resolver selects
+        only states on the requested axis and never falls back from story time
+        to narrative order. If the requested position cannot be compared, the
+        result explicitly reports that instead of choosing a potentially wrong
+        state.
+        """
+        states = list(states or [])
+        if not states:
+            return {"found": False, "reason": "no_states", "state": None}
+        axis, target = self._temporal_request_axis(as_of or {})
+        if axis is None or target is None:
+            return {"found": False, "reason": "unresolvable_temporal_position", "state": None}
+
+        matches = []
+        for state in states:
+            state_keys = dict(self._state_axis_keys(state))
+            start = state_keys.get(axis)
+            if start is None or start > target:
+                continue
+            end = None
+            validity = state.get("validity") or {}
+            axis_boundary = validity.get(axis) if isinstance(validity, dict) else None
+            end_position = axis_boundary.get("valid_to_temporal_position") if isinstance(axis_boundary, dict) else None
+            if isinstance(end_position, dict):
+                end_axis, end = self._temporal_request_axis({"temporal_position": end_position})
+                if end_axis != axis:
+                    end = None
+            if end is not None and target >= end:
+                continue
+            matches.append(state)
+
+        if not matches:
+            return {"found": False, "reason": "no_state_at_position", "axis": axis, "position": target, "state": None}
+        matches.sort(key=lambda state: dict(self._state_axis_keys(state)).get(axis))
+        state = matches[-1]
+        return {
+            "found": True,
+            "axis": axis,
+            "position": target,
+            "state": state,
+        }
+
+    def resolve_attribute_state(self, entity_id, attribute, as_of):
+        """Resolve an entity attribute at an explicit historical position."""
+        entity = self._read_entity(str(entity_id))
+        if not entity:
+            return {"found": False, "reason": "unknown_entity", "entity_id": str(entity_id), "attribute": str(attribute)}
+        states = (entity.get("attributes") or {}).get(str(attribute), [])
+        result = self._resolve_states_at(states, as_of)
+        result.update({"entity_id": str(entity_id), "attribute": str(attribute)})
+        return result
+
+    def resolve_entity_state(self, entity_id, as_of, attributes=None):
+        """Resolve all requested entity attributes at one historical position."""
+        entity = self._read_entity(str(entity_id))
+        if not entity:
+            return {"found": False, "reason": "unknown_entity", "entity_id": str(entity_id), "attributes": {}}
+        names = [str(x) for x in attributes] if attributes else list((entity.get("attributes") or {}).keys())
+        resolved = {}
+        for name in names:
+            item = self._resolve_states_at((entity.get("attributes") or {}).get(name, []), as_of)
+            if item.get("found"):
+                resolved[name] = item["state"]
+        return {
+            "found": bool(resolved),
+            "entity_id": str(entity_id),
+            "position": as_of,
+            "attributes": resolved,
+        }
+
+    def _append_attribute(self, data: dict, attr: str, value, timeline=None, source_artifact=None, locator=None, summary="", sequence=None, valid_from=None, valid_to=None, event_id=None, temporal_position=None):
         states = data.setdefault("attributes", {}).setdefault(str(attr), [])
-        sig = json.dumps({"value": value, "timeline": timeline, "source_artifact": source_artifact, "locator": locator, "event_id": event_id}, sort_keys=True, ensure_ascii=False)
-        if any(json.dumps({"value": s.get("value"), "timeline": s.get("timeline"), "source_artifact": s.get("source_artifact"), "locator": s.get("source_locator"), "event_id": s.get("event_id")}, sort_keys=True, ensure_ascii=False) == sig for s in states):
+        temporal = temporal_position or _normalize_temporal_position(timeline, None, sequence)
+        sig = json.dumps({"value": value, "temporal_position": temporal, "source_artifact": source_artifact, "locator": locator, "event_id": event_id}, sort_keys=True, ensure_ascii=False)
+        if any(json.dumps({"value": s.get("value"), "temporal_position": s.get("temporal_position") or _normalize_temporal_position(s.get("timeline"), s.get("story_time"), s.get("timeline_sequence")), "source_artifact": s.get("source_artifact"), "locator": s.get("source_locator"), "event_id": s.get("event_id")}, sort_keys=True, ensure_ascii=False) == sig for s in states):
             return
+        narrative = temporal.get("narrative", {})
+        explicit_valid_to = valid_to is not None
         rec = {
             "value": value,
             "summary": summary,
             "timeline": timeline,
-            "timeline_sequence": sequence if sequence is not None else _timeline_rank(timeline),
+            "temporal_position": temporal,
+            "timeline_sequence": narrative.get("sequence", sequence if sequence is not None else _timeline_rank(timeline)),
             "valid_from": valid_from or timeline,
             "valid_to": valid_to,
+            "valid_from_temporal_position": temporal,
+            "valid_to_temporal_position": None,
+            "validity_axis": None,
+            "valid_to_explicit": explicit_valid_to,
             "event_id": event_id,
             "source_artifact": source_artifact,
             "source_locator": locator,
@@ -411,6 +774,7 @@ class CognitionStore:
             "sequence": len(states) + 1,
         }
         states.append(rec)
+        self._recompute_state_intervals(states)
 
     def upsert_entity_update(self, update, source_artifact=None, chunk_index=0, default_timeline=None, default_sequence=None):
         eid = str(update.get("id") or update.get("stable_id") or update.get("name") or "")
@@ -431,6 +795,11 @@ class CognitionStore:
                 data["tags"].append(str(tag))
         self._append_knowledge(data, update.get("knowledge"))
         timeline = update.get("timeline") or default_timeline
+        temporal_position = _normalize_temporal_position(
+            update.get("narrative_position") or {"label": timeline, "sequence": update.get("sequence", default_sequence)},
+            update.get("story_time"),
+            update.get("sequence", default_sequence),
+        )
         provenance = update.get("provenance") or update.get("locations") or []
         self._record_provenance(data, provenance)
         for attr, value in (update.get("attributes") or {}).items():
@@ -441,9 +810,10 @@ class CognitionStore:
                     locator=value.get("locator"), summary=value.get("summary", ""),
                     sequence=value.get("sequence", default_sequence), valid_from=value.get("valid_from"),
                     valid_to=value.get("valid_to"), event_id=value.get("event_id") or value.get("valid_from_event"),
+                    temporal_position=value.get("temporal_position") or _normalize_temporal_position(value.get("narrative_position") or {"label": value.get("timeline", timeline), "sequence": value.get("sequence", default_sequence)}, value.get("story_time"), value.get("sequence", default_sequence)),
                 )
             else:
-                self._append_attribute(data, attr, value, timeline, source_artifact, None, "", default_sequence)
+                self._append_attribute(data, attr, value, timeline, source_artifact, None, "", default_sequence, temporal_position=temporal_position)
         for ref_kind in ("relationships", "events", "locations", "concepts", "definitions", "knowledge_links"):
             refs = []
             for item in update.get(ref_kind) or []:
@@ -452,6 +822,7 @@ class CognitionStore:
                 elif isinstance(item, dict) and item.get("id"):
                     refs.append({"id": str(item["id"])})
             data[ref_kind] = self._append_unique(data.get(ref_kind, []), refs)
+        data["last_update_temporal_position"] = temporal_position
         if update.get("timeline_entry"):
             data["timeline"] = self._append_unique(data.get("timeline", []), [update["timeline_entry"]])
         if source_artifact:
@@ -472,7 +843,15 @@ class CognitionStore:
         self._write_master(m)
         self.db.sync_entity_index(self, eid)
         if description_addition or update.get("knowledge") or update.get("attributes"):
-            timeline_entry = {"sequence": default_sequence, "timeline": timeline, "kind": "entity_update", "object_id": eid}
+            timeline_entry = {
+                "sequence": default_sequence,
+                "timeline": timeline,
+                "narrative_position": temporal_position.get("narrative", {}),
+                "story_time": temporal_position.get("story", {}),
+                "temporal_position": temporal_position,
+                "kind": "entity_update",
+                "object_id": eid,
+            }
             data["timeline"] = self._append_unique(data.get("timeline", []), [timeline_entry])
             self._write_json(path, data)
             self.append_timeline_entry(timeline or "document", timeline_entry)
@@ -505,10 +884,15 @@ class CognitionStore:
         rec.setdefault("evolution", [])
         addition = record.get("description", "")
         rec["description"] = self._append_text(existing.get("description", ""), addition)
+        temporal_position = _normalize_temporal_position({"label": timeline}, record.get("story_time"), record.get("sequence"))
+        if record.get("temporal_position"):
+            temporal_position = record["temporal_position"]
+        rec["last_update_temporal_position"] = temporal_position
         if addition:
             observation = {
                 "sequence": len(rec["evolution"]) + 1,
                 "timeline": timeline,
+                "temporal_position": temporal_position,
                 "description": addition,
                 "source_artifact": source_artifact,
                 "locator": location,
@@ -531,7 +915,7 @@ class CognitionStore:
             self._record_provenance(rec, [{"artifact_id": source_artifact, "locator": location}])
         self._write_json(path, rec)
         if addition:
-            self.append_timeline_entry(timeline or "document", {"sequence": len(rec["evolution"]), "kind": kind, "object_id": ident})
+            self.append_timeline_entry(timeline or "document", {"sequence": len(rec["evolution"]), "temporal_position": temporal_position, "kind": kind, "object_id": ident})
         return rec
 
     def upsert_canonical(self, kind, record, source_artifact=None, timeline=None, location=None):
@@ -545,8 +929,20 @@ class CognitionStore:
             return False
         path = self._entity_path(entity_id)
         data = self._read_json(path, {})
-        self._append_attribute(data, attribute, new_value, timeline=timeline, source_artifact=source_artifact, locator=locator, summary=description, sequence=sequence, valid_from=timeline, event_id=event_id)
-        entry = {"sequence": sequence, "timeline": timeline, "kind": "state_change", "object_id": event_id, "entity_ids": [entity_id], "attribute": attribute}
+        temporal_position = _normalize_temporal_position({"label": timeline, "sequence": sequence}, None, sequence)
+        self._append_attribute(data, attribute, new_value, timeline=timeline, source_artifact=source_artifact, locator=locator, summary=description, sequence=sequence, valid_from=timeline, event_id=event_id, temporal_position=temporal_position)
+        entry = {
+            "sequence": sequence,
+            "timeline": timeline,
+            "narrative_position": temporal_position.get("narrative", {}),
+            "story_time": temporal_position.get("story", {}),
+            "temporal_position": temporal_position,
+            "kind": "state_change",
+            "object_id": event_id,
+            "entity_ids": [entity_id],
+            "attribute": attribute,
+            "caused_by_event_id": event_id,
+        }
         data["timeline"] = self._append_unique(data.get("timeline", []), [entry])
         self._record_provenance(data, [{"artifact_id": source_artifact, "locator": locator, "event_id": event_id}])
         data["updated_at"] = now_iso()
@@ -556,28 +952,90 @@ class CognitionStore:
         return True
 
     def add_relationship(self, rel, default_source=None, source_artifact=None, timeline=None, data=None):
+        """Persist one canonical relationship with an explicit participant set.
+
+        ``participants`` is authoritative.  Each participant is a structured
+        reference with an id, kind, and optional role.  ``source``/``target``
+        remain as derived compatibility fields for the existing binary index
+        and callers; they are never the canonical representation.
+        """
         if not isinstance(rel, dict):
             return None
+
+        raw_participants = rel.get("participants")
+        participants = []
+        if isinstance(raw_participants, (list, tuple)):
+            for item in raw_participants:
+                if isinstance(item, str):
+                    pid = item.strip()
+                    if pid:
+                        participants.append({"id": pid, "kind": "entity"})
+                elif isinstance(item, dict):
+                    pid = item.get("id") or item.get("entity_id") or item.get("participant_id")
+                    if pid:
+                        participant = {
+                            "id": str(pid),
+                            "kind": str(item.get("kind") or item.get("type") or "entity"),
+                        }
+                        if item.get("role") is not None:
+                            participant["role"] = str(item["role"])
+                        participants.append(participant)
+
         source = str(rel.get("source") or rel.get("from") or default_source or "")
         target = str(rel.get("target") or rel.get("to") or "")
-        if not source or not target:
+        if not participants:
+            if source:
+                participants.append({"id": source, "kind": str(rel.get("source_kind") or "entity")})
+            if target and target != source:
+                participants.append({"id": target, "kind": str(rel.get("target_kind") or "entity")})
+        if not participants or len(participants) < 2:
             return None
-        rid = str(rel.get("id") or f"relationship:{source}:{rel.get('type','related_to')}:{target}")
+
+        # Preserve participant order because roles/direction can be meaningful.
+        deduped = []
+        seen = set()
+        for participant in participants:
+            key = (participant.get("kind", "entity"), participant.get("id"), participant.get("role"))
+            if key not in seen:
+                deduped.append(participant)
+                seen.add(key)
+        participants = deduped
+        if len(participants) < 2:
+            return None
+
+        if not source:
+            source = participants[0]["id"]
+        if not target:
+            target = participants[1]["id"]
+
+        relation_type = rel.get("type") or rel.get("relation_type") or "related_to"
+        participant_signature = "|".join(
+            f"{p.get('kind', 'entity')}:{p.get('id')}:{p.get('role', '')}" for p in participants
+        )
+        rid = str(rel.get("id") or f"relationship:{relation_type}:{participant_signature}")
         existing = self._read_object("relationship", rid)
+        temporal_position = rel.get("temporal_position") or _normalize_temporal_position(
+            {"label": rel.get("timeline", timeline), "sequence": rel.get("sequence")},
+            rel.get("story_time"),
+            rel.get("sequence"),
+        )
         rec = dict(existing)
         rec.update({
             "schema_version": self.SCHEMA_VERSION,
             "id": rid,
-            "type": rel.get("type") or rel.get("relation_type") or existing.get("type", "related_to"),
+            "type": relation_type,
+            "participants": participants,
+            # Compatibility projections.  Consumers should prefer participants.
             "source": source,
             "target": target,
-            "source_kind": rel.get("source_kind", existing.get("source_kind", "entity")),
-            "target_kind": rel.get("target_kind", existing.get("target_kind", "entity")),
-            "source_ref": {"kind": rel.get("source_kind", existing.get("source_kind", "entity")), "id": source},
-            "target_ref": {"kind": rel.get("target_kind", existing.get("target_kind", "entity")), "id": target},
+            "source_kind": participants[0].get("kind", "entity"),
+            "target_kind": participants[1].get("kind", "entity"),
+            "source_ref": {"kind": participants[0].get("kind", "entity"), "id": source},
+            "target_ref": {"kind": participants[1].get("kind", "entity"), "id": target},
             "state": rel.get("state", existing.get("state")),
             "description": self._append_text(existing.get("description", ""), rel.get("description") or rel.get("state") or ""),
             "timeline": rel.get("timeline", timeline),
+            "last_update_temporal_position": temporal_position,
             "evolution": list(existing.get("evolution") or []),
             "provenance": list(existing.get("provenance") or []),
             "created_at": existing.get("created_at", now_iso()),
@@ -586,6 +1044,8 @@ class CognitionStore:
         observation = {
             "sequence": len(rec["evolution"]) + 1,
             "timeline": rel.get("timeline", timeline),
+            "temporal_position": temporal_position,
+            "participants": participants,
             "state": rel.get("state"),
             "description": rel.get("description") or rel.get("state") or "",
             "source_artifact": source_artifact,
@@ -598,11 +1058,27 @@ class CognitionStore:
         if source_artifact:
             self._record_provenance(rec, [{"artifact_id": source_artifact, "locator": (rel.get("document_locations") or [])}])
         self._write_json(self._object_path("relationship", rid), rec)
-        self.db.add_relation({"id": rid, "from_id": source, "to_id": target, "relation_type": rec["type"], "description": rec["description"], "timeline": rec.get("timeline"), "source_artifact": source_artifact})
-        source_kind = rec.get("source_kind", "entity")
-        target_kind = rec.get("target_kind", "entity")
-        self._link_object_reference(source_kind, source, "relationships", rid, as_object=True)
-        self._link_object_reference(target_kind, target, "relationships", rid, as_object=True)
+
+        # SQLite remains a derived binary-relation index.  The canonical JSON
+        # retains the complete n-ary participant set.
+        self.db.add_relation({
+            "id": rid,
+            "from_id": source,
+            "to_id": target,
+            "relation_type": rec["type"],
+            "description": rec["description"],
+            "timeline": rec.get("timeline"),
+            "source_artifact": source_artifact,
+        })
+
+        for participant in participants:
+            self._link_object_reference(
+                participant.get("kind", "entity"),
+                participant["id"],
+                "relationships",
+                rid,
+                as_object=True,
+            )
         for loc in rel.get("document_locations") or []:
             self._attach_location("relationship", rid, loc, source_artifact)
         return rid
@@ -656,6 +1132,7 @@ class CognitionStore:
             pos["label"] = timeline
         if sequence is not None and pos.get("sequence") is None:
             pos["sequence"] = sequence
+        temporal_position = event.get("temporal_position") or _normalize_temporal_position(pos, event.get("story_time", pos.get("story_time")), pos.get("sequence", sequence))
         rec = dict(existing)
         rec.update({
             "schema_version": self.SCHEMA_VERSION,
@@ -667,6 +1144,7 @@ class CognitionStore:
             "location_ids": list(dict.fromkeys((existing.get("location_ids") or []) + [str(x) for x in (event.get("location_ids") or [])])),
             "concept_ids": list(dict.fromkeys((existing.get("concept_ids") or []) + [str(x) for x in (event.get("concept_ids") or [])])),
             "narrative_position": pos,
+            "temporal_position": temporal_position,
             "sequence": event.get("sequence", existing.get("sequence", sequence)),
             "previous_events": list(dict.fromkeys((existing.get("previous_events") or []) + [str(x) for x in (event.get("previous_events") or [])])),
             "next_events": list(dict.fromkeys((existing.get("next_events") or []) + [str(x) for x in (event.get("next_events") or [])])),
@@ -679,6 +1157,7 @@ class CognitionStore:
             "sequence": len(rec["evolution"]) + 1,
             "timeline": pos.get("label") or timeline,
             "story_time": pos.get("story_time"),
+            "temporal_position": temporal_position,
             "description": event.get("description") or event.get("event") or "",
             "state_changes": event.get("state_changes") or [],
             "source_artifact": source_artifact,
@@ -702,6 +1181,7 @@ class CognitionStore:
                         "sequence": pos.get("sequence", sequence),
                         "timeline": pos.get("label") or timeline,
                         "story_time": pos.get("story_time"),
+                        "temporal_position": temporal_position,
                         "kind": "event",
                         "object_id": event_id,
                     }
@@ -716,7 +1196,9 @@ class CognitionStore:
             self._attach_location("event", event_id, loc, source_artifact)
         self.append_timeline_entry(pos.get("label") or timeline or "document", {
             "sequence": pos.get("sequence", sequence),
-            "story_time": pos.get("story_time"),
+            "narrative_position": temporal_position.get("narrative", {}),
+            "story_time": temporal_position.get("story", {}),
+            "temporal_position": temporal_position,
             "kind": "event",
             "object_id": event_id,
             "entity_ids": rec["entities"],
@@ -730,22 +1212,100 @@ class CognitionStore:
             pass
 
     def append_timeline_entry(self, timeline_id, entry):
-        """Append a reference-only entry to the canonical global timeline.
+        """Append one canonical temporal transition/reference to the global timeline.
 
-        The timeline never duplicates event/entity descriptions. It records
-        ordering and references so the state of an object can be reconstructed
-        without maintaining a second copy of the underlying cognition.
+        The timeline is the authoritative temporal index. It records where a
+        cognition change occurred in narrative progression and, independently,
+        when the represented state/event exists in story time. It references
+        canonical cognition objects instead of duplicating their prose.
         """
         timeline_id = str(timeline_id or "document")
         global_path = self.timeline_root / "timeline.json"
-        existing = self._read_json(global_path, {"schema_version": self.SCHEMA_VERSION, "id": "timeline", "entries": []})
+        existing = self._read_json(
+            global_path,
+            {
+                "schema_version": self.SCHEMA_VERSION,
+                "timeline_schema_version": self.TIMELINE_SCHEMA_VERSION,
+                "temporal_model_version": self.TEMPORAL_MODEL_VERSION,
+                "id": "timeline",
+                "entries": [],
+            },
+        )
+        existing["schema_version"] = self.SCHEMA_VERSION
+        existing["timeline_schema_version"] = self.TIMELINE_SCHEMA_VERSION
+        existing["temporal_model_version"] = self.TEMPORAL_MODEL_VERSION
+
         entry = dict(entry or {})
         entry.setdefault("timeline", timeline_id)
+
+        temporal = entry.get("temporal_position")
+        if not isinstance(temporal, dict):
+            temporal = _normalize_temporal_position(
+                narrative=entry.get("narrative_position") or {
+                    "label": entry.get("timeline"),
+                    "sequence": entry.get("sequence"),
+                },
+                story_time=entry.get("story_time"),
+                sequence=entry.get("sequence"),
+            )
+        else:
+            # Re-normalize supplied positions so every timeline entry has the
+            # same canonical shape and model version.
+            temporal = _normalize_temporal_position(
+                narrative=temporal.get("narrative"),
+                story_time=temporal.get("story"),
+                sequence=entry.get("sequence"),
+            )
+
+        entry["temporal_position"] = temporal
+        entry["narrative_position"] = temporal["narrative"]
+        entry["story_time"] = temporal["story"]
+        entry["timeline_schema_version"] = self.TIMELINE_SCHEMA_VERSION
+
         entries = existing.setdefault("entries", [])
-        sig = json.dumps(entry, sort_keys=True, ensure_ascii=False)
-        if not any(json.dumps(x, sort_keys=True, ensure_ascii=False) == sig for x in entries):
+
+        def identity(item):
+            return json.dumps({
+                "kind": item.get("kind"),
+                "object_id": item.get("object_id"),
+                "attribute": item.get("attribute"),
+                "entity_ids": item.get("entity_ids") or [],
+                "narrative_position": item.get("narrative_position") or {},
+                "story_time": item.get("story_time") or {},
+            }, sort_keys=True, ensure_ascii=False)
+
+        incoming_id = identity(entry)
+        replaced = False
+        for index, old in enumerate(entries):
+            if identity(old) != incoming_id:
+                continue
+            # Preserve the canonical entry while enriching it with fields that
+            # became available later. Never create a second timeline record for
+            # the same semantic transition.
+            merged = dict(old)
+            for key, value in entry.items():
+                if value is not None and (key not in merged or merged[key] in (None, "", [], {})):
+                    merged[key] = value
+            entries[index] = merged
+            replaced = True
+            break
+        if not replaced:
             entries.append(entry)
-        entries.sort(key=lambda x: ((x.get("sequence") is None), x.get("sequence") or 10**12, str(x.get("timeline") or ""), str(x.get("story_time") or ""), str(x.get("object_id") or "")))
+
+        def sort_key(item):
+            n = item.get("narrative_position") or {}
+            return (
+                n.get("sequence") is None,
+                n.get("sequence") if n.get("sequence") is not None else 10**12,
+                n.get("chapter") if n.get("chapter") is not None else 10**12,
+                n.get("scene") if n.get("scene") is not None else 10**12,
+                str(n.get("session") or ""),
+                n.get("turn") if n.get("turn") is not None else 10**12,
+                str((item.get("story_time") or {}).get("label") or ""),
+                str(item.get("object_id") or ""),
+            )
+
+        entries.sort(key=sort_key)
         existing["updated_at"] = now_iso()
         self._write_json(global_path, existing)
 
@@ -753,6 +1313,8 @@ class CognitionStore:
         timelines = set(m.get("timelines") or [])
         timelines.add(timeline_id)
         m["timelines"] = sorted(timelines)
+        m["timeline_schema_version"] = self.TIMELINE_SCHEMA_VERSION
+        m["temporal_model_version"] = self.TEMPORAL_MODEL_VERSION
         self._write_master(m)
 
     def link_event_to_entity(self, entity_id, event_id):
@@ -910,46 +1472,6 @@ class CognitionStore:
     def search_cognition_metadata(self, query, limit=8):
         return {"query": query, "candidates": self._search_canonical(query, max(1, min(int(limit or 8), 50))), "source_loaded": False}
 
-    def retrieve(self, requests, max_chars=16000):
-        result = {"requests": []}
-        used = 0
-        for req in requests or []:
-            detail = str(req.get("detail", "summary")).lower()
-            ids = []
-            if req.get("entity_id"):
-                ids = [str(req["entity_id"])]
-            elif req.get("entity_ids"):
-                ids = [str(x) for x in req["entity_ids"]]
-            elif req.get("name") or req.get("query"):
-                ids = self.matching_entities(req.get("name") or req.get("query"))
-            for eid in ids[:20]:
-                entity = self._read_entity(eid)
-                if not entity:
-                    continue
-                item = {"id": eid, "type": entity.get("type"), "name": entity.get("name"), "summary": entity.get("summary", ""), "description": entity.get("description", ""), "tags": entity.get("tags", [])}
-                if detail in {"state", "section", "full"}:
-                    item["knowledge"] = entity.get("knowledge", {})
-                    item["attributes"] = entity.get("attributes", {})
-                    item["provenance"] = entity.get("provenance", [])
-                    item["timeline"] = entity.get("timeline", [])
-                if detail in {"full", "section"}:
-                    item["relationship_refs"] = entity.get("relationships", [])
-                    item["event_refs"] = entity.get("events", [])
-                    item["location_refs"] = entity.get("locations", [])
-                    item["concept_refs"] = entity.get("concepts", [])
-                if detail == "full":
-                    item["relationships"] = [self.relationships().get(r.get("id")) for r in entity.get("relationships", []) if isinstance(r, dict) and self.relationships().get(r.get("id"))]
-                    item["events"] = [self.event(r.get("id")) for r in entity.get("events", []) if isinstance(r, dict) and self.event(r.get("id"))]
-                    item["locations"] = [self._read_object("location", r.get("id")) for r in entity.get("locations", []) if isinstance(r, dict) and self._read_object("location", r.get("id"))]
-                payload = json.dumps(item, ensure_ascii=False)
-                if used + len(payload) > max_chars:
-                    break
-                result["requests"].append(item)
-                used += len(payload)
-        result["used_chars"] = used
-        result["truncated"] = used >= max_chars
-        return result
-
     def document_structure(self, artifact_id=None, query=None, limit=200):
         if artifact_id:
             return {"document": self.document_index.document(artifact_id), "sections": self.document_index.sections(artifact_id=artifact_id, query=query, limit=limit)}
@@ -1080,6 +1602,15 @@ class CognitionStore:
         if value:
             m["project_type"] = value
         self._write_master(m)
+
+    def commit_authoritative_change(self, message):
+        """Persist the current canonical state as one Git revision.
+
+        Git is versioning/provenance infrastructure only; canonical cognition
+        remains filesystem-authoritative.
+        """
+        from ragapp.core.vcs import VCSManager
+        return VCSManager(self).commit(str(message or "Canonical cognition update"))
 
     def mark_compiled(self):
         m = self.master_metadata()

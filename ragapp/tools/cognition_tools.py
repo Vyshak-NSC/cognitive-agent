@@ -1,91 +1,176 @@
-from __future__ import annotations
-
+import json
 from ragapp.tools.definitions import Tool
-
-
-def _section_cognition(store, section_id, artifact_id=None):
-    section = store.document_index.section(section_id)
-    if not section:
-        return {"found": False, "section_id": section_id}
-    result = {"found": True, "section": section, "entities": {}, "events": {}, "relationships": {}}
-    data = store.document_index._read()
-    for kind, key in (("entity", "entities"), ("event", "events"), ("relationship", "relationships"), ("location", "locations"), ("concept", "concepts")):
-        bucket = data.get(f"{kind}_locations", {})
-        for ident, locations in bucket.items():
-            if any((not artifact_id or loc.get("artifact_id") == artifact_id) and (section_id in (loc.get("section_ids") or []) or loc.get("chapter_id") == section_id or loc.get("scene_id") == section_id) for loc in locations):
-                if kind == "entity":
-                    obj = store.entity(ident)
-                elif kind == "event":
-                    obj = store.event(ident)
-                elif kind == "relationship":
-                    obj = store.relationships().get(ident)
-                else:
-                    obj = store._read_object(kind, ident)
-                if obj:
-                    result.setdefault(f"{kind}s", {})[ident] = obj
-    return result
+from ragapp.cognition.session_memory import SessionMemory
+from ragapp.core.retrieval import RetrievalStore
 
 
 def build_cognition_tools(store, session_id=None):
+    retrieval = RetrievalStore(store)
+
     return [
         Tool(
             "search_cognition_metadata",
-            "Search canonical persisted cognition and document structure without loading source text. Returns compact candidate IDs, kinds, names, summaries and provenance.",
-            {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
-            lambda query, limit=8: store.search_cognition_metadata(query, limit=limit),
+            "FIRST retrieval step for project-content questions. Search only compact local metadata and return candidate entities/files/source pointers. Never returns source content. Use the result to choose or refine the next targeted retrieval.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+            lambda query, limit=8: retrieval.search_metadata_candidates(query, limit=limit),
         ),
         Tool(
-            "get_cognition_object",
-            "Load one canonical cognition object by kind and ID. This returns derived cognition, not raw source text.",
-            {"type": "object", "properties": {"kind": {"type": "string", "enum": ["entity", "relationship", "event", "location", "concept", "definition", "knowledge"]}, "id": {"type": "string"}}, "required": ["kind", "id"]},
-            lambda kind, id: store.entity(id) if kind == "entity" else (store.event(id) if kind == "event" else store.relationships().get(id) if kind == "relationship" else store._read_object(kind, id)),
-        ),
-        Tool(
-            "get_relationship_history",
-            "Return the evolution of one canonical relationship without reading the source document.",
-            {"type": "object", "properties": {"relationship_id": {"type": "string"}}, "required": ["relationship_id"]},
-            lambda relationship_id: store.relationship_history(relationship_id),
-        ),
-        Tool(
-            "get_document_structure",
-            "Return document/chapter/section metadata and locators only.",
-            {"type": "object", "properties": {"artifact_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}},
-            lambda artifact_id=None, query=None, limit=200: store.document_structure(artifact_id=artifact_id, query=query, limit=limit),
-        ),
-        Tool(
-            "resolve_document_section",
-            "Resolve a chapter/section name to its exact structural locator without loading source text.",
-            {"type": "object", "properties": {"query": {"type": "string"}, "artifact_id": {"type": "string"}}, "required": ["query"]},
-            lambda query, artifact_id=None: store.resolve_document_section(query, artifact_id=artifact_id),
-        ),
-        Tool(
-            "get_section_cognition",
-            "Return canonical cognition associated with a document section without loading its source body.",
-            {"type": "object", "properties": {"section_id": {"type": "string"}, "artifact_id": {"type": "string"}}, "required": ["section_id"]},
-            lambda section_id, artifact_id=None: _section_cognition(store, section_id, artifact_id),
-        ),
-        Tool(
-            "get_cognition_locations",
-            "Return source locators for a canonical cognition object.",
-            {"type": "object", "properties": {"kind": {"type": "string"}, "id": {"type": "string"}}, "required": ["kind", "id"]},
-            lambda kind, id: store.cognition_locations(kind, id),
+            "get_cognition_index",
+            "Compatibility tool. Do not use for normal retrieval because it may be large. Use search_cognition_metadata instead.",
+            {"type": "object", "properties": {}},
+            lambda: {
+                "project_id": store.project_id,
+                "current_version": store.master_metadata().get("current_version", 0),
+                "entity_count": len(store.master_metadata().get("entities", {})),
+                "artifact_count": len(store.master_metadata().get("artifacts", {})),
+                "use": "Call search_cognition_metadata(query) for actual retrieval.",
+            },
         ),
         Tool(
             "request_cognition_context",
-            "Retrieve targeted canonical cognition. This never returns raw source content.",
-            {"type": "object", "properties": {"requests": {"type": "array", "items": {"type": "object"}}, "max_chars": {"type": "integer"}}, "required": ["requests"]},
-            lambda requests, max_chars=16000: store.retrieve(requests, max_chars=max_chars),
+            "Retrieve targeted cognition after a candidate has been identified. Prefer metadata/summary/state/section; request full only when necessary.",
+            {
+                "type": "object",
+                "properties": {
+                    "requests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": {"type": "string"},
+                                "entity_ids": {"type": "array", "items": {"type": "string"}},
+                                "event_id": {"type": "string"},
+                                "event_ids": {"type": "array", "items": {"type": "string"}},
+                                "event_query": {"type": "string"},
+                                "name": {"type": "string"},
+                                "query": {"type": "string"},
+                                "attributes": {"type": "array", "items": {"type": "string"}},
+                                "sections": {"type": "array", "items": {"type": "string"}},
+                                "timeline": {"type": "string"},
+                                "as_of": {"type": "object"},
+                                "story_time": {"type": "object"},
+                                "narrative_position": {"type": "object"},
+                                "temporal_position": {"type": "object"},
+                                "detail": {"type": "string", "enum": ["metadata", "summary", "state", "section", "full"]},
+                                "include_source": {"type": "boolean"},
+                            },
+                        },
+                    },
+                    "max_chars": {"type": "integer"},
+                },
+                "required": ["requests"],
+            },
+            lambda requests, max_chars=12000: retrieval.retrieve(requests, max_chars=max_chars),
         ),
         Tool(
-            "deliver_source_to_user",
-            "Read and return exact source evidence directly to the user. Use only when the user explicitly asks to see/show the source content; do not use this to obtain source text for reasoning.",
-            {"type": "object", "properties": {"artifact_id": {"type": "string"}, "locator": {"type": "object"}}, "required": ["artifact_id", "locator"]},
-            lambda artifact_id, locator: store.read_source_location(artifact_id, locator),
+            "get_entity_metadata",
+            "Return only metadata for named entities so the agent can decide whether a deeper fetch is necessary.",
+            {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}, "required": ["names"]},
+            lambda names: {"entities": [store.master_metadata().get("entities", {}).get(k) or (store.master_metadata().get("entities", {}).get(store.matching_entities(k)[0]) if store.matching_entities(k) else None) for k in names]},
         ),
-        Tool(
-            "read_source_location",
-            "Read exact source evidence only after a canonical cognition object or document structure has identified the locator.",
-            {"type": "object", "properties": {"artifact_id": {"type": "string"}, "locator": {"type": "object"}}, "required": ["artifact_id", "locator"]},
-            lambda artifact_id, locator: store.read_source_location(artifact_id, locator),
-        ),
+        Tool("get_state_map", "Legacy compatibility view. Do not use for retrieval; use search_cognition_metadata and request_cognition_context.", {"type": "object", "properties": {}}, lambda: {"project_id": store.project_id, "entity_count": len(store.master_metadata().get("entities", {})), "use": "search_cognition_metadata"}),
+        Tool("get_ledger", "Legacy compatibility view. Do not use for retrieval; use request_cognition_context.", {"type": "object", "properties": {}}, lambda: {"entity_count": len(store.master_metadata().get("entities", {})), "use": "request_cognition_context"}),
+        Tool("load_entities", "Load exact entity files and directly linked relationships. Use targeted names only.", {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}, "required": ["names"]}, lambda names: store.load_entities(names)),
+        Tool("record_fact", "Persist a durable fact with provenance/confidence/temporal validity.", {"type": "object", "properties": {"claim": {"type": "string"}, "status": {"type": "string"}, "confidence": {"type": "number"}, "evidence_ids": {"type": "array", "items": {"type": "string"}}, "entities": {"type": "array", "items": {"type": "string"}}, "valid_from": {"type": "string"}, "valid_to": {"type": "string"}, "source": {"type": "string"}}, "required": ["claim"]}, lambda **a: _record_knowledge(store, "fact", a)),
+        Tool("record_evidence", "Persist evidence and its source locator.", {"type": "object", "properties": {"claim": {"type": "string"}, "source_file": {"type": "string"}, "locator": {"type": "string"}, "excerpt": {"type": "string"}, "reliability": {"type": "number"}, "source_type": {"type": "string"}, "source": {"type": "string"}}, "required": ["claim"]}, lambda **a: _record_knowledge(store, "evidence", a)),
+        Tool("record_hypothesis", "Persist a testable hypothesis and supporting/disconfirming evidence.", {"type": "object", "properties": {"statement": {"type": "string"}, "status": {"type": "string"}, "confidence": {"type": "number"}, "supporting_evidence": {"type": "array", "items": {"type": "string"}}, "disconfirming_evidence": {"type": "array", "items": {"type": "string"}}}, "required": ["statement"]}, lambda **a: _record_knowledge(store, "hypothesis", a)),
+        Tool("record_decision", "Persist decision, rationale, alternatives and consequences.", {"type": "object", "properties": {"decision": {"type": "string"}, "rationale": {"type": "string"}, "alternatives": {"type": "array", "items": {"type": "string"}}, "consequences": {"type": "array", "items": {"type": "string"}}, "owner": {"type": "string"}}, "required": ["decision", "rationale"]}, lambda **a: _record_knowledge(store, "decision", a)),
+        Tool("record_dependency", "Persist a relationship/dependency between project elements.", {"type": "object", "properties": {"source": {"type": "string"}, "target": {"type": "string"}, "relation": {"type": "string"}, "impact": {"type": "string"}}, "required": ["source", "target", "relation"]}, lambda **a: _record_dependency(store, a)),
+        Tool("record_change", "Persist a change and its affected elements/validation.", {"type": "object", "properties": {"description": {"type": "string"}, "affected": {"type": "array", "items": {"type": "string"}}, "caused_by": {"type": "string"}, "validation": {"type": "string"}}, "required": ["description"]}, lambda **a: _record_knowledge(store, "change", a)),
+        Tool("get_contradictions", "Find candidate contradictions requiring validation.", {"type": "object", "properties": {}}, lambda: _validate(store)["contradiction_candidates"]),
+        Tool("analyze_impact", "Return project elements that may be affected by a change using persisted dependencies.", {"type": "object", "properties": {"element": {"type": "string"}}, "required": ["element"]}, lambda element: _impact(store, element)),
+        Tool("validate_cognition", "Check cognition integrity.", {"type": "object", "properties": {}}, lambda: _validate(store)),
+        Tool("get_world_model", "Return facts, evidence, hypotheses, decisions, dependencies, changes and open questions.", {"type": "object", "properties": {"query": {"type": "string"}}}, lambda query="": _world_model_snapshot(store, query)),
+        Tool("distill_session", "Persist a durable episode from the current conversation.", {"type": "object", "properties": {"transcript": {"type": "array", "items": {"type": "object"}}}, "required": ["transcript"]}, lambda transcript: SessionMemory(store).distill(session_id or "unknown", transcript)),
     ]
+
+
+def _record_knowledge(store, subtype, data):
+    import uuid
+    payload = dict(data or {})
+    ident = str(payload.pop("id", "") or f"{subtype}:{uuid.uuid4().hex}")
+    payload.update({"id": ident, "subtype": subtype})
+    result = store.upsert_canonical("knowledge", payload, source_artifact=payload.get("source"))
+    store.commit_authoritative_change(f"Record {subtype}")
+    return result
+
+
+def _record_dependency(store, data):
+    import uuid
+    payload = dict(data or {})
+    ident = str(payload.pop("id", "") or f"dependency:{uuid.uuid4().hex}")
+    payload.update({"id": ident, "type": "dependency", "relation_type": payload.get("relation") or "depends_on", "participants": [
+        {"id": str(payload.get("source")), "kind": "entity", "role": "source"},
+        {"id": str(payload.get("target")), "kind": "entity", "role": "target"},
+    ]})
+    result = store.add_relationship(payload)
+    store.commit_authoritative_change("Record dependency")
+    return result
+
+
+def _knowledge_snapshot(store):
+    grouped = {"facts": {}, "evidence": {}, "hypotheses": {}, "decisions": {}, "changes": {}}
+    for rec in store._all_kind_records("knowledge"):
+        subtype = str(rec.get("subtype") or "")
+        bucket = {"fact": "facts", "evidence": "evidence", "hypothesis": "hypotheses", "decision": "decisions", "change": "changes"}.get(subtype)
+        if bucket:
+            grouped[bucket][str(rec.get("id"))] = rec
+    grouped["dependencies"] = {rid: rel for rid, rel in store.relationships().items() if rel.get("type") == "dependency" or rel.get("relation_type") == "dependency"}
+    grouped["contradictions"] = {}
+    grouped["open_questions"] = {}
+    return grouped
+
+
+def _world_model_snapshot(store, query=""):
+    m = _knowledge_snapshot(store)
+    if not query:
+        return m
+    q = str(query).lower()
+    return {k: {i: v for i, v in bucket.items() if q in json.dumps(v, ensure_ascii=False).lower()} if isinstance(bucket, dict) else bucket for k, bucket in m.items()}
+
+
+def _impact(store, element):
+    deps = _knowledge_snapshot(store).get("dependencies", {})
+    affected = []
+    seen = {element}
+    queue = [element]
+    while queue:
+        cur = queue.pop(0)
+        for d in deps.values():
+            if d.get("source") == cur and d.get("target") not in seen:
+                seen.add(d.get("target")); queue.append(d.get("target")); affected.append(d)
+            elif d.get("target") == cur and d.get("source") not in seen:
+                seen.add(d.get("source")); queue.append(d.get("source")); affected.append(d)
+    return {"element": element, "affected": affected}
+
+
+
+def _contradictions(store):
+    facts = list(_knowledge_snapshot(store).get("facts", {}).values())
+    out = []
+    for i, a in enumerate(facts):
+        for b in facts[i + 1:]:
+            if set(a.get("entities", [])) & set(b.get("entities", [])) and a.get("claim") and b.get("claim"):
+                if a.get("status") == "supported" and b.get("status") == "supported" and a.get("claim", "").lower() != b.get("claim", "").lower():
+                    out.append({"fact_a": a["id"], "fact_b": b["id"], "reason": "same entities with competing supported claims"})
+    return out
+
+def _validate(store):
+    m = _knowledge_snapshot(store)
+    evidence = set(m.get("evidence", {}))
+    errors = []
+    for fid, f in m.get("facts", {}).items():
+        for eid in f.get("evidence_ids", []):
+            if eid not in evidence:
+                errors.append({"fact": fid, "missing_evidence": eid})
+    for did, d in m.get("decisions", {}).items():
+        if not d.get("rationale"):
+            errors.append({"decision": did, "error": "missing rationale"})
+    return {"valid": not errors, "errors": errors, "contradiction_candidates": _contradictions(store)}

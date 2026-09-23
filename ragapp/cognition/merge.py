@@ -96,8 +96,12 @@ def merge_deltas(store: CognitionStore, deltas, source_label="generation", event
             rejected.append({"event": event, "error": str(exc)})
 
     store.mark_compiled()
+    git_commit = None
+    if applied:
+        git_commit = store.commit_authoritative_change("Merge durable cognition")
     return {
         "version": store.master_metadata().get("current_version", 0),
         "applied": applied,
         "rejected": rejected,
+        "git_commit": git_commit,
     }

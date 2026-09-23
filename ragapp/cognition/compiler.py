@@ -584,6 +584,7 @@ def _compile_project_impl(
         store.ensure_initialized()
         store.mark_compiled()
         sync_store(store)
+        commit_id = store.commit_authoritative_change("Compile canonical cognition")
         return {
             "status": "compiled",
             "project_id": store.project_id,
@@ -594,6 +595,7 @@ def _compile_project_impl(
             "chunks": 0,
             "deterministic_code": deterministic_result or {},
             "skipped_chunks": [],
+            "git_commit": commit_id,
         }
 
     # All non-code documents now use the structure-aware compiler.
@@ -614,4 +616,6 @@ def _compile_project_impl(
     document_result["workspace_files"] = sum(
         1 for area, _, _ in files if area == "workspace"
     )
+    sync_store(store)
+    document_result["git_commit"] = store.commit_authoritative_change("Compile canonical cognition")
     return document_result
