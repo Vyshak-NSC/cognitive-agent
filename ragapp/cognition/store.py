@@ -275,44 +275,6 @@ class CognitionStore:
             if folder.exists() and folder.is_dir():
                 shutil.rmtree(folder, ignore_errors=True)
 
-    def reset_source_derived_cognition(self):
-        """Clear all source-derived cognition and rebuild from current source."""
-        import shutil
-
-        self.ensure_initialized()
-        self._remove_legacy_cognition_files()
-        for root in (
-            self.entities_root, self.relationships_root, self.events_root,
-            self.locations_root, self.concepts_root, self.definitions_root,
-            self.knowledge_root, self.timeline_root,
-        ):
-            if root.exists():
-                shutil.rmtree(root, ignore_errors=True)
-
-        m = {
-            "schema_version": self.SCHEMA_VERSION,
-            "temporal_model_version": self.TEMPORAL_MODEL_VERSION,
-            "project_id": self.project_id,
-            "project_type": "domain",
-            "current_version": 0,
-            "artifacts": {},
-            "entities": {},
-            "counts": {},
-            "timelines": [],
-            "temporal_model": {
-                "version": self.TEMPORAL_MODEL_VERSION,
-                "timeline_schema_version": self.TIMELINE_SCHEMA_VERSION,
-                "axes": ["narrative", "story"],
-                "narrative": "document/chat progression; independent from story chronology",
-                "story": "in-story chronology; may diverge from narrative order",
-            },
-            "compiled": False,
-        }
-        self._write_master(m)
-        self._db_reset()
-        self._document_index = None
-        return True
-
     def _db_reset(self):
         db = self.db
         with db.conn() as conn:
@@ -747,12 +709,12 @@ class CognitionStore:
             "attributes": resolved,
         }
 
-    def _append_attribute(self, data: dict, attr: str, value, timeline=None, source_artifact=None, locator=None, summary="", sequence=None, valid_from=None, valid_to=None, event_id=None, temporal_position=None):
+    def _append_attribute(self, data: dict, attr: str, value, timeline=None, source_artifact=None, locator=None, summary="", sequence=None, valid_from=None, valid_to=None, event_id=None, temporal_position=None, authority=None):
         states = data.setdefault("attributes", {}).setdefault(str(attr), [])
         temporal = temporal_position or _normalize_temporal_position(timeline, None, sequence)
         sig = json.dumps({"value": value, "temporal_position": temporal, "source_artifact": source_artifact, "locator": locator, "event_id": event_id}, sort_keys=True, ensure_ascii=False)
         if any(json.dumps({"value": s.get("value"), "temporal_position": s.get("temporal_position") or _normalize_temporal_position(s.get("timeline"), s.get("story_time"), s.get("timeline_sequence")), "source_artifact": s.get("source_artifact"), "locator": s.get("source_locator"), "event_id": s.get("event_id")}, sort_keys=True, ensure_ascii=False) == sig for s in states):
-            return
+            return None
         narrative = temporal.get("narrative", {})
         explicit_valid_to = valid_to is not None
         rec = {
@@ -770,13 +732,15 @@ class CognitionStore:
             "event_id": event_id,
             "source_artifact": source_artifact,
             "source_locator": locator,
+            "authority": authority or ("source" if source_artifact else "durable"),
             "recorded_at": now_iso(),
             "sequence": len(states) + 1,
         }
         states.append(rec)
         self._recompute_state_intervals(states)
+        return rec
 
-    def upsert_entity_update(self, update, source_artifact=None, chunk_index=0, default_timeline=None, default_sequence=None):
+    def upsert_entity_update(self, update, source_artifact=None, chunk_index=0, default_timeline=None, default_sequence=None, change_metadata=None):
         eid = str(update.get("id") or update.get("stable_id") or update.get("name") or "")
         if not eid:
             raise ValueError("entity update requires id")
@@ -802,18 +766,26 @@ class CognitionStore:
         )
         provenance = update.get("provenance") or update.get("locations") or []
         self._record_provenance(data, provenance)
+        state_authority = (change_metadata or {}).get("authority") if isinstance(change_metadata, dict) else None
+        state_authority = state_authority or ("source" if source_artifact else "durable")
+        new_states = {}
+        previous_states = {}
+        for attr in (update.get("attributes") or {}):
+            prior = self.latest_attribute_state(eid, attr)
+            previous_states[str(attr)] = dict(prior) if isinstance(prior, dict) else None
         for attr, value in (update.get("attributes") or {}).items():
             if isinstance(value, dict):
-                self._append_attribute(
+                new_states[str(attr)] = self._append_attribute(
                     data, attr, value.get("value", value.get("state")),
                     timeline=value.get("timeline", timeline), source_artifact=source_artifact,
                     locator=value.get("locator"), summary=value.get("summary", ""),
                     sequence=value.get("sequence", default_sequence), valid_from=value.get("valid_from"),
                     valid_to=value.get("valid_to"), event_id=value.get("event_id") or value.get("valid_from_event"),
                     temporal_position=value.get("temporal_position") or _normalize_temporal_position(value.get("narrative_position") or {"label": value.get("timeline", timeline), "sequence": value.get("sequence", default_sequence)}, value.get("story_time"), value.get("sequence", default_sequence)),
+                    authority=state_authority,
                 )
             else:
-                self._append_attribute(data, attr, value, timeline, source_artifact, None, "", default_sequence, temporal_position=temporal_position)
+                new_states[str(attr)] = self._append_attribute(data, attr, value, timeline, source_artifact, None, "", default_sequence, temporal_position=temporal_position, authority=state_authority)
         for ref_kind in ("relationships", "events", "locations", "concepts", "definitions", "knowledge_links"):
             refs = []
             for item in update.get(ref_kind) or []:
@@ -853,6 +825,48 @@ class CognitionStore:
                 "object_id": eid,
             }
             data["timeline"] = self._append_unique(data.get("timeline", []), [timeline_entry])
+
+            # Attribute mutations get an explicit change-ledger record. This is
+            # intentionally separate from the canonical attribute state: the
+            # entity file stores the current/history of the value, while the
+            # global timeline records how cognition moved from the prior value
+            # to the new value and which observation is current.
+            for attr in (update.get("attributes") or {}):
+                latest = self.latest_attribute_state(eid, attr)
+                if not latest:
+                    continue
+                prior = previous_states.get(str(attr))
+                new_state = new_states.get(str(attr))
+                is_current = bool(new_state and latest.get("recorded_at") == new_state.get("recorded_at"))
+                change = dict(change_metadata or {})
+                change.setdefault("change_id", f"state:{eid}:{attr}:{new_state.get('recorded_at', now_iso()) if isinstance(new_state, dict) else now_iso()}")
+                change.update({
+                    "kind": "state_change",
+                    "object_id": eid,
+                    "attribute": str(attr),
+                    "previous_value": prior.get("value") if isinstance(prior, dict) else None,
+                    "new_value": new_state.get("value") if isinstance(new_state, dict) else latest.get("value"),
+                    "previous_state_recorded_at": prior.get("recorded_at") if isinstance(prior, dict) else None,
+                    "new_state_recorded_at": new_state.get("recorded_at") if isinstance(new_state, dict) else latest.get("recorded_at"),
+                    "current": is_current,
+                    "current_state": {
+                        "value": latest.get("value"),
+                        "valid_from": latest.get("valid_from"),
+                        "valid_to": latest.get("valid_to"),
+                        "event_id": latest.get("event_id"),
+                    },
+                    "sequence": latest.get("timeline_sequence", default_sequence),
+                    "timeline": (new_state or latest).get("timeline") or timeline,
+                    "narrative_position": (new_state or latest).get("temporal_position", {}).get("narrative", temporal_position.get("narrative", {})),
+                    "story_time": (new_state or latest).get("temporal_position", {}).get("story", temporal_position.get("story", {})),
+                    "temporal_position": (new_state or latest).get("temporal_position") or temporal_position,
+                    "source_artifact": (new_state or latest).get("source_artifact") or source_artifact,
+                    "source_locator": (new_state or latest).get("source_locator"),
+                    "authority": (new_state or latest).get("authority") or state_authority,
+                })
+                data["timeline"] = self._append_unique(data.get("timeline", []), [change])
+                self.append_timeline_entry(change.get("timeline") or "document", change)
+
             self._write_json(path, data)
             self.append_timeline_entry(timeline or "document", timeline_entry)
         return eid
@@ -930,7 +944,14 @@ class CognitionStore:
         path = self._entity_path(entity_id)
         data = self._read_json(path, {})
         temporal_position = _normalize_temporal_position({"label": timeline, "sequence": sequence}, None, sequence)
-        self._append_attribute(data, attribute, new_value, timeline=timeline, source_artifact=source_artifact, locator=locator, summary=description, sequence=sequence, valid_from=timeline, event_id=event_id, temporal_position=temporal_position)
+        new_state = self._append_attribute(
+            data, attribute, new_value, timeline=timeline, source_artifact=source_artifact,
+            locator=locator, summary=description, sequence=sequence, valid_from=timeline,
+            event_id=event_id, temporal_position=temporal_position,
+            authority="source" if source_artifact else "durable",
+        )
+        latest = self.latest_attribute_state(entity_id, attribute)
+        is_current = bool(new_state and latest and latest.get("recorded_at") == new_state.get("recorded_at"))
         entry = {
             "sequence": sequence,
             "timeline": timeline,
@@ -938,10 +959,23 @@ class CognitionStore:
             "story_time": temporal_position.get("story", {}),
             "temporal_position": temporal_position,
             "kind": "state_change",
-            "object_id": event_id,
+            # The entity+attribute pair is the state being tracked. The event
+            # that caused it is retained separately rather than used as the
+            # timeline object's identity.
+            "object_id": entity_id,
             "entity_ids": [entity_id],
             "attribute": attribute,
+            "previous_value": previous_value,
+            "new_value": new_value,
+            "current": is_current,
+            "current_state": {
+                "value": new_value,
+                "valid_from": timeline,
+                "valid_to": None,
+                "event_id": event_id,
+            },
             "caused_by_event_id": event_id,
+            "authority": "source" if source_artifact else "durable",
         }
         data["timeline"] = self._append_unique(data.get("timeline", []), [entry])
         self._record_provenance(data, [{"artifact_id": source_artifact, "locator": locator, "event_id": event_id}])
@@ -1265,16 +1299,40 @@ class CognitionStore:
         entries = existing.setdefault("entries", [])
 
         def identity(item):
-            return json.dumps({
+            key = {
                 "kind": item.get("kind"),
                 "object_id": item.get("object_id"),
                 "attribute": item.get("attribute"),
                 "entity_ids": item.get("entity_ids") or [],
                 "narrative_position": item.get("narrative_position") or {},
                 "story_time": item.get("story_time") or {},
-            }, sort_keys=True, ensure_ascii=False)
+            }
+            if item.get("kind") == "state_change":
+                # Each accepted value transition is a distinct ledger entry,
+                # even when multiple chat updates happen at the same narrative
+                # position.
+                key.update({
+                    "previous_value": item.get("previous_value"),
+                    "new_value": item.get("new_value"),
+                    "change_id": item.get("change_id"),
+                })
+            return json.dumps(key, sort_keys=True, ensure_ascii=False)
 
         incoming_id = identity(entry)
+
+        # A state-change entry is the timeline's explicit current marker for a
+        # single entity attribute. When a newer accepted state arrives, the
+        # previous marker becomes historical rather than remaining current.
+        if entry.get("kind") == "state_change" and entry.get("current", True) and entry.get("object_id") and entry.get("attribute"):
+            for old in entries:
+                if (
+                    isinstance(old, dict)
+                    and old.get("kind") == "state_change"
+                    and str(old.get("object_id")) == str(entry.get("object_id"))
+                    and str(old.get("attribute")) == str(entry.get("attribute"))
+                ):
+                    old["current"] = False
+
         replaced = False
         for index, old in enumerate(entries):
             if identity(old) != incoming_id:
@@ -1359,6 +1417,25 @@ class CognitionStore:
     def _read_entity(self, entity_id):
         path = self._entity_path(entity_id)
         return self._read_json(path, {}) if path else {}
+
+    def latest_attribute_state(self, entity_id, attribute):
+        """Return the latest durable state observation for an entity attribute.
+
+        Canonical entity JSON is authoritative. The timeline records the
+        mutation history/current marker, but it is not a second copy of the
+        attribute value.
+        """
+        entity = self._read_entity(str(entity_id))
+        states = (entity.get("attributes") or {}).get(str(attribute), [])
+        if not isinstance(states, list):
+            return None
+        durable = [s for s in states if isinstance(s, dict) and s.get("authority") == "durable"]
+        if durable:
+            return durable[-1]
+        for state in reversed(states):
+            if isinstance(state, dict):
+                return state
+        return None
 
     def entity(self, name):
         return self._read_entity(name)
@@ -1565,9 +1642,40 @@ class CognitionStore:
             for rec in list(self._all_kind_records(kind)):
                 prov = rec.get("provenance") or []
                 aids = {str(p.get("artifact_id")) for p in prov if isinstance(p, dict) and p.get("artifact_id")}
-                if aids and aids.issubset(source_artifacts):
-                    removed_ids.add(str(rec["id"]))
-                    self._object_path(kind, rec["id"]).unlink(missing_ok=True)
+                if not (aids and aids.issubset(source_artifacts)):
+                    continue
+
+                # Preserve cognition that was introduced by chat/agent state
+                # updates. Such observations intentionally have no source
+                # artifact and must survive source re-ingestion.
+                if kind == "entity":
+                    attrs = rec.get("attributes") or {}
+                    preserved = {}
+                    for attr, states in attrs.items():
+                        keep = [
+                            state for state in (states or [])
+                            if isinstance(state, dict) and not state.get("source_artifact")
+                        ]
+                        if keep:
+                            preserved[attr] = keep
+                    if preserved:
+                        rec["attributes"] = preserved
+                        rec["updated_at"] = now_iso()
+                        self._write_json(self._object_path(kind, rec["id"]), rec)
+                        continue
+
+                if kind in {"relationship", "event"}:
+                    evolution = rec.get("evolution") or []
+                    non_source = [x for x in evolution if isinstance(x, dict) and not x.get("source_artifact")]
+                    if non_source:
+                        rec["evolution"] = non_source
+                        rec["provenance"] = [x for x in prov if not (isinstance(x, dict) and x.get("artifact_id") in source_artifacts)]
+                        rec["updated_at"] = now_iso()
+                        self._write_json(self._object_path(kind, rec["id"]), rec)
+                        continue
+
+                removed_ids.add(str(rec["id"]))
+                self._object_path(kind, rec["id"]).unlink(missing_ok=True)
         # Rebuild master entity metadata from surviving entity files.
         m = self.master_metadata()
         m["entities"] = {}

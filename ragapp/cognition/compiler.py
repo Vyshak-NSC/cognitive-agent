@@ -419,13 +419,20 @@ def compile_project(
     """Compile project files with rollback for selective replacement.
 
     Selective compilation replaces the source projection for the selected
-    files. A snapshot is taken before that replacement so an API, parsing, or
-    persistence failure cannot leave the project with its previous cognition
-    deleted. Full-project compilation keeps the existing behavior without the
-    extra snapshot.
+    files. A filesystem rollback snapshot protects against an API, parsing, or
+    persistence failure, while Git preserves the exact pre-compilation state
+    for recovery. The same Git pre-state checkpoint is taken for full builds.
     """
     if selected_files is not None:
         selected_files = list(selected_files)
+
+    # Compilation can mutate canonical cognition, so preserve the exact
+    # pre-compilation project state in Git before any source projection is
+    # removed or any new cognition is written. Git is the recovery layer; the
+    # filesystem-backed cognition remains authoritative at runtime.
+    pre_state_git_commit = store.commit_authoritative_change(
+        "Pre-state backup before cognition compilation"
+    )
 
     needs_rollback = (
         reconcile_selected
@@ -434,12 +441,15 @@ def compile_project(
     )
 
     if not needs_rollback:
-        return _compile_project_impl(
+        result = _compile_project_impl(
             store,
             progress_callback=progress_callback,
             selected_files=selected_files,
             reconcile_selected=reconcile_selected,
         )
+        if isinstance(result, dict):
+            result.setdefault("pre_state_git_commit", pre_state_git_commit)
+        return result
 
     with tempfile.TemporaryDirectory(prefix="cognition-compile-") as tmp:
         backup = Path(tmp) / "cognition"
@@ -449,12 +459,15 @@ def compile_project(
         shutil.copytree(store.cognition, backup)
 
         try:
-            return _compile_project_impl(
+            result = _compile_project_impl(
                 store,
                 progress_callback=progress_callback,
                 selected_files=selected_files,
                 reconcile_selected=reconcile_selected,
             )
+            if isinstance(result, dict):
+                result.setdefault("pre_state_git_commit", pre_state_git_commit)
+            return result
         except Exception:
             if store.cognition.exists():
                 shutil.rmtree(store.cognition)

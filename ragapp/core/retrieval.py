@@ -155,6 +155,7 @@ class RetrievalStore:
             "name": meta.get("name"),
             "type": meta.get("type"),
             "summary": meta.get("summary", ""),
+            "current_state": self._current_state(entity),
             "tags": meta.get("tags", []),
             "path": meta.get("path"),
             "source_artifacts": artifact_refs,
@@ -190,106 +191,299 @@ class RetrievalStore:
             return []
         return rows[:limit]
 
-    # Legacy methods retained for compatibility. They are no longer used as
-    # eager context injection by the agent loop.
-    def retrieve(self, requests, max_chars=12000):
-        """Retrieve targeted canonical cognition; temporal resolution stays in the canonical store."""
-        result = {"requests": []}
-        used = 0
+    def _current_state(self, entity):
+        """Return the canonical current-value projection for retrieval.
 
-        def temporal_request(req):
-            if not isinstance(req, dict):
-                return None
-            if isinstance(req.get("temporal_position"), dict):
-                return req["temporal_position"]
-            if isinstance(req.get("story_time"), dict) or isinstance(req.get("narrative_position"), dict):
-                return {
-                    "temporal_position": {
-                        "story": req.get("story_time") if isinstance(req.get("story_time"), dict) else {},
-                        "narrative": req.get("narrative_position") if isinstance(req.get("narrative_position"), dict) else {},
-                    }
-                }
-            if isinstance(req.get("as_of"), dict):
-                return req["as_of"]
-            return None
+        Durable chat/agent state takes precedence over later source reingestion;
+        the entity file remains authoritative and this is only a response view.
+        """
+        out = {}
+        for name in (entity.get("attributes") or {}):
+            latest = self.store.latest_attribute_state(entity.get("id"), name)
+            if not isinstance(latest, dict):
+                continue
+            out[str(name)] = {
+                "value": latest.get("value"),
+                "summary": latest.get("summary", ""),
+                "valid_from": latest.get("valid_from"),
+                "valid_to": latest.get("valid_to"),
+                "event_id": latest.get("event_id"),
+            }
+        return out
+
+    @staticmethod
+    def _json_size(value):
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+    def _chunk_item(self, item, max_chars):
+        """Split one oversized cognition result into valid structured chunks."""
+        max_chars = max(1000, int(max_chars or 12000))
+        base = {k: item[k] for k in ("id", "type", "name", "summary", "current_state") if k in item}
+        parts = []
+        current = dict(base)
+        reserve = self._json_size({"chunk": {"index": 999, "count": 999}}) + 64
+
+        def flush():
+            nonlocal current
+            if len(current) > len(base):
+                parts.append(current)
+            current = dict(base)
+
+        def add_value(key, value):
+            nonlocal current
+            candidate = dict(current)
+            candidate[key] = value
+            if self._json_size(candidate) + reserve <= max_chars:
+                current = candidate
+                return
+
+            if key in current:
+                flush()
+
+            if self._json_size({**base, key: value}) + reserve <= max_chars:
+                current[key] = value
+                return
+
+            if isinstance(value, str):
+                text = value
+                # Keep valid UTF-8/JSON boundaries and leave room for wrapper metadata.
+                step = max(256, max_chars - self._json_size(base) - reserve - len(key) - 64)
+                for start in range(0, len(text), step):
+                    if len(current) > len(base):
+                        flush()
+                    current[key] = text[start:start + step]
+                    flush()
+                return
+
+            if isinstance(value, list):
+                bucket = []
+                for entry in value:
+                    candidate_list = bucket + [entry]
+                    candidate = dict(base)
+                    candidate[key] = candidate_list
+                    if self._json_size(candidate) + reserve <= max_chars:
+                        bucket = candidate_list
+                    else:
+                        if bucket:
+                            current[key] = bucket
+                            flush()
+                        bucket = [entry]
+                if bucket:
+                    current[key] = bucket
+                    flush()
+                return
+
+            if isinstance(value, dict):
+                bucket = {}
+                for subkey, entry in value.items():
+                    candidate_map = dict(bucket)
+                    candidate_map[subkey] = entry
+                    candidate = dict(base)
+                    candidate[key] = candidate_map
+                    if self._json_size(candidate) + reserve <= max_chars:
+                        bucket = candidate_map
+                    else:
+                        if bucket:
+                            current[key] = bucket
+                            flush()
+                        bucket = {subkey: entry}
+                if bucket:
+                    current[key] = bucket
+                    flush()
+                return
+
+            text = str(value)
+            step = max(256, max_chars - self._json_size(base) - reserve - len(key) - 64)
+            for start in range(0, len(text), step):
+                current[key] = text[start:start + step]
+                flush()
+
+        for key, value in item.items():
+            if key in base:
+                continue
+            add_value(key, value)
+        flush()
+
+        if not parts:
+            parts = [base]
+
+        total = len(parts)
+        out = []
+        for index, data in enumerate(parts, 1):
+            chunk = dict(data)
+            chunk["chunk"] = {"index": index, "count": total, "of_entity": item.get("id")}
+            out.append(chunk)
+        return out
+
+    def _fetch_request(self, req):
+        """Resolve one retrieval request directly from canonical cognition."""
+        detail = str(req.get("detail", "summary")).lower()
+
+        # Event-targeted retrieval.
+        event_ids = []
+        if req.get("event_id"):
+            event_ids.append(str(req["event_id"]))
+        event_ids.extend(str(x) for x in (req.get("event_ids") or []) if x)
+        if event_ids:
+            out = []
+            for event_id in dict.fromkeys(event_ids):
+                event = self.store.event(event_id)
+                if event:
+                    out.append(dict(event))
+            return out
+
+        if req.get("event_query"):
+            q = str(req["event_query"]).lower()
+            out = []
+            for event in self.store.events(limit=1000):
+                hay = json.dumps(event, ensure_ascii=False).lower()
+                if q in hay:
+                    out.append(dict(event))
+            return out
+
+        entity_ids = []
+        if req.get("entity_id"):
+            entity_ids.append(str(req["entity_id"]))
+        entity_ids.extend(str(x) for x in (req.get("entity_ids") or []) if x)
+        if req.get("name") and not entity_ids:
+            entity_ids.extend(self.store.matching_entities(str(req["name"])))
+        if req.get("query") and not entity_ids:
+            entity_ids.extend(self._rank_candidates(str(req["query"]), limit=8))
+
+        out = []
+        for eid in dict.fromkeys(entity_ids):
+            entity = self.store._read_entity(eid)
+            if not entity:
+                continue
+            if detail == "metadata":
+                meta = dict(self.store.master_metadata().get("entities", {}).get(eid) or {})
+                meta["id"] = eid
+                out.append(meta)
+                continue
+
+            if detail == "summary":
+                out.append({
+                    "id": eid,
+                    "type": entity.get("type"),
+                    "name": entity.get("name"),
+                    "summary": entity.get("summary", ""),
+                    "current_state": self._current_state(entity),
+                })
+                continue
+
+            if detail == "state":
+                requested_attributes = [str(x) for x in (req.get("attributes") or [])]
+                state = self._current_state(entity)
+                if requested_attributes:
+                    state = {k: v for k, v in state.items() if k in requested_attributes}
+                out.append({
+                    "id": eid,
+                    "type": entity.get("type"),
+                    "name": entity.get("name"),
+                    "summary": entity.get("summary", ""),
+                    "current_state": state,
+                    "timeline": entity.get("timeline", []),
+                })
+                continue
+
+            if detail == "section":
+                sections = [str(x) for x in (req.get("sections") or [])]
+                item = {"id": eid, "type": entity.get("type"), "name": entity.get("name")}
+                if not sections or "summary" in sections or "identity" in sections:
+                    item["summary"] = entity.get("summary", "")
+                    item["description"] = entity.get("description", "")
+                if "state" in sections or "attributes" in sections or not sections:
+                    item["current_state"] = self._current_state(entity)
+                if "relationships" in sections or not sections:
+                    item["relationships"] = entity.get("relationships", [])
+                if "events" in sections or not sections:
+                    item["events"] = entity.get("events", [])
+                if "timeline" in sections or not sections:
+                    item["timeline"] = entity.get("timeline", [])
+                out.append(item)
+                continue
+
+            # full: return the canonical entity object, not metadata/source.
+            item = dict(entity)
+            item["current_state"] = self._current_state(entity)
+            out.append(item)
+
+        return out
+
+    def retrieve(self, requests, max_chars=12000):
+        """Retrieve canonical cognition without silently dropping oversized objects.
+
+        Oversized ``full`` requests are deterministically chunked. The caller
+        requests the next chunk by adding ``chunk_index`` to the same request.
+        This keeps each tool result bounded while guaranteeing that a large
+        entity never becomes an empty retrieval result.
+        """
+        max_chars = max(1000, int(max_chars or 12000))
+        result = {"requests": [], "used_chars": 0, "truncated": False}
+        next_requests = []
+        used = 0
 
         for req in requests or []:
             if not isinstance(req, dict):
                 continue
             detail = str(req.get("detail", "summary")).lower()
-            as_of = temporal_request(req)
-            ids = []
-            if req.get("entity_id"):
-                ids = [str(req["entity_id"])]
-            elif req.get("entity_ids"):
-                ids = [str(x) for x in req["entity_ids"]]
-            elif req.get("name") or req.get("query"):
-                ids = self._rank_candidates(req.get("name") or req.get("query"), limit=20)
+            requested_chunk = max(0, int(req.get("chunk_index", 0) or 0))
+            items = self._fetch_request(req)
+            if not items:
+                continue
 
-            for eid in ids[:20]:
-                entity = self.store._read_entity(eid)
-                if not entity:
-                    continue
+            for item in items:
+                chunks = self._chunk_item(item, max_chars) if detail == "full" else [item]
 
-                item = {
-                    "id": eid,
-                    "type": entity.get("type"),
-                    "name": entity.get("name"),
-                    "summary": entity.get("summary", ""),
-                    "description": entity.get("description", ""),
-                    "tags": entity.get("tags", []),
-                }
-
-                if detail in {"state", "section", "full"}:
-                    item["knowledge"] = entity.get("knowledge", {})
-                    item["provenance"] = entity.get("provenance", [])
-                    item["timeline"] = entity.get("timeline", [])
-                    if as_of is not None:
-                        resolution = self.store.resolve_entity_state(
-                            eid, as_of, attributes=req.get("attributes")
-                        )
-                        item["attributes"] = resolution.get("attributes", {})
-                        item["temporal_resolution"] = {
-                            "requested": as_of,
-                            "found": resolution.get("found", False),
-                        }
-                        if resolution.get("reason"):
-                            item["temporal_resolution"]["reason"] = resolution["reason"]
-                    else:
-                        item["attributes"] = entity.get("attributes", {})
-
-                if detail in {"full", "section"}:
-                    item["relationship_refs"] = entity.get("relationships", [])
-                    item["event_refs"] = entity.get("events", [])
-                    item["location_refs"] = entity.get("locations", [])
-                    item["concept_refs"] = entity.get("concepts", [])
                 if detail == "full":
-                    item["relationships"] = [
-                        self.store.relationships().get(r.get("id"))
-                        for r in entity.get("relationships", [])
-                        if isinstance(r, dict) and self.store.relationships().get(r.get("id"))
-                    ]
-                    item["events"] = [
-                        self.store.event(r.get("id"))
-                        for r in entity.get("events", [])
-                        if isinstance(r, dict) and self.store.event(r.get("id"))
-                    ]
-                    item["locations"] = [
-                        self.store._read_object("location", r.get("id"))
-                        for r in entity.get("locations", [])
-                        if isinstance(r, dict) and self.store._read_object("location", r.get("id"))
-                    ]
+                    if requested_chunk >= len(chunks):
+                        requested_chunk = 0
+                    chunk = chunks[requested_chunk]
+                    payload_size = self._json_size(chunk)
+                    if payload_size > max_chars:
+                        minimal = {
+                            k: chunk[k]
+                            for k in ("id", "type", "name", "summary", "current_state")
+                            if k in chunk
+                        }
+                        minimal["chunk"] = {
+                            "index": requested_chunk + 1,
+                            "count": len(chunks),
+                            "of_entity": chunk.get("id"),
+                            "oversized": True,
+                        }
+                        chunk = minimal
+                        payload_size = self._json_size(chunk)
 
-                payload = json.dumps(item, ensure_ascii=False)
-                if used + len(payload) > max_chars:
+                    if used + payload_size > max_chars and result["requests"]:
+                        result["truncated"] = True
+                        break
+                    result["requests"].append(chunk)
+                    used += payload_size
+                    if requested_chunk + 1 < len(chunks):
+                        continuation = dict(req)
+                        continuation["chunk_index"] = requested_chunk + 1
+                        next_requests.append(continuation)
+                    break
+
+                payload_size = self._json_size(item)
+                if used + payload_size > max_chars and result["requests"]:
+                    result["truncated"] = True
                     break
                 result["requests"].append(item)
-                used += len(payload)
+                used += payload_size
+
+            if result["truncated"]:
+                break
 
         result["used_chars"] = used
-        result["truncated"] = used >= max_chars
+        if next_requests:
+            result["next_requests"] = next_requests
+            result["truncated"] = True
         return result
 
+    # Legacy methods retained for compatibility. They are no longer used as
+    # eager context injection by the agent loop.
     def retrieve_for_query(self, query, max_chars=12000):
         entity_ids = self._rank_candidates(query, limit=20)
         requests = [
