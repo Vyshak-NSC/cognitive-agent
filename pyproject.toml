@@ -1,0 +1,48 @@
+[project]
+name = "cognitive-persistence-agent"
+version = "8.4.0"
+description = "Agentic AI with deterministic cognitive persistence and a mutable artifact workspace"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "google-genai>=1.30.0",
+  "streamlit>=1.45.0",
+  "python-dotenv>=1.0.0",
+  "pyjwt>=2.8.0",
+  "pypdf>=5.0.0",
+  "python-docx>=1.1.0",
+  "openpyxl>=3.1.0",
+  "python-pptx>=1.0.0",
+  "reportlab>=4.0.0",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pyyaml>=6.0.0",
+  "networkx>=3.2.0",
+  "python-multipart>=0.0.9",
+  "anthropic>=0.40.0",
+  "sqlite-vec>=0.1.6",
+  "openai>=1.50.0",
+  "tree-sitter-languages>=1.10.2",
+  # tree-sitter-languages==1.10.2 is built against the OLD tree_sitter.Language(ptr, name)
+  # constructor. tree-sitter>=0.22 changed that signature, which makes every
+  # tree_sitter_languages.get_language(...) call raise TypeError. Pin below 0.22 until
+  # tree-sitter-languages is replaced with an actively maintained alternative
+  # (e.g. tree-sitter-language-pack).
+  "tree-sitter>=0.21.0,<0.22.0",
+  "docstring-parser>=0.16",
+  "lxml>=5.0.0",
+  "streamlit-cookies-controller>=0.0.4",
+  "streamlit-pdf>=2.0.1",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["ragapp*"]
+exclude = ["projects*"]
+
+[project.scripts]
+cognitive-agent = "ragapp.interfaces.launcher:main"
+cognitive-streamlit = "ragapp.interfaces.streamlit_app.main:main"
+cognitive-api = "api:app"
