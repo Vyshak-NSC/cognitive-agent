@@ -10,8 +10,8 @@ from ragapp.core.approval import ApprovalEngine
 from ragapp.core.instructions import InstructionStore
 from ragapp.core.vcs import VCSManager
 from ragapp.cognition.compiler import compile_project
-from ragapp.cognition.world_model import WorldModel
 from ragapp.cognition.session_memory import SessionMemory
+from ragapp.tools.cognition_tools import _world_model_snapshot, _validate, _impact
 
 app=FastAPI(title='Agentic State Layer API',version='0.1.0')
 initialize_database()
@@ -62,15 +62,13 @@ def ingest(username,project_id): return compile_project(store_for(username,proje
 
 @app.get('/cognition/{username}/{project_id}')
 def cognition(username,project_id,query:str=''):
-    return WorldModel(store_for(username,project_id)).snapshot(query)
+    return _world_model_snapshot(store_for(username,project_id), query)
 @app.get('/cognition/{username}/{project_id}/validate')
 def cognition_validate(username,project_id):
-    from ragapp.tools.cognition_tools import _validate
-    return _validate(WorldModel(store_for(username,project_id)))
+    return _validate(store_for(username,project_id))
 @app.get('/cognition/{username}/{project_id}/impact')
 def cognition_impact(username,project_id,element:str):
-    from ragapp.tools.cognition_tools import _impact
-    return _impact(WorldModel(store_for(username,project_id)),element)
+    return _impact(store_for(username,project_id),element)
 @app.get('/sessions/{username}/{project_id}')
 def sessions(username,project_id):
     from ragapp.chat_sessions import ChatSessionStore

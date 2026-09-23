@@ -1,5 +1,7 @@
 from __future__ import annotations
+import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 class VCSManager:
     def __init__(self,store): self.root=store.root
@@ -8,6 +10,7 @@ class VCSManager:
         return subprocess.run(['git',*args],cwd=self.root,text=True,capture_output=True,check=True).stdout.strip()
     
     def init(self):
+        """Initialize Git metadata without creating an artificial baseline commit."""
         self.root.mkdir(parents=True, exist_ok=True)
         git_dir = self.root / ".git"
         if not git_dir.exists():
@@ -16,48 +19,84 @@ class VCSManager:
                 cwd=self.root,
                 check=True,
                 capture_output=True,
-                text=True
+                text=True,
             )
-        status = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=self.root,
-            capture_output=True,
-            text=True
+        # Keep project history self-contained and reproducible even when the
+        # host machine has no global Git identity configured.
+        subprocess.run(
+            ["git", "config", "user.email", "agent@local.invalid"],
+            cwd=self.root, check=True, capture_output=True, text=True,
         )
-        if status.returncode != 0:
-            # Keep project history self-contained and reproducible even when
-            # the host machine has no global Git identity configured.
-            subprocess.run(["git", "config", "user.email", "agent@local.invalid"], cwd=self.root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "config", "user.name", "Cognitive Agent"], cwd=self.root, check=True, capture_output=True, text=True)
-            subprocess.run(
-                ["git", "add", "."],
-                cwd=self.root,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            staged = subprocess.run(
-                ["git", "diff", "--cached", "--quiet"],
-                cwd=self.root,
-                capture_output=True,
-                text=True
-            )
-            if staged.returncode != 0:
-                subprocess.run(
-                    ["git", "commit", "-m", "Initial project state"],
-                    cwd=self.root,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-            
+        subprocess.run(
+            ["git", "config", "user.name", "Cognitive Agent"],
+            cwd=self.root, check=True, capture_output=True, text=True,
+        )
+
     def _has_head(self):
         p=subprocess.run(['git','rev-parse','--verify','HEAD'],cwd=self.root,text=True,capture_output=True); return p.returncode==0
     
     def commit(self,message):
-        self.init(); subprocess.run(['git','add','source','log','cognition'],cwd=self.root,check=True)
-        p=subprocess.run(['git','commit','-m',message],cwd=self.root,text=True,capture_output=True)
-        return self._run('rev-parse','HEAD')
+        """Commit authoritative project state and bind new timeline entries to it.
+
+        Git cannot embed its own commit hash in the tree being committed. The
+        authoritative change therefore receives a first commit, then the
+        timeline is enriched with that commit hash in a small follow-up commit.
+        The timeline entry points to the first commit, which is the exact tree
+        containing the cognition change it describes.
+        """
+        self.init()
+        subprocess.run(['git', 'add', 'source', 'log', 'cognition'], cwd=self.root, check=True)
+        p = subprocess.run(['git', 'commit', '-m', message], cwd=self.root, text=True, capture_output=True)
+        if p.returncode != 0:
+            # Git returns non-zero when there is nothing new to commit. Keep the
+            # existing HEAD as the authoritative revision rather than inventing
+            # a new timeline binding.
+            if 'nothing to commit' not in (p.stdout + p.stderr).lower():
+                raise subprocess.CalledProcessError(p.returncode, p.args, p.stdout, p.stderr)
+        commit_id = self._run('rev-parse', 'HEAD')
+        self._bind_timeline_entries(commit_id, message)
+        return commit_id
+
+    def _bind_timeline_entries(self, commit_id, message):
+        """Bind currently unbound timeline entries to an already-created commit."""
+        path = self.root / 'cognition' / 'timeline' / 'timeline.json'
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            return False
+        entries = payload.get('entries')
+        if not isinstance(entries, list):
+            return False
+
+        bound_at = datetime.now(timezone.utc).isoformat()
+        changed = False
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get('git_commit'):
+                continue
+            entry['git_commit'] = commit_id
+            entry['git_commit_message'] = str(message or '')
+            entry['git_bound_at'] = bound_at
+            changed = True
+        if not changed:
+            return False
+
+        payload['updated_at'] = bound_at
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+        # The binding itself is metadata about the already-created authoritative
+        # commit. It must be committed separately because a commit cannot contain
+        # its own hash. Do not recursively bind the entries again.
+        subprocess.run(['git', 'add', 'cognition/timeline/timeline.json'], cwd=self.root, check=True)
+        subprocess.run(
+            ['git', 'commit', '-m', f'Bind timeline to {commit_id[:12]}'],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return True
     
     def log(self, limit=50):
         if not self._has_head():

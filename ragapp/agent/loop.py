@@ -12,6 +12,7 @@ Durable cognition changes are applied through STATE_UPDATE blocks.
 """
 from __future__ import annotations
 import json
+import logging
 import re
 from ragapp.agent.registry import ToolRegistry
 from ragapp.llm.tool_calling import (
@@ -25,6 +26,29 @@ from ragapp.core.drafts import DraftManager
 from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
+from ragapp.logging_config import configure_logging
+
+configure_logging()
+LOGGER = logging.getLogger("ragapp.agent.loop")
+_PAGED_SOURCE_TOOLS = {"read_source_content", "read_source_pdf_chapter"}
+_DIRECT_PDF_PAGE_TOOLS = {"show_source_pdf_pages"}
+_MAX_AUTO_SOURCE_CHUNKS = 32
+
+
+def _emit_source_chunk(on_section, result, chunk_number):
+    """Send a source excerpt to a live UI without placing it in model context."""
+    if not on_section or not isinstance(result, dict) or not result.get("text"):
+        return
+    title = result.get("title") or result.get("path") or "Source document"
+    try:
+        on_section({
+            "type": "section",
+            "title": f"{title} - part {chunk_number}",
+            "content": f"### {title} - part {chunk_number}\n\n{result['text']}",
+        })
+    except Exception:
+        # Rendering must never make a source read fail.
+        LOGGER.exception("Could not render source chunk path=%s", result.get("path"))
 class EmptyResponseError(Exception):
     pass
 def generate_step(*args, **kwargs):
@@ -142,7 +166,18 @@ def _load_persistent_instructions(cognition):
     return instructions or []
 def _build_system_instruction(active_instructions):
     """Build the actual system instruction sent to the provider."""
-    system_instruction = COGNITIVE_AGENT_PROMPT
+    system_instruction = COGNITIVE_AGENT_PROMPT + """
+
+TEMPORAL COGNITION RETRIEVAL PROTOCOL:
+- Treat narrative/document order and story-world time as separate axes. Never use one as a substitute for the other.
+- For present/current questions, retrieve current state (timeline=latest) unless the user explicitly specifies another point.
+- For an explicit chapter/session/turn or other document-order reference, request narrative_position/as_of on the narrative axis.
+- For an explicit in-world date, age, era, chapter-in-the-world, or flashback point, request story_time/as_of on the story axis.
+- A flashback changes the requested story-time state; do not assume the surrounding chapter's current state applies.
+- If the temporal reference is ambiguous or cannot be represented precisely, do not guess. Ask for clarification or retrieve without temporal resolution only when the question does not depend on historical state.
+- When requesting historical entity state, include the relevant attributes when known and use request_cognition_context rather than relying on metadata summaries.
+- Do not invent temporal coordinates merely to make a retrieval request resolvable.
+"""
     if not active_instructions:
         return system_instruction
     lines = []
@@ -393,52 +428,6 @@ def _persist_drafts(
             draft,
         )
     return drafts, skipped
-def _format_direct_source(payload):
-    """Render terminal source retrieval without sending source text back to the LLM."""
-    if not isinstance(payload, dict):
-        return str(payload)
-    path = payload.get("path") or payload.get("artifact_id") or "source"
-    lines = [f"Source: {path}"]
-    if payload.get("pages"):
-        for page in payload["pages"]:
-            lines.append(f"\n--- Page {page.get('page')} ---\n{page.get('text','')}")
-    if payload.get("paragraphs"):
-        for para in payload["paragraphs"]:
-            lines.append(f"\n--- Paragraph {para.get('index')} ---\n{para.get('text','')}")
-    if payload.get("slides"):
-        for slide in payload["slides"]:
-            lines.append(f"\n--- Slide {slide.get('slide')} ---")
-            for shape in slide.get("shapes", []):
-                lines.append(shape.get("text", ""))
-    if payload.get("rows"):
-        lines.append(f"\n--- Sheet {payload.get('sheet','')} ---")
-        lines.extend("\t".join("" if x is None else str(x) for x in row) for row in payload["rows"])
-    if payload.get("text") is not None:
-        lines.append("\n--- Text ---\n" + str(payload.get("text")))
-    return "\n".join(lines)
-
-def _is_document_or_knowledge_query(text):
-    q=str(text or "").lower()
-    hints=("document","pdf","policy","section","chapter","page","slide","sheet",
-           "according to","what happened","when did","who is","who was",
-           "explain","requirements","relationship","evolution","event",
-           "show me","give me","tell me about")
-    return any(h in q for h in hints)
-
-
-_COGNITION_TOOL_NAMES={
-    "search_cognition_metadata",
-    "get_cognition_object",
-    "get_document_structure",
-    "resolve_document_section",
-    "get_cognition_locations",
-    "get_relationship_history",
-    "get_section_cognition",
-    "request_cognition_context",
-    "read_source_location",
-    "deliver_source_to_user",
-}
-
 def run_agent(
     transcript,
     tools,
@@ -453,6 +442,10 @@ def run_agent(
     merged directly into cognition. Source-backed implementation changes
     continue to use workspace drafts and approval.
     """
+    LOGGER.info(
+        "Agent start project=%s session=%s messages=%d max_steps=%d tools=%d",
+        project_id, session_id or "none", len(transcript), max_steps, len(tools),
+    )
     registry = ToolRegistry(tools)
     contents = to_provider_contents(
         transcript,
@@ -467,35 +460,32 @@ def run_agent(
         else None
     )
     # --------------------------------------------------------------
-    # Metadata-first retrieval: do NOT preload project cognition or source
-    # text into the first model context. The model must explicitly request
-    # compact metadata with search_cognition_metadata, then request targeted
-    # cognition/source only after a candidate has been selected.
+    # Persistent instructions remain part of the system instruction.
+    # They are small and are not source retrieval.
     # --------------------------------------------------------------
-    calls = []
-    
     active_instructions = _load_persistent_instructions(cognition)
     system_instruction = _build_system_instruction(active_instructions)
+    # --------------------------------------------------------------
+    # Retrieval is deliberately lazy. Do not inject the project index or
+    # retrieved cognition into every model request. The model first uses
+    # search_cognition_metadata, then requests only the targeted content it
+    # actually needs. This keeps the initial prompt small.
+    # --------------------------------------------------------------
+    calls = []
     # --------------------------------------------------------------
     # Tool declarations
     # --------------------------------------------------------------
     if _is_simple_chat(transcript):
         function_declarations = []
-    elif (
-        cognition is not None
-        and cognition.exists()
-        and transcript
-        and _is_document_or_knowledge_query(transcript[-1].get("content", ""))
-    ):
-        # Keep the first tool schema small for content questions. Code/file
-        # editing requests still receive the complete registry below.
-        function_declarations = registry.as_function_declarations(_COGNITION_TOOL_NAMES)
     else:
-        function_declarations = registry.as_function_declarations()
+        function_declarations = (
+            registry.as_function_declarations()
+        )
     # --------------------------------------------------------------
     # Agent loop
     # --------------------------------------------------------------
     for step_number in range(max_steps):
+        LOGGER.info("Agent model step=%d/%d project=%s", step_number + 1, max_steps, project_id)
         try:
             step = generate_step(
                 contents,
@@ -504,11 +494,15 @@ def run_agent(
                 store=cognition,
             )
         except EmptyResponseError as exc:
+            LOGGER.warning("Agent empty response project=%s step=%d error=%s", project_id, step_number + 1, exc)
             return (
                 f"⚠️ {exc}",
                 calls,
                 [],
             )
+        except Exception:
+            LOGGER.exception("Agent model request failed project=%s step=%d", project_id, step_number + 1)
+            raise
         # ----------------------------------------------------------
         # Model finished
         # ----------------------------------------------------------
@@ -589,6 +583,7 @@ def run_agent(
                     )
                 except Exception:
                     pass
+            LOGGER.info("Agent completed project=%s step=%d tool_calls=%d drafts=%d", project_id, step_number + 1, len(calls), len(drafts))
             return (
                 text,
                 calls,
@@ -615,6 +610,7 @@ def run_agent(
                 "args",
                 {},
             )
+            LOGGER.info("Tool call project=%s step=%d tool=%s arg_keys=%s", project_id, step_number + 1, tool_name, sorted(tool_args.keys()) if isinstance(tool_args, dict) else [])
             if call.get("args_error"):
                 # The model sent malformed arguments; report it back instead
                 # of executing the tool with empty/default arguments.
@@ -636,35 +632,96 @@ def run_agent(
             safe_result = _json_safe(
                 result
             )
+            if isinstance(safe_result, dict) and (safe_result.get("error") or safe_result.get("status") == "error"):
+                LOGGER.warning("Tool failed project=%s step=%d tool=%s error=%s", project_id, step_number + 1, tool_name, safe_result.get("error", "unknown error"))
+            else:
+                LOGGER.info("Tool completed project=%s step=%d tool=%s", project_id, step_number + 1, tool_name)
             _record_tool_call(
                 calls,
                 tool_name,
                 tool_args,
                 safe_result,
             )
-            # Exact source display is terminal: the local engine returns the
-            # requested source directly to the user instead of round-tripping
-            # the source body through the LLM. Explanatory requests should use
-            # read_source_location, whose evidence is then synthesized by the model.
-            if tool_name == "deliver_source_to_user":
-                payload = safe_result
-                if isinstance(payload, dict) and payload.get("error"):
-                    contents.append(
-                        build_function_response_content(tool_name, payload, call.get("id"), store=cognition)
+            model_result = safe_result
+            # A page/range requested for display is rendered directly from
+            # the local PDF. The page text never enters the model context.
+            if (
+                tool_name in _DIRECT_PDF_PAGE_TOOLS
+                and isinstance(safe_result, dict)
+                and isinstance(safe_result.get("pages"), list)
+            ):
+                for page_item in safe_result["pages"]:
+                    if not isinstance(page_item, dict):
+                        continue
+                    page_number = page_item.get("page")
+                    page_text = page_item.get("text") or ""
+                    if page_text:
+                        _emit_source_chunk(
+                            on_section,
+                            {
+                                "title": f"{safe_result.get('path', 'PDF')} - page {page_number}",
+                                "path": safe_result.get("path"),
+                                "text": page_text,
+                            },
+                            page_number,
+                        )
+                model_result = {
+                    "path": safe_result.get("path"),
+                    "page_count": safe_result.get("page_count"),
+                    "pages_delivered": [
+                        item.get("page")
+                        for item in safe_result.get("pages", [])
+                        if isinstance(item, dict)
+                    ],
+                    "delivered_to_user": True,
+                    "message": "Requested PDF page(s) were rendered directly to the user; do not repeat their text.",
+                }
+
+            # Long source documents are paged locally. Each piece is rendered
+            # immediately, while the model receives delivery metadata only.
+            elif (
+                tool_name in _PAGED_SOURCE_TOOLS
+                and isinstance(safe_result, dict)
+                and safe_result.get("text")
+            ):
+                chunks_delivered = 1
+                _emit_source_chunk(on_section, safe_result, chunks_delivered)
+                current_result = safe_result
+                while (
+                    current_result.get("next_offset") is not None
+                    and chunks_delivered < _MAX_AUTO_SOURCE_CHUNKS
+                ):
+                    continuation_args = dict(tool_args)
+                    continuation_args["offset"] = current_result["next_offset"]
+                    LOGGER.info(
+                        "Source continuation project=%s tool=%s chunk=%d offset=%d",
+                        project_id, tool_name, chunks_delivered + 1,
+                        continuation_args["offset"],
                     )
-                    continue
-                return (
-                    _format_direct_source(payload),
-                    calls,
-                    [],
-                )
+                    continuation_result = _json_safe(registry.call(tool_name, continuation_args))
+                    _record_tool_call(calls, tool_name, continuation_args, continuation_result)
+                    if not isinstance(continuation_result, dict) or continuation_result.get("error"):
+                        LOGGER.warning("Source continuation failed project=%s tool=%s", project_id, tool_name)
+                        break
+                    chunks_delivered += 1
+                    _emit_source_chunk(on_section, continuation_result, chunks_delivered)
+                    current_result = continuation_result
+                model_result = {
+                    "path": safe_result.get("path"),
+                    "title": safe_result.get("title"),
+                    "delivered_to_user": True,
+                    "chunks_delivered": chunks_delivered,
+                    "complete": current_result.get("complete", False),
+                    "next_offset": current_result.get("next_offset"),
+                    "message": "Source text was streamed directly to the user; do not repeat it.",
+                }
             # Feed the actual tool result back into
             # the model, preserving the provider's
             # function-call/result protocol.
             contents.append(
                 build_function_response_content(
                     tool_name,
-                    safe_result,
+                    model_result,
                     call.get("id"),
                     store=cognition,
                 )
@@ -672,6 +729,7 @@ def run_agent(
     # --------------------------------------------------------------
     # Execution limit
     # --------------------------------------------------------------
+    LOGGER.warning("Agent execution limit reached project=%s tool_calls=%d max_steps=%d", project_id, len(calls), max_steps)
     return (
         "I could not complete the workflow within "
         "the configured execution limit.",
