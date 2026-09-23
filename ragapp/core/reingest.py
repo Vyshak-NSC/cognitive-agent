@@ -31,13 +31,16 @@ class ReingestPipeline:
         if not selected:
             return {"status": "no_affected_source_files", "project_id": self.store.project_id, "source_files": 0, "chunks": 0, "entities": 0, "relationships": 0}
 
-        self.store.remove_source_projection({f"source:{rel}" for _, rel in selected})
-        return compile_project(self.store, selected_files=selected, reconcile_selected=False)
+        return compile_project(self.store, selected_files=selected, reconcile_selected=True)
 
     def full(self):
+        """Rebuild source-derived cognition without deleting chat/agent state."""
         source_files = self._source_files()
-        self.store.reset_source_derived_cognition()
-        return compile_project(self.store, selected_files=source_files, reconcile_selected=False)
+        return compile_project(
+            self.store,
+            selected_files=source_files,
+            reconcile_selected=True,
+        )
 
     def affected(self, entity_ids):
         result = set()

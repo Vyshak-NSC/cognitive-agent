@@ -10,6 +10,15 @@ def merge_deltas(store: CognitionStore, deltas, source_label="generation", event
     applied = []
     rejected = []
 
+    # A durable mutation must have a recoverable pre-mutation revision. Git is
+    # the backup/version layer; canonical cognition remains the runtime source
+    # of truth. Capture the state immediately before the first permanent
+    # mutation in this batch.
+    permanent_deltas = [d for d in (deltas or []) if isinstance(d, dict) and d.get("permanence", "transient") == "permanent"]
+    pre_commit = None
+    if permanent_deltas:
+        pre_commit = store.commit_authoritative_change("Pre-state backup before durable cognition update")
+
     for delta in deltas or []:
         try:
             permanence = delta.get("permanence", "transient")
@@ -66,6 +75,7 @@ def merge_deltas(store: CognitionStore, deltas, source_label="generation", event
                 raise ValueError("entity and field are required")
             if eid not in store.master_metadata().get("entities", {}):
                 raise ValueError(f"unknown entity: {eid}")
+            prior = store.latest_attribute_state(eid, field)
             store.upsert_entity_update(
                 {
                     "id": eid,
@@ -83,6 +93,15 @@ def merge_deltas(store: CognitionStore, deltas, source_label="generation", event
                 },
                 source_artifact=delta.get("source"),
                 default_timeline=delta.get("timeline"),
+                change_metadata={
+                    "origin": source_label,
+                    "change_type": "state_update",
+                    "authority": "durable",
+                    "reason": delta.get("reason", ""),
+                    "pre_state_git_commit": pre_commit,
+                    "requested_value": delta.get("new"),
+                    "previous_value": prior.get("value") if isinstance(prior, dict) else None,
+                },
             )
             applied.append({**delta, "applied": True})
         except Exception as exc:
@@ -103,5 +122,6 @@ def merge_deltas(store: CognitionStore, deltas, source_label="generation", event
         "version": store.master_metadata().get("current_version", 0),
         "applied": applied,
         "rejected": rejected,
+        "pre_state_git_commit": pre_commit,
         "git_commit": git_commit,
     }

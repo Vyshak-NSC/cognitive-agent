@@ -145,6 +145,9 @@ class ApprovalEngine:
                 f"else. Draft rejected — no file was modified."
             )
 
+        pre_commit = self.vcs.backup_authoritative_state(
+            m.get("change_description", "Pre-state backup before cognition approval")
+        )
         existed, old, new = self._apply_content(d, target_path)
         if new == old:
             raise ValueError("Approved cognition change produces no file change.")
@@ -167,6 +170,7 @@ class ApprovalEngine:
 
         desc = m.get("change_description", "Approved cognition change")
         self._write_log(d, desc, "cognition", relative)
+        d["pre_state_git_commit"] = pre_commit
         d["commit"] = self.vcs.commit(desc)
         self.drafts.save(d)
         return d

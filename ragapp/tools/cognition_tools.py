@@ -4,6 +4,43 @@ from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
 
 
+def _entity_metadata_with_current_state(store, names):
+    """Return metadata plus the latest durable state from canonical entity files.
+
+    master_metadata is a compact search/index projection and can legitimately
+    retain the source-derived summary. Current durable state must come from the
+    canonical entity object so a STATE_UPDATE is visible in later sessions.
+    """
+    master = store.master_metadata().get("entities", {})
+    out = []
+    for name in names or []:
+        key = str(name)
+        eid = key if key in master else None
+        if eid is None:
+            matches = store.matching_entities(key)
+            eid = matches[0] if matches else None
+        if not eid:
+            out.append(None)
+            continue
+        meta = dict(master.get(eid) or {})
+        entity = store._read_entity(eid)
+        if entity:
+            current = {}
+            for attr in (entity.get("attributes") or {}):
+                latest = store.latest_attribute_state(eid, attr)
+                if isinstance(latest, dict):
+                    current[str(attr)] = {
+                        "value": latest.get("value"),
+                        "summary": latest.get("summary", ""),
+                        "valid_from": latest.get("valid_from"),
+                        "valid_to": latest.get("valid_to"),
+                        "event_id": latest.get("event_id"),
+                    }
+            meta["current_state"] = current
+            meta["canonical_updated_at"] = entity.get("updated_at")
+        out.append(meta)
+    return {"entities": out}
+
 def build_cognition_tools(store, session_id=None):
     retrieval = RetrievalStore(store)
 
@@ -35,7 +72,7 @@ def build_cognition_tools(store, session_id=None):
         ),
         Tool(
             "request_cognition_context",
-            "Retrieve targeted cognition after a candidate has been identified. Prefer metadata/summary/state/section; request full only when necessary.",
+            "Retrieve targeted cognition after a candidate has been identified. Prefer metadata/summary/state/section; request full only when necessary. If a full result returns next_requests, repeat the same request with the supplied chunk_index until complete.",
             {
                 "type": "object",
                 "properties": {
@@ -60,6 +97,7 @@ def build_cognition_tools(store, session_id=None):
                                 "temporal_position": {"type": "object"},
                                 "detail": {"type": "string", "enum": ["metadata", "summary", "state", "section", "full"]},
                                 "include_source": {"type": "boolean"},
+                                "chunk_index": {"type": "integer", "minimum": 0},
                             },
                         },
                     },
@@ -73,7 +111,7 @@ def build_cognition_tools(store, session_id=None):
             "get_entity_metadata",
             "Return only metadata for named entities so the agent can decide whether a deeper fetch is necessary.",
             {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}, "required": ["names"]},
-            lambda names: {"entities": [store.master_metadata().get("entities", {}).get(k) or (store.master_metadata().get("entities", {}).get(store.matching_entities(k)[0]) if store.matching_entities(k) else None) for k in names]},
+            lambda names: _entity_metadata_with_current_state(store, names),
         ),
         Tool("get_state_map", "Legacy compatibility view. Do not use for retrieval; use search_cognition_metadata and request_cognition_context.", {"type": "object", "properties": {}}, lambda: {"project_id": store.project_id, "entity_count": len(store.master_metadata().get("entities", {})), "use": "search_cognition_metadata"}),
         Tool("get_ledger", "Legacy compatibility view. Do not use for retrieval; use request_cognition_context.", {"type": "object", "properties": {}}, lambda: {"entity_count": len(store.master_metadata().get("entities", {})), "use": "request_cognition_context"}),
@@ -97,6 +135,7 @@ def _record_knowledge(store, subtype, data):
     payload = dict(data or {})
     ident = str(payload.pop("id", "") or f"{subtype}:{uuid.uuid4().hex}")
     payload.update({"id": ident, "subtype": subtype})
+    store.commit_authoritative_change(f"Pre-state backup before {subtype}")
     result = store.upsert_canonical("knowledge", payload, source_artifact=payload.get("source"))
     store.commit_authoritative_change(f"Record {subtype}")
     return result
@@ -110,6 +149,7 @@ def _record_dependency(store, data):
         {"id": str(payload.get("source")), "kind": "entity", "role": "source"},
         {"id": str(payload.get("target")), "kind": "entity", "role": "target"},
     ]})
+    store.commit_authoritative_change("Pre-state backup before dependency")
     result = store.add_relationship(payload)
     store.commit_authoritative_change("Record dependency")
     return result

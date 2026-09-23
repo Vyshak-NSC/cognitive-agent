@@ -46,16 +46,26 @@ class VCSManager:
         """
         self.init()
         subprocess.run(['git', 'add', 'source', 'log', 'cognition'], cwd=self.root, check=True)
+
+        # Only authoritative project areas are staged. Untracked runtime/config
+        # files outside those areas must not make a pre-state backup fail.
+        staged = subprocess.run(
+            ['git', 'diff', '--cached', '--quiet'],
+            cwd=self.root,
+            capture_output=True,
+        )
+        if staged.returncode == 0:
+            return self._run('rev-parse', 'HEAD') if self._has_head() else None
+
         p = subprocess.run(['git', 'commit', '-m', message], cwd=self.root, text=True, capture_output=True)
         if p.returncode != 0:
-            # Git returns non-zero when there is nothing new to commit. Keep the
-            # existing HEAD as the authoritative revision rather than inventing
-            # a new timeline binding.
-            if 'nothing to commit' not in (p.stdout + p.stderr).lower():
-                raise subprocess.CalledProcessError(p.returncode, p.args, p.stdout, p.stderr)
+            raise subprocess.CalledProcessError(p.returncode, p.args, p.stdout, p.stderr)
         commit_id = self._run('rev-parse', 'HEAD')
         self._bind_timeline_entries(commit_id, message)
-        return commit_id
+        # Return the final HEAD. If timeline binding required the follow-up
+        # commit, that commit is now the complete project revision callers can
+        # use as the recoverable checkpoint.
+        return self._run('rev-parse', 'HEAD')
 
     def _bind_timeline_entries(self, commit_id, message):
         """Bind currently unbound timeline entries to an already-created commit."""
@@ -98,6 +108,11 @@ class VCSManager:
         )
         return True
     
+
+    def backup_authoritative_state(self, message="Pre-state backup"):
+        """Create a Git revision representing the exact state before mutation."""
+        return self.commit(str(message))
+
     def log(self, limit=50):
         if not self._has_head():
             return ''
