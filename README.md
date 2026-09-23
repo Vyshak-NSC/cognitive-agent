@@ -227,21 +227,23 @@ Check `.env` or configure the provider through Project Settings. Never commit th
 
 ## Versioning
 
-The long-lived development branch for the version 8 series is:
+The repository uses `main` as the current promoted/stable line for the
+active major version.
 
-```text
-v8.x
-```
+For version 8, ongoing development happens on:
+
+    v8.x
 
 Minor milestones are represented by commits/tags such as:
 
-```text
-8.5
-8.6
-8.7
-```
+    v8.5.0
+    v8.6.0
+    v8.7.0
 
-The current project version is `8.5.0`.
+When a v8.x milestone is ready for promotion, it is merged/promoted
+to `main`.
+
+Historical versions remain available through Git tags.
 
 ## Repository hygiene
 
