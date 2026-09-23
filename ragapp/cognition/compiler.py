@@ -564,6 +564,13 @@ def _compile_project_impl(
             if area == "source"
         }
         if selected_source_artifacts:
+            # If one canonical cognition object is supported by multiple source
+            # artifacts, rebuild all of those contributing artifacts together.
+            selected_source_artifacts = store.expand_source_artifacts(selected_source_artifacts)
+            if selected_set is not None:
+                for artifact_id in selected_source_artifacts:
+                    if artifact_id.startswith("source:"):
+                        selected_set.add(("source", artifact_id[len("source:"):]))
             store.remove_source_projection(selected_source_artifacts)
 
     deterministic_result = None

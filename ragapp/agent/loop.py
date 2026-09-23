@@ -428,6 +428,7 @@ def _is_document_or_knowledge_query(text):
 
 _COGNITION_TOOL_NAMES={
     "search_cognition_metadata",
+    "get_cognition_object",
     "get_document_structure",
     "resolve_document_section",
     "get_cognition_locations",

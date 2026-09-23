@@ -1,46 +1,103 @@
-"""Deterministic application of agent-generated state deltas to entity files."""
+"""Durable agent-state merge into the canonical cognition model."""
 from __future__ import annotations
+
 from ragapp.cognition.store import CognitionStore
-ALLOWED_PERMANENCE={"permanent","transient"}
 
-def _flag_related(store,eid,affected_entities,source_label,delta):
-    # Mirrors ReingestPipeline's affected_files: this only flags related
-    # entities as needing review after a state change — it never edits or
-    # rewrites their content. If their state must also change, that needs
-    # its own explicit delta.
-    known=store.master_metadata().get("entities",{})
-    for related_id in affected_entities or []:
-        if related_id==eid or related_id not in known: continue
-        store.append_event({"type":"related_entity_flagged","source":source_label,
-                             "entity":related_id,"caused_by":eid,
-                             "reason":delta.get("reason","")})
+ALLOWED_PERMANENCE = {"permanent", "transient"}
 
-def merge_deltas(store:CognitionStore,deltas,source_label="generation"):
-    applied=[]; rejected=[]
-    for d in deltas or []:
+
+def merge_deltas(store: CognitionStore, deltas, source_label="generation", events=None):
+    applied = []
+    rejected = []
+
+    for delta in deltas or []:
         try:
-            permanence=d.get("permanence","transient")
-            if permanence not in ALLOWED_PERMANENCE: raise ValueError("permanence must be permanent or transient")
-            if d.get("operation")=="create_entity":
-                if permanence!="permanent":raise ValueError("create_entity must be permanent")
-                eid=d.get("entity")
-                if not eid:raise ValueError("entity is required")
-                if eid in store.master_metadata().get("entities",{}):raise ValueError(f"entity already exists: {eid}")
-                data=dict(d.get("entity_data") or {}); data.setdefault("id",eid); data.setdefault("type","other"); data.setdefault("name",eid)
-                store.upsert_entity_update(data,source_artifact=d.get("source"),default_timeline=d.get("timeline"))
-                if d.get("initial_state"):
-                    store.upsert_entity_update({"id":eid,"attributes":d["initial_state"]},source_artifact=d.get("source"),default_timeline=d.get("timeline"))
-                store.append_event({"type":"entity_created","source":source_label,"entity":eid,"data":data})
-                applied.append({**d,"applied":True}); continue
-            eid=d.get("entity"); field=d.get("field")
-            if not eid or not field:raise ValueError("entity and field are required")
-            if eid not in store.master_metadata().get("entities",{}):raise ValueError(f"unknown entity: {eid}")
-            if permanence=="transient":
-                store.append_event({"type":"transient_delta","source":source_label,"delta":d}); applied.append({**d,"applied":False,"reason":"transient"}); continue
-            store.upsert_entity_update({"id":eid,"attributes":{field:{"value":d.get("new"),"summary":d.get("reason",""),"timeline":d.get("timeline"),"valid_from":d.get("valid_from"),"valid_to":d.get("valid_to"),"locator":d.get("locator")}}},source_artifact=d.get("source"),default_timeline=d.get("timeline"))
-            store.append_event({"type":"state_delta","source":source_label,"delta":d})
-            _flag_related(store,eid,d.get("affected_entities"),source_label,d)
-            applied.append({**d,"applied":True})
-        except Exception as exc:rejected.append({"delta":d,"error":str(exc)})
+            permanence = delta.get("permanence", "transient")
+            if permanence not in ALLOWED_PERMANENCE:
+                raise ValueError("permanence must be permanent or transient")
+
+            operation = delta.get("operation")
+            if permanence == "transient":
+                store.append_event({"type": "transient_delta", "source": source_label, "delta": delta})
+                applied.append({**delta, "applied": False, "reason": "transient"})
+                continue
+
+            if operation == "create_entity":
+                eid = str(delta.get("entity") or "")
+                if not eid:
+                    raise ValueError("entity is required")
+                payload = dict(delta.get("entity_data") or {})
+                payload.setdefault("id", eid)
+                payload.setdefault("name", eid)
+                payload.setdefault("type", "other")
+                store.upsert_entity_update(payload, source_artifact=delta.get("source"), default_timeline=delta.get("timeline"))
+                applied.append({**delta, "applied": True})
+                continue
+
+            if operation == "create_relationship":
+                rel = dict(delta.get("relationship") or {})
+                if not rel.get("id"):
+                    raise ValueError("relationship.id is required")
+                store.add_relationship(rel, source_artifact=delta.get("source"), timeline=delta.get("timeline"))
+                applied.append({**delta, "applied": True})
+                continue
+
+            if operation == "create_event":
+                event = dict(delta.get("event") or {})
+                if not event.get("id"):
+                    raise ValueError("event.id is required")
+                store.add_event(event, source_artifact=delta.get("source"), timeline=delta.get("timeline"), sequence=delta.get("sequence"))
+                applied.append({**delta, "applied": True})
+                continue
+
+            if operation == "create_knowledge":
+                record = dict(delta.get("knowledge") or {})
+                if not record.get("id"):
+                    raise ValueError("knowledge.id is required")
+                store.upsert_canonical("knowledge", record, source_artifact=delta.get("source"), timeline=delta.get("timeline"), location=delta.get("locator"))
+                applied.append({**delta, "applied": True})
+                continue
+
+            # Default durable operation: append a new state observation rather
+            # than replacing the previous state.
+            eid = str(delta.get("entity") or "")
+            field = str(delta.get("field") or "")
+            if not eid or not field:
+                raise ValueError("entity and field are required")
+            if eid not in store.master_metadata().get("entities", {}):
+                raise ValueError(f"unknown entity: {eid}")
+            store.upsert_entity_update(
+                {
+                    "id": eid,
+                    "attributes": {
+                        field: {
+                            "value": delta.get("new"),
+                            "summary": delta.get("reason", ""),
+                            "timeline": delta.get("timeline"),
+                            "valid_from": delta.get("valid_from"),
+                            "valid_to": delta.get("valid_to"),
+                            "event_id": delta.get("event_id"),
+                            "locator": delta.get("locator"),
+                        }
+                    },
+                },
+                source_artifact=delta.get("source"),
+                default_timeline=delta.get("timeline"),
+            )
+            applied.append({**delta, "applied": True})
+        except Exception as exc:
+            rejected.append({"delta": delta, "error": str(exc)})
+
+    for event in events or []:
+        try:
+            if isinstance(event, dict) and event.get("id"):
+                store.add_event(event, source_artifact=event.get("source_artifact"), timeline=event.get("timeline"), sequence=event.get("sequence"))
+        except Exception as exc:
+            rejected.append({"event": event, "error": str(exc)})
+
     store.mark_compiled()
-    return {"version":store.master_metadata().get("current_version",0),"applied":applied,"rejected":rejected}
+    return {
+        "version": store.master_metadata().get("current_version", 0),
+        "applied": applied,
+        "rejected": rejected,
+    }

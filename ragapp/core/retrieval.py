@@ -1,17 +1,11 @@
-"""Local, zero-API-call retrieval over cognition metadata.
-
-The query path is deliberately metadata-first. Source bodies are never loaded by
-this module; source retrieval is a separate, explicit operation.
-"""
+"""Zero-API-call metadata retrieval over the canonical cognition model."""
 from __future__ import annotations
 import re
-from ragapp.core.metadata import MetadataDB
 
 
 class RetrievalStore:
     def __init__(self, store):
         self.store = store
-        self.db = MetadataDB(store)
 
     @staticmethod
     def _tokens(query):
@@ -19,96 +13,87 @@ class RetrievalStore:
 
     @staticmethod
     def _phrases(query):
-        text = " ".join(RetrievalStore._tokens(query))
-        tokens = text.split()
+        tokens = RetrievalStore._tokens(query)
+        text = " ".join(tokens)
         phrases = [text] if len(tokens) > 1 else []
-        phrases.extend(" ".join(tokens[i:i+2]) for i in range(len(tokens)-1))
-        return list(dict.fromkeys(p for p in phrases if p))
+        phrases.extend(" ".join(tokens[i:i+2]) for i in range(len(tokens) - 1))
+        return list(dict.fromkeys(x for x in phrases if x))
 
-    def _rank_entities(self, query, limit=8):
-        q = " ".join(self._tokens(query))
+    def search_metadata(self, query, limit=8):
+        """Search canonical cognition + structural metadata; never reads source bodies."""
+        q = str(query or "").strip().casefold()
         tokens = set(self._tokens(query))
         phrases = self._phrases(query)
         scored = []
-        for entity_id, meta in self.store.master_metadata().get("entities", {}).items():
-            name = str(meta.get("name") or "").lower()
-            summary = str(meta.get("summary") or "").lower()
-            typ = str(meta.get("type") or "").lower()
-            tags = " ".join(str(x) for x in (meta.get("tags") or [])).lower()
-            path = str(meta.get("path") or "").lower()
-            hay = " ".join((name, summary, typ, tags, path))
-            score = 0
-            for phrase in phrases:
-                if phrase in name:
-                    score += 100
-                elif phrase in summary:
-                    score += 30
-                elif phrase in tags:
-                    score += 20
-            for token in tokens:
-                if token in name:
-                    score += 15
-                if token in summary:
-                    score += 4
-                if token in typ:
-                    score += 3
-                if token in tags:
-                    score += 5
-            if q and q == name:
-                score += 250
-            if score:
-                scored.append((score, entity_id, meta))
-        scored.sort(key=lambda x: (-x[0], str(x[2].get("name") or ""), x[1]))
-        return scored[:limit]
 
-    def search_metadata(self, query, limit=8):
-        """Return compact candidate metadata only: entities + document sections."""
-        candidates = []
-        for score, eid, meta in self._rank_entities(query, limit=limit):
-            candidates.append({
-                "kind": "entity", "id": eid, "score": score,
-                "name": meta.get("name"), "type": meta.get("type"),
-                "summary": meta.get("summary", ""),
-                "tags": meta.get("tags", []), "path": meta.get("path"),
-            })
+        # Canonical cognition candidates.
+        for kind in ("entity", "relationship", "event", "location", "concept", "definition", "knowledge"):
+            for rec in self.store._all_kind_records(kind):
+                name = str(rec.get("name") or rec.get("title") or rec.get("term") or rec.get("id") or "").casefold()
+                text = " ".join(str(rec.get(k, "")) for k in ("name", "title", "term", "description", "summary", "state", "type")).casefold()
+                score = 0
+                if q and q == name:
+                    score += 400
+                if q and q in name:
+                    score += 180
+                if q and q in text:
+                    score += 80
+                for phrase in phrases:
+                    if phrase in name:
+                        score += 100
+                    elif phrase in text:
+                        score += 35
+                for token in tokens:
+                    if token in name:
+                        score += 20
+                    elif token in text:
+                        score += 4
+                if score:
+                    scored.append({
+                        "kind": kind,
+                        "id": rec.get("id"),
+                        "score": score,
+                        "name": rec.get("name") or rec.get("title") or rec.get("term") or rec.get("id"),
+                        "type": rec.get("type"),
+                        "summary": (rec.get("summary") or rec.get("description") or "")[:1000],
+                        "provenance": (rec.get("provenance") or [])[:3] if isinstance(rec.get("provenance"), list) else [],
+                    })
 
-        q = " ".join(self._tokens(query))
-        section_rows = self.store.document_index.sections(query=None, limit=5000)
-        section_scored = []
-        for section in section_rows:
-            title = str(section.get("title") or "").lower()
-            sid = str(section.get("id") or "").lower()
-            if not title and not sid:
-                continue
+        # Structural document candidates.
+        for section in self.store.document_index.sections(query=None, limit=5000):
+            title = str(section.get("title") or "").casefold()
             score = 0
             if q and q == title:
-                score += 300
-            for phrase in self._phrases(query):
+                score += 500
+            if q and q in title:
+                score += 220
+            for phrase in phrases:
                 if phrase in title:
                     score += 120
-            for token in set(self._tokens(query)):
+            for token in tokens:
                 if token in title:
                     score += 18
             if score:
-                section_scored.append((score, section))
-        section_scored.sort(key=lambda x: (-x[0], x[1].get("order", 0)))
-        for score, section in section_scored[:limit]:
-            candidates.append({
-                "kind": "section", "id": section.get("id"), "score": score,
-                "name": section.get("title"), "type": section.get("type"),
-                "summary": "document section",
-                "artifact_id": section.get("artifact_id"),
-                "path": section.get("path"), "locator": section.get("locator", {}),
-                "parent_id": section.get("parent_id"),
-            })
-        candidates.sort(key=lambda x: (-x.get("score", 0), x.get("kind", ""), x.get("name") or ""))
-        return candidates[:limit]
+                scored.append({
+                    "kind": "section",
+                    "id": section.get("id"),
+                    "score": score,
+                    "name": section.get("title"),
+                    "type": section.get("type"),
+                    "summary": "document structure node",
+                    "artifact_id": section.get("artifact_id"),
+                    "path": section.get("path"),
+                    "locator": section.get("locator", {}),
+                    "parent_id": section.get("parent_id"),
+                })
+
+        scored.sort(key=lambda x: (-x.get("score", 0), x.get("kind", ""), str(x.get("name") or "")))
+        return scored[:max(1, min(int(limit or 8), 50))]
 
     def retrieve(self, requests, max_chars=12000):
         return self.store.retrieve(requests, max_chars=max_chars)
 
     def retrieve_for_query(self, query, max_chars=12000):
-        """Legacy compatibility method; returns metadata-only candidates."""
         candidates = self.search_metadata(query, limit=8)
         return {"candidates": candidates, "used_chars": len(str(candidates)), "truncated": False}
 
