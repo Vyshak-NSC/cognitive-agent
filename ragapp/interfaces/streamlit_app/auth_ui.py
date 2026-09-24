@@ -32,8 +32,20 @@ def _get_cookie_controller():
 
 
 def _get_token():
-    controller = _get_cookie_controller()
+    """Read the auth token without depending on component render timing.
 
+    Streamlit exposes request cookies through ``st.context.cookies`` on a
+    browser reload.  Prefer that synchronous snapshot; fall back to the
+    cookie component for older Streamlit/component combinations.
+    """
+    try:
+        token = st.context.cookies.get(COOKIE_NAME)
+        if token:
+            return token
+    except Exception:
+        pass
+
+    controller = _get_cookie_controller()
     if controller is None:
         return None
 

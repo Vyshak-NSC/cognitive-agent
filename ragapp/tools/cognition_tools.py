@@ -47,7 +47,7 @@ def build_cognition_tools(store, session_id=None):
     return [
         Tool(
             "search_cognition_metadata",
-            "FIRST retrieval step for project-content questions. Search only compact local metadata and return candidate entities/files/source pointers. Never returns source content. Use the result to choose or refine the next targeted retrieval.",
+            "Search compact canonical metadata across entities, relationships, events, locations, concepts, definitions, and knowledge. The controller performs an initial search automatically for project-content turns; call this tool only to refine or broaden retrieval.",
             {
                 "type": "object",
                 "properties": {
@@ -72,7 +72,7 @@ def build_cognition_tools(store, session_id=None):
         ),
         Tool(
             "request_cognition_context",
-            "Retrieve targeted cognition after a candidate has been identified. Prefer metadata/summary/state/section; request full only when necessary. If a full result returns next_requests, repeat the same request with the supplied chunk_index until complete.",
+            "Retrieve targeted canonical cognition. Prefer compact/state/section; request full only when necessary. Continuation is controller-owned and is consumed automatically.",
             {
                 "type": "object",
                 "properties": {
@@ -81,6 +81,9 @@ def build_cognition_tools(store, session_id=None):
                         "items": {
                             "type": "object",
                             "properties": {
+                                "kind": {"type": "string", "enum": ["entity", "relationship", "event", "location", "concept", "definition", "knowledge"]},
+                                "id": {"type": "string"},
+                                "ids": {"type": "array", "items": {"type": "string"}},
                                 "entity_id": {"type": "string"},
                                 "entity_ids": {"type": "array", "items": {"type": "string"}},
                                 "event_id": {"type": "string"},
@@ -95,7 +98,7 @@ def build_cognition_tools(store, session_id=None):
                                 "story_time": {"type": "object"},
                                 "narrative_position": {"type": "object"},
                                 "temporal_position": {"type": "object"},
-                                "detail": {"type": "string", "enum": ["metadata", "summary", "state", "section", "full"]},
+                                "detail": {"type": "string", "enum": ["metadata", "summary", "compact", "state", "section", "full"]},
                                 "include_source": {"type": "boolean"},
                                 "chunk_index": {"type": "integer", "minimum": 0},
                             },

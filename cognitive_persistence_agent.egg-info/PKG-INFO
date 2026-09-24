@@ -1,0 +1,292 @@
+Metadata-Version: 2.4
+Name: cognitive-persistence-agent
+Version: 8.5.0
+Summary: Agentic AI with deterministic cognitive persistence and a mutable artifact workspace
+Requires-Python: <3.13,>=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: anthropic==1.5.0
+Requires-Dist: docstring-parser==0.18.0
+Requires-Dist: fastapi==0.141.1
+Requires-Dist: google-genai==2.22.0
+Requires-Dist: lxml==6.1.3
+Requires-Dist: networkx==3.6.1
+Requires-Dist: openai==3.13.0
+Requires-Dist: openpyxl==3.1.5
+Requires-Dist: openrouter==1.1.96
+Requires-Dist: pydantic==2.12.5
+Requires-Dist: pypdf==6.16.2
+Requires-Dist: python-docx==1.2.0
+Requires-Dist: python-dotenv==1.2.3
+Requires-Dist: python-multipart==0.0.32
+Requires-Dist: python-pptx==1.0.2
+Requires-Dist: pyyaml==6.0.3
+Requires-Dist: reportlab==5.0.1
+Requires-Dist: sqlite-vec==0.1.9
+Requires-Dist: streamlit==1.63.0
+Requires-Dist: streamlit-cookies-controller==0.0.4
+Requires-Dist: streamlit-pdf==2.0.1
+Requires-Dist: tree-sitter==0.21.3
+Requires-Dist: tree-sitter-languages==1.10.2
+Requires-Dist: uvicorn[standard]==0.52.4
+
+# Cognitive Persistence Agent
+
+Version 8.5.0
+
+A local agentic application with persistent cognition, project workspaces, document/code ingestion, multiple LLM providers, and a Streamlit interface.
+
+## Requirements
+
+- Windows, macOS, or Linux
+- Python 3.12.x
+- `uv`
+- An API key for at least one configured LLM provider
+
+The project is intentionally constrained to Python 3.12. The dependency versions in `pyproject.toml` are pinned to the known-good development environment, and `uv.lock` should be committed with the project.
+
+## Fresh-machine setup
+
+Clone the repository and enter it:
+
+```powershell
+git clone <repository-url>
+cd cognitive-agent
+```
+
+Install `uv` if it is not already installed. Then create the project environment and install the locked dependencies:
+
+```powershell
+uv sync
+```
+
+`uv sync` creates `.venv` automatically and installs the versions recorded by `uv.lock`.
+
+Do not manually install the individual Python packages with `pip`. The repository's `pyproject.toml` and `uv.lock` are the dependency source of truth.
+
+## Environment configuration
+
+Copy the example environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Then configure at least one provider.
+
+Supported provider environment variables include:
+
+- `GEMINI_API_KEY`
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `AZURE_OPENAI_API_KEY`
+- `OPENROUTER_API_KEY`
+
+The application can also store provider configuration in the project's `.system/config.yaml` through its Project Settings interface. Do not commit API keys or `.env`.
+
+Other useful settings in `.env` include:
+
+- `CHAT_MODEL`
+- `OPENAI_MODEL`
+- `OPENROUTER_MODEL`
+- `JWT_SECRET`
+- `PROJECTS_ROOT`
+- `MAX_AGENT_STEPS`
+
+For a local installation, the default project root is:
+
+```text
+./projects
+```
+
+The `projects/` directory is intentionally ignored by Git because it contains runtime/project state.
+
+## Run the application
+
+### Streamlit UI
+
+```powershell
+uv run cognitive-streamlit
+```
+
+Equivalent direct command:
+
+```powershell
+uv run python -m streamlit run ragapp/interfaces/streamlit_app/main.py
+```
+
+### Launcher
+
+```powershell
+uv run cognitive-agent
+```
+
+The launcher offers the Streamlit application and terminal chat.
+
+### API
+
+Run the FastAPI application with Uvicorn:
+
+```powershell
+uv run uvicorn api:app --reload
+```
+
+The repository's `run_api.bat` helper runs the same API entrypoint.
+
+## Windows helper scripts
+
+The repository also contains:
+
+```text
+run.bat
+run_streamlit.bat
+run_api.bat
+```
+
+The Streamlit helper uses `uv`.
+
+For a new machine, `uv sync` should be run first. The `uv` commands above are the preferred reproducible path.
+
+## Dependency reproducibility
+
+The project uses two files together:
+
+```text
+pyproject.toml
+    direct project dependencies and supported Python version
+
+uv.lock
+    exact resolved dependency graph
+```
+
+The lock file should be committed to Git.
+
+After changing a dependency intentionally:
+
+```powershell
+uv lock
+uv sync
+```
+
+Then test the application before committing the updated `pyproject.toml` and `uv.lock`.
+
+Do not run an unrestricted `pip install -U` in the project environment. That can move the environment away from the locked dependency set.
+
+## Cognition and project data
+
+Application project data lives below:
+
+```text
+projects/
+```
+
+This includes persistent project state, cognition, sessions, metadata, source artifacts, and workspace data.
+
+It is ignored by Git by design. The source repository contains the application code; project-specific runtime cognition is separate.
+
+If an existing project must be moved to another machine, copy that project's directory under `projects/` separately.
+
+## Development
+
+Check the active Python interpreter:
+
+```powershell
+uv run python --version
+uv run python -c "import sys; print(sys.executable)"
+```
+
+Expected Python major/minor version:
+
+```text
+Python 3.12.x
+```
+
+Check the installed locked environment:
+
+```powershell
+uv pip freeze
+```
+
+Run a syntax check over the application:
+
+```powershell
+uv run python -m compileall ragapp api.py main.py
+```
+
+## Common clean-machine problems
+
+### `ModuleNotFoundError`
+
+Do not immediately install the missing package with pip.
+
+First run:
+
+```powershell
+uv sync
+```
+
+If the package is a project dependency, it should come from `pyproject.toml`/`uv.lock`.
+
+### Wrong Python version
+
+Check:
+
+```powershell
+uv run python --version
+```
+
+The project targets Python 3.12.x.
+
+### Stale or damaged environment
+
+The environment can be recreated without changing the repository:
+
+```powershell
+Remove-Item -Recurse -Force .venv
+uv sync
+```
+
+On Unix-like systems:
+
+```bash
+rm -rf .venv
+uv sync
+```
+
+### Missing API key
+
+Check `.env` or configure the provider through Project Settings. Never commit the real key.
+
+## Versioning
+
+The repository uses `main` as the current promoted/stable line for the
+active major version.
+
+For version 8, ongoing development happens on:
+
+    v8.x
+
+Minor milestones are represented by commits/tags such as:
+
+    v8.5.0
+    v8.6.0
+    v8.7.0
+
+When a v8.x milestone is ready for promotion, it is merged/promoted
+to `main`.
+
+Historical versions remain available through Git tags.
+
+## Repository hygiene
+
+Do not commit:
+
+- `.venv/`
+- `.env`
+- `.env.*` except `.env.example`
+- `projects/`
+- SQLite runtime databases
+- Python bytecode
+- `__pycache__/`
+- local ZIP archives
+
+The existing `.gitignore` is intended to keep these out of the repository.

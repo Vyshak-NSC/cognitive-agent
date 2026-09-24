@@ -40,10 +40,12 @@ For questions about compiled documents, policies, PDFs, DOCX/PPTX/XLSX files,
 or persistent project knowledge, follow this sequence:
 1. Do NOT expect preloaded document text. The initial context intentionally
    contains no source body.
-2. FIRST call search_cognition_metadata with the user's concept/question. It
-   returns only compact candidate metadata and document locators.
-3. Once a canonical cognition candidate is identified, load the canonical
-   cognition object with get_cognition_object or request_cognition_context.
+2. The application performs a bounded canonical search before the first model
+   call and may provide CONTROLLER-PREFETCHED CANONICAL COGNITION. Use that
+   current canonical context first. Call search_cognition_metadata only when
+   you need to refine or broaden candidate discovery.
+3. Load additional canonical cognition with request_cognition_context when the
+   prefetched compact context is insufficient.
    Canonical cognition is the persisted derived understanding and is the
    primary basis for answering project-content questions. Do not reopen the
    source merely because provenance is present.
@@ -51,16 +53,16 @@ or persistent project knowledge, follow this sequence:
    location knowledge, concepts, definitions, and derived knowledge are
    cumulative and authoritative. Use them to answer reconstruction,
    characterization, history, relationship, and state questions.
-5. Use get_relationship_history or linked event/timeline data when the user
-   asks how something evolved over time. Do not reconstruct the history by
-   rereading the entire source.
+5. For evolution/history questions, retrieve the relevant relationship/event
+   with request_cognition_context using section/full detail as needed. Do not
+   reconstruct the history by rereading the entire source.
 6. Read source evidence only when exact source wording, verification, missing
    context, or an explicit evidence request requires it. Use the smallest
    exact locator available.
-7. If the user explicitly asks to see/show/give the source content itself,
-   resolve the exact locator first and then call deliver_source_to_user. That
-   tool is terminal: its source body is returned directly to the user and
-   must NOT be sent back through the model for paraphrasing.
+7. If the user explicitly asks to see/show/give source content, use the
+   registered source-reading/display tools with the smallest resolved locator.
+   Source-display results may be delivered directly to the user rather than
+   placed back into model context.
 8. Never use a whole-file read when a document locator is available.
 9. If canonical cognition is incomplete for the requested question, identify
    the missing object/context first, then use the smallest relevant source
