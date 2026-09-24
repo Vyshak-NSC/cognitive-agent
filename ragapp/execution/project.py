@@ -38,6 +38,25 @@ def create_project(username, project_id):
     return store
 
 
+
+def rename_project(username, project_id, new_project_id):
+    """Rename a project directory without changing its contents."""
+    old_id = slug(str(project_id).strip())
+    new_id = slug(str(new_project_id).strip())
+    if not new_id:
+        raise ValueError("Enter a valid project name.")
+    if old_id == new_id:
+        return get_project(username, old_id)
+    user_root = Path(settings.PROJECTS_ROOT) / slug(str(username).lower())
+    source = user_root / old_id
+    target = user_root / new_id
+    if not source.is_dir():
+        raise FileNotFoundError(f"Project '{old_id}' does not exist.")
+    if target.exists():
+        raise FileExistsError(f"A project named '{new_id}' already exists.")
+    source.rename(target)
+    return get_project(username, new_id)
+
 def _clear_readonly(path):
     """Make a file/directory writable before Windows tries to remove it."""
     try:

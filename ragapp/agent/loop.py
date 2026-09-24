@@ -26,6 +26,7 @@ from ragapp.core.drafts import DraftManager
 from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
+from ragapp.core.retrieval import RetrievalStore
 from ragapp.logging_config import configure_logging
 
 configure_logging()
@@ -153,6 +154,33 @@ def _is_simple_chat(transcript):
         transcript[-1].get("content", "")
     ).strip().lower()
     return text in _SIMPLE_CHAT
+
+def _latest_user_query(transcript):
+    for message in reversed(transcript or []):
+        if str(message.get("role", "")).lower() == "user":
+            return str(message.get("content", "") or "").strip()
+    return ""
+
+
+def _prefetch_cognition(cognition, transcript, max_chars=8000, limit=8):
+    """Deterministic lexical/canonical prefetch; no LLM inference is used here.
+
+    CognitionStore.search_cognition_metadata performs the local candidate
+    search.  The LLM receives a bounded compact projection and may use tools to
+    refine it.  This guarantees consultation of current canonical state without
+    dumping the entire cognition store into the prompt.
+    """
+    if cognition is None or not cognition.exists() or _is_simple_chat(transcript):
+        return None
+    query = _latest_user_query(transcript)
+    if not query:
+        return None
+    try:
+        retrieval = RetrievalStore(cognition)
+        return retrieval.retrieve_for_query(query, max_chars=max_chars, limit=limit, detail="compact")
+    except Exception:
+        LOGGER.exception("Canonical prefetch failed")
+        return None
 def _load_persistent_instructions(cognition):
     """Load active persistent instructions locally."""
     if cognition is None or not cognition.exists():
@@ -466,12 +494,23 @@ def run_agent(
     active_instructions = _load_persistent_instructions(cognition)
     system_instruction = _build_system_instruction(active_instructions)
     # --------------------------------------------------------------
-    # Retrieval is deliberately lazy. Do not inject the project index or
-    # retrieved cognition into every model request. The model first uses
-    # search_cognition_metadata, then requests only the targeted content it
-    # actually needs. This keeps the initial prompt small.
+    # Cognition-first retrieval.  Candidate discovery is deterministic local
+    # search, not model inference.  Only a bounded compact projection is
+    # injected; the model can refine/broaden it with cognition tools.
     # --------------------------------------------------------------
     calls = []
+    prefetched = _prefetch_cognition(cognition, transcript)
+    if prefetched and prefetched.get("requests"):
+        calls.append({
+            "tool": "controller.prefetch_cognition",
+            "args": {"query": prefetched.get("query"), "limit": 8, "max_chars": 8000},
+            "result": _json_safe(prefetched),
+        })
+        system_instruction += (
+            "\n\nCONTROLLER-PREFETCHED CANONICAL COGNITION "
+            "(current authoritative project state; use this before old transcript claims):\n"
+            + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
+        )
     # --------------------------------------------------------------
     # Tool declarations
     # --------------------------------------------------------------
@@ -632,6 +671,33 @@ def run_agent(
             safe_result = _json_safe(
                 result
             )
+            # Canonical retrieval continuation is controller-owned.  Consume
+            # resumable requests deterministically, with duplicate/round caps,
+            # before exposing the result to the model.
+            if tool_name == "request_cognition_context" and isinstance(safe_result, dict):
+                pending = list(safe_result.get("next_requests") or [])
+                seen_pending = set()
+                continuation_rounds = 0
+                while pending and continuation_rounds < 32:
+                    follow = pending.pop(0)
+                    key = json.dumps(follow, ensure_ascii=False, sort_keys=True, default=str)
+                    if key in seen_pending:
+                        continue
+                    seen_pending.add(key)
+                    continuation_rounds += 1
+                    follow_args = {
+                        "requests": [follow],
+                        "max_chars": int(tool_args.get("max_chars", 12000) or 12000),
+                    }
+                    follow_result = _json_safe(registry.call(tool_name, follow_args))
+                    _record_tool_call(calls, tool_name, follow_args, follow_result)
+                    if not isinstance(follow_result, dict) or follow_result.get("error"):
+                        break
+                    safe_result.setdefault("requests", []).extend(follow_result.get("requests", []))
+                    pending.extend(follow_result.get("next_requests") or [])
+                safe_result.pop("next_requests", None)
+                safe_result["continuations_consumed"] = continuation_rounds
+                safe_result["continuation_complete"] = not pending
             if isinstance(safe_result, dict) and (safe_result.get("error") or safe_result.get("status") == "error"):
                 LOGGER.warning("Tool failed project=%s step=%d tool=%s error=%s", project_id, step_number + 1, tool_name, safe_result.get("error", "unknown error"))
             else:

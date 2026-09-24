@@ -1,16 +1,21 @@
 from pathlib import Path
 import base64
 import json
+import os
+import signal
+import threading
+import time
 
 import streamlit as st
 from ragapp.auth.db import initialize_database
-from ragapp.interfaces.streamlit_app.auth_ui import login
+from ragapp.interfaces.streamlit_app.auth_ui import login, logout
 from ragapp.cognition.compiler import compile_project, list_available_files
 from ragapp.execution.project import (
     get_project,
     list_projects,
     create_project,
     delete_project,
+    rename_project,
 )
 from ragapp.workspace.manager import set_current_project
 from ragapp.agent.loop import run_agent
@@ -63,6 +68,13 @@ st.markdown(
     overflow: hidden;
 }
 
+[data-testid="stSidebar"] { min-width: 250px; max-width: 280px; }
+[data-testid="stSidebar"] .block-container { padding-top: .55rem; padding-bottom: .55rem; }
+[data-testid="stSidebar"] h1 { font-size: 1.25rem; margin-bottom: .1rem; }
+[data-testid="stSidebar"] h3 { font-size: .92rem; margin: .35rem 0 .15rem; }
+[data-testid="stSidebar"] hr { margin: .35rem 0; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .35rem; }
+[data-testid="stSidebar"] button { min-height: 2rem; }
 [data-testid="stChatInput"] {
     position: static !important;
     bottom: auto !important;
@@ -97,6 +109,50 @@ st.session_state.setdefault(
     "project_id",
     "default",
 )
+
+# ===========================================================================
+# Browser/session + server lifecycle helpers
+# ===========================================================================
+
+def _query_value(name: str) -> str | None:
+    """Return one non-empty query-parameter value."""
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return None
+    if isinstance(value, list):
+        value = value[-1] if value else None
+    value = str(value).strip() if value is not None else ""
+    return value or None
+
+
+def _sync_browser_location(project_id: str, session_id: str | None = None) -> None:
+    """Persist non-secret navigation state across a browser refresh."""
+    try:
+        st.query_params["project"] = project_id
+        if session_id:
+            st.query_params["chat"] = session_id
+        elif "chat" in st.query_params:
+            del st.query_params["chat"]
+    except Exception:
+        # Navigation persistence is helpful but must never break the UI.
+        pass
+
+
+def _terminate_streamlit_process_after_response(delay: float = 0.8) -> None:
+    """Terminate this Streamlit server after the confirmation rerun renders.
+
+    The launcher owns the Streamlit subprocess, so SIGTERM returns control to
+    the launcher instead of requiring a keyboard interrupt.
+    """
+    pid = os.getpid()
+
+    def _stop() -> None:
+        time.sleep(delay)
+        os.kill(pid, signal.SIGTERM)
+
+    threading.Thread(target=_stop, name="streamlit-shutdown", daemon=True).start()
+
 
 # ===========================================================================
 # Project helpers
@@ -343,6 +399,7 @@ def _new_project_dialog():
     )
 
     st.session_state.messages = []
+    _sync_browser_location(new_store.project_id, None)
 
     for key in (
         "create_project_name",
@@ -378,10 +435,11 @@ if not projects:
         "default",
     ]
 
-if st.session_state.project_id not in projects:
-    st.session_state.project_id = (
-        projects[0]
-    )
+requested_project = _query_value("project")
+if requested_project in projects:
+    st.session_state.project_id = requested_project
+elif st.session_state.project_id not in projects:
+    st.session_state.project_id = projects[0]
 
 store = get_project(
     username,
@@ -402,15 +460,12 @@ if not session_list:
     session = sessions.create()
 
 else:
-    current_id = st.session_state.get(
-        "chat_session_id",
+    current_id = (
+        _query_value("chat")
+        or st.session_state.get("chat_session_id")
     )
 
-    session = (
-        sessions.load(current_id)
-        if current_id
-        else None
-    )
+    session = sessions.load(current_id) if current_id else None
 
     if session is None:
         session = session_list[0]
@@ -421,6 +476,8 @@ st.session_state.messages = session.get(
     "messages",
     [],
 )
+
+_sync_browser_location(st.session_state.project_id, session["id"])
 
 # ===========================================================================
 # Sidebar
@@ -500,129 +557,62 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown(
-        "### Project"
+    st.markdown("### Project")
+
+    selected_project = st.selectbox(
+        "Project", projects,
+        index=projects.index(st.session_state.project_id),
+        label_visibility="collapsed", key="project_selector",
     )
 
-    project_col, delete_project_col = st.columns(
-        [5, 1]
-    )
-
-    with project_col:
-        selected_project = st.selectbox(
-            "Project",
-            projects,
-            index=projects.index(
-                st.session_state.project_id
-            ),
-            label_visibility="collapsed",
-            key="project_selector",
+    with st.popover("Project actions", use_container_width=True):
+        if st.button("＋ New project", use_container_width=True, key="sidebar_new_project"):
+            _new_project_dialog()
+        st.caption("Rename current project")
+        project_rename = st.text_input(
+            "New project name", value=st.session_state.project_id,
+            label_visibility="collapsed", key="project_rename_input",
         )
+        if st.button("Rename project", use_container_width=True, key="rename_project_btn"):
+            try:
+                renamed = rename_project(username, st.session_state.project_id, project_rename)
+                st.session_state.project_id = renamed.project_id
+                st.session_state.pop("chat_session_id", None)
+                st.session_state.messages = []
+                _sync_browser_location(renamed.project_id, None)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        if st.button("Delete project…", use_container_width=True, key="delete_selected_project"):
+            st.session_state["confirm_delete_project"] = True
 
-    with delete_project_col:
-        if st.button(
-            "🗑",
-            key="delete_selected_project",
-            help="Delete selected project",
-            use_container_width=True,
-        ):
-            st.session_state[
-                "confirm_delete_project"
-            ] = True
-
-    if st.button(
-        "＋ New project",
-        use_container_width=True,
-    ):
-        _new_project_dialog()
-
-    if (
-        selected_project
-        != st.session_state.project_id
-    ):
-        st.session_state.project_id = (
-            selected_project
-        )
-
-        st.session_state.pop(
-            "chat_session_id",
-            None,
-        )
-
+    if selected_project != st.session_state.project_id:
+        st.session_state.project_id = selected_project
+        st.session_state.pop("chat_session_id", None)
         st.session_state.messages = []
-
+        _sync_browser_location(selected_project, None)
         st.rerun()
 
-    if st.session_state.get(
-        "confirm_delete_project"
-    ):
-        st.warning(
-            f"Delete project "
-            f"'{st.session_state.project_id}' "
-            f"permanently?"
-        )
-
+    if st.session_state.get("confirm_delete_project"):
+        st.warning(f"Delete project '{st.session_state.project_id}' permanently?")
         dp1, dp2 = st.columns(2)
-
         with dp1:
-            if st.button(
-                "Delete permanently",
-                key="confirm_project_delete",
-                type="primary",
-                use_container_width=True,
-            ):
-                project_to_delete = (
-                    st.session_state.project_id
-                )
-
-                delete_project(
-                    username,
-                    project_to_delete,
-                )
-
-                remaining = list_projects(
-                    username,
-                )
-
+            if st.button("Delete", key="confirm_project_delete", type="primary", use_container_width=True):
+                project_to_delete = st.session_state.project_id
+                delete_project(username, project_to_delete)
+                remaining = list_projects(username)
                 if not remaining:
-                    create_project(
-                        username,
-                        "default",
-                    )
-
-                    remaining = [
-                        "default"
-                    ]
-
-                st.session_state.project_id = (
-                    remaining[0]
-                )
-
-                st.session_state.pop(
-                    "chat_session_id",
-                    None,
-                )
-
+                    create_project(username, "default")
+                    remaining = ["default"]
+                st.session_state.project_id = remaining[0]
+                st.session_state.pop("chat_session_id", None)
                 st.session_state.messages = []
-
-                st.session_state.pop(
-                    "confirm_delete_project",
-                    None,
-                )
-
+                st.session_state.pop("confirm_delete_project", None)
+                _sync_browser_location(st.session_state.project_id, None)
                 st.rerun()
-
         with dp2:
-            if st.button(
-                "Cancel",
-                key="cancel_project_delete",
-                use_container_width=True,
-            ):
-                st.session_state.pop(
-                    "confirm_delete_project",
-                    None,
-                )
-
+            if st.button("Cancel", key="cancel_project_delete", use_container_width=True):
+                st.session_state.pop("confirm_delete_project", None)
                 st.rerun()
 
     st.divider()
@@ -680,6 +670,7 @@ with st.sidebar:
                     [],
                 )
             )
+            _sync_browser_location(st.session_state.project_id, loaded["id"])
 
             st.rerun()
 
@@ -697,6 +688,7 @@ with st.sidebar:
             )
 
             st.session_state.messages = []
+            _sync_browser_location(st.session_state.project_id, new_session["id"])
 
             st.rerun()
 
@@ -764,6 +756,7 @@ with st.sidebar:
                     "confirm_delete_chat",
                     None,
                 )
+                _sync_browser_location(st.session_state.project_id, session["id"])
 
                 st.rerun()
 
@@ -777,6 +770,7 @@ with st.sidebar:
                     "confirm_delete_chat",
                     None,
                 )
+                _sync_browser_location(st.session_state.project_id, session["id"])
 
                 st.rerun()
 
@@ -811,9 +805,7 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown(
-        "### Project status"
-    )
+    st.caption("Project status")
 
     source_file_count = sum(
         p.is_file()
@@ -840,13 +832,29 @@ with st.sidebar:
         f"{store.state_map().get('current_version', 0)}"
     )
 
-    if st.button(
-        "Log out",
-        use_container_width=True,
-    ):
-        st.session_state.authenticated = False
-        st.session_state.messages = []
-        st.rerun()
+    with st.popover("System", use_container_width=True):
+        if st.button("Log out", use_container_width=True, key="system_logout"):
+            logout()
+
+        if st.button("Shut down UI…", use_container_width=True, key="system_shutdown_request"):
+            st.session_state["confirm_shutdown_ui"] = True
+
+        if st.session_state.get("confirm_shutdown_ui"):
+            st.warning("This stops the Streamlit server for every connected browser.")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if st.button("Shut down", type="primary", use_container_width=True, key="system_shutdown_confirm"):
+                    st.session_state["shutdown_scheduled"] = True
+                    st.session_state.pop("confirm_shutdown_ui", None)
+                    _terminate_streamlit_process_after_response()
+                    st.rerun()
+            with sc2:
+                if st.button("Cancel", use_container_width=True, key="system_shutdown_cancel"):
+                    st.session_state.pop("confirm_shutdown_ui", None)
+                    st.rerun()
+
+    if st.session_state.get("shutdown_scheduled"):
+        st.info("Shutting down the UI. The launcher will regain control shortly.")
 
 # ===========================================================================
 # Main navigation

@@ -1,0 +1,3 @@
+[console_scripts]
+cognitive-agent = ragapp.interfaces.launcher:main
+cognitive-streamlit = ragapp.interfaces.streamlit_app.main:main
