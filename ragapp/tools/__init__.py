@@ -8,6 +8,7 @@ from ragapp.tools.pptx_files import build_pptx_tools
 from ragapp.tools.xlsx_files import build_xlsx_tools
 from ragapp.tools.binary_files import build_binary_file_tools
 from ragapp.tools.project_files import build_project_file_tools
+from ragapp.tools.vcs_tools import build_vcs_tools
 
 
 def build_default_tools(username, store, include_cognition=True, session_id=None):
@@ -18,6 +19,7 @@ def build_default_tools(username, store, include_cognition=True, session_id=None
     """
     tools = []
     tools.extend(build_project_file_tools())
+    tools.extend(build_vcs_tools(store))
     if include_cognition and store.exists():
         tools.extend(build_cognition_tools(store, session_id=session_id))
     tools.extend(build_workspace_file_tools(username))

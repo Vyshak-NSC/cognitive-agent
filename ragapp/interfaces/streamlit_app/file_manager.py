@@ -2,6 +2,7 @@
 from pathlib import Path
 import base64, html, io, mimetypes, re, shutil, zipfile
 import streamlit as st
+from ragapp.core.project_files import ProjectFileService
 
 TEXT_EXTENSIONS={'.txt','.md','.py','.js','.mjs','.ts','.tsx','.jsx','.json','.yaml','.yml','.csv','.xml','.html','.htm','.css','.sql','.toml','.ini','.cfg','.env','.java','.kt','.go','.rs','.c','.cpp','.h','.hpp','.sh','.bat','.ps1','.r','.tex'}
 AREAS={'workspace':('Workspace','Working files and generated artifacts.'),'source':('Source','Source material used by cognition.')}
@@ -63,12 +64,11 @@ def _extract_zip_into(data,root,folder,overwrite=False):
     return out
 
 def _transfer(store,src_area,rel,dst_area,dst_folder,move):
-    sr=_root(store,src_area); dr=_root(store,dst_area); src=_safe(sr,rel); dst=_safe(dr,str(Path(dst_folder)/src.name) if dst_folder!='/' else src.name)
-    if dst.exists(): raise FileExistsError('Destination already exists.')
-    dst.parent.mkdir(parents=True,exist_ok=True)
-    if move: shutil.move(str(src),str(dst))
-    elif src.is_dir(): shutil.copytree(src,dst)
-    else: shutil.copy2(src,dst)
+    service=ProjectFileService(store)
+    src=service.path(src_area,rel)
+    dst_rel=(Path(dst_folder)/src.name).as_posix() if dst_folder!='/' else src.name
+    if move: return service.move(src_area,rel,dst_area,dst_rel)
+    return service.copy(src_area,rel,dst_area,dst_rel)
 
 def _preview(path,root):
     if _is_text(path):
@@ -81,6 +81,7 @@ def _preview(path,root):
 def render_file_manager(store):
     st.subheader('Files')
     st.caption('Workspace and Source are managed from one compact browser. Select an item, then choose an action.')
+    files=ProjectFileService(store)
     top1,top2=st.columns([1,2])
     with top1:
         area=st.segmented_control('Area',['workspace','source'],format_func=lambda x:AREAS[x][0],default=st.session_state.get('fm_area','workspace'),key='fm_area') or 'workspace'
@@ -99,23 +100,29 @@ def render_file_manager(store):
                 try:
                     target=_safe(root,str(Path(folder)/_clean_name(name)) if folder!='/' else _clean_name(name))
                     if target.exists(): raise FileExistsError('Destination already exists.')
-                    if kind=='Folder': target.mkdir(parents=True)
-                    else: target.parent.mkdir(parents=True,exist_ok=True); target.write_text(content,encoding='utf-8')
+                    rel=target.relative_to(root).as_posix()
+                    if kind=='Folder': files.create_folder(area,rel)
+                    else: files.write_text(area,rel,content)
                     st.rerun()
                 except Exception as e: st.error(str(e))
         with tab2:
             ups=st.file_uploader('Files',accept_multiple_files=True,key=f'ups_{area}')
             if ups and st.button('Upload',type='primary',key=f'upload_{area}'):
                 try:
+                    batch=[]
                     for up in ups:
-                        t=_safe(root,str(Path(folder)/Path(up.name).name) if folder!='/' else Path(up.name).name)
-                        if t.exists(): raise FileExistsError(f'{up.name} already exists.')
-                        t.write_bytes(up.getbuffer())
+                        rel=(Path(folder)/Path(up.name).name).as_posix() if folder!='/' else Path(up.name).name
+                        batch.append((rel,up.getvalue()))
+                    files.write_many(area,batch,description=f'Upload {len(batch)} file(s) to {area}')
                     st.rerun()
                 except Exception as e: st.error(str(e))
             z=st.file_uploader('Or extract a ZIP',type=['zip'],key=f'zip_{area}'); overwrite=st.checkbox('Overwrite existing',key=f'ow_{area}')
             if z and st.button('Extract ZIP',key=f'extract_{area}'):
-                try: _extract_zip_into(z.getvalue(),root,folder,overwrite); st.rerun()
+                try:
+                    files.vcs.checkpoint(f'Pre-change: extract ZIP into {area}/{folder}')
+                    _extract_zip_into(z.getvalue(),root,folder,overwrite)
+                    files.vcs.commit(f'Extract ZIP into {area}/{folder}',bind_timeline=False)
+                    st.rerun()
                 except Exception as e: st.error(str(e))
         with tab3:
             other='source' if area=='workspace' else 'workspace'; oroot=_root(store,other)
@@ -147,17 +154,21 @@ def render_file_manager(store):
         if e['type']=='Folder': st.info('Folders cannot be edited; rename/move them or edit their contents.')
         elif _is_text(p):
             text=st.text_area('Contents',p.read_text(encoding='utf-8',errors='replace'),height=430,key=f'edit_{area}_{e["path"]}')
-            if st.button('Save changes',type='primary',key=f'save_{area}_{e["path"]}'): p.write_text(text,encoding='utf-8'); st.success('Saved.')
+            if st.button('Save changes',type='primary',key=f'save_{area}_{e["path"]}'):
+                files.write_text(area,e['path'],text,overwrite=True,description=f'Edit {area}/{e["path"]}')
+                st.success('Saved.')
         else:
             replacement=st.file_uploader('Replace binary file',key=f'replace_{area}_{e["path"]}')
-            if replacement and st.button('Replace',type='primary',key=f'replace_go_{area}_{e["path"]}'): p.write_bytes(replacement.getbuffer()); st.rerun()
+            if replacement and st.button('Replace',type='primary',key=f'replace_go_{area}_{e["path"]}'):
+                files.write_bytes(area,e['path'],replacement.getvalue(),overwrite=True,description=f'Replace {area}/{e["path"]}')
+                st.rerun()
     elif action=='Rename / move':
         name=st.text_input('Name',value=p.name,key=f'rname_{area}_{e["path"]}'); dest=st.selectbox('Folder',folders,key=f'rdest_{area}_{e["path"]}')
         if st.button('Apply',type='primary',key=f'rgo_{area}_{e["path"]}'):
             try:
                 target=_safe(root,str(Path(dest)/_clean_name(name)) if dest!='/' else _clean_name(name))
                 if target!=p and target.exists(): raise FileExistsError('Destination already exists.')
-                shutil.move(str(p),str(target)); st.rerun()
+                files.move(area,e['path'],area,target.relative_to(root).as_posix()); st.rerun()
             except Exception as ex: st.error(str(ex))
     elif action=='Copy':
         dest=st.selectbox('Destination folder',folders,key=f'cdest_{area}_{e["path"]}')
@@ -165,7 +176,7 @@ def render_file_manager(store):
             try:
                 target=_safe(root,str(Path(dest)/p.name) if dest!='/' else p.name)
                 if target.exists(): raise FileExistsError('Destination already exists.')
-                shutil.copytree(p,target) if p.is_dir() else shutil.copy2(p,target); st.rerun()
+                files.copy(area,e['path'],area,target.relative_to(root).as_posix()); st.rerun()
             except Exception as ex: st.error(str(ex))
     elif action in {'Move to other area','Copy to other area'}:
         other='source' if area=='workspace' else 'workspace'; dests=_folders(_root(store,other)); dest=st.selectbox(f'{AREAS[other][0]} folder',dests,key=f'xarea_{area}_{e["path"]}')
@@ -178,4 +189,4 @@ def render_file_manager(store):
     elif action=='Delete':
         st.warning(f"Delete {e['type'].lower()} '{e['name']}' permanently?")
         if st.button('Delete permanently',type='primary',key=f'del_{area}_{e["path"]}'):
-            shutil.rmtree(p) if p.is_dir() else p.unlink(); st.rerun()
+            files.delete(area,e['path']); st.rerun()

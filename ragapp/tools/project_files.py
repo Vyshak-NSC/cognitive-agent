@@ -4,6 +4,7 @@ import shutil
 from ragapp.tools.definitions import Tool
 from ragapp.workspace.manager import current_store
 from ragapp.core.drafts import DraftManager
+from ragapp.core.project_files import ProjectFileService
 
 
 def _root(area):
@@ -67,60 +68,23 @@ def list_project_files(area="workspace", relative_path=""):
 
 
 def create_project_folder(area, relative_path):
-    p = _path(area, relative_path)
-    if p.exists():
-        raise FileExistsError(f"Already exists: {relative_path}")
-    p.mkdir(parents=True)
-    return {"path": relative_path, "status": "created"}
+    return ProjectFileService(current_store()).create_folder(area, relative_path)
 
 
 def create_project_file(area, relative_path, content=""):
-    p = _path(area, relative_path)
-    if p.exists():
-        raise FileExistsError(f"Already exists: {relative_path}")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    return {"path": relative_path, "status": "created"}
+    return ProjectFileService(current_store()).write_text(area, relative_path, content)
 
 
 def copy_project_item(area, source_relative_path, destination_relative_path):
-    src = _path(area, source_relative_path)
-    dst = _path(area, destination_relative_path)
-    if not src.exists():
-        raise FileNotFoundError(source_relative_path)
-    if dst.exists():
-        raise FileExistsError(f"Destination already exists: {destination_relative_path}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_dir():
-        shutil.copytree(src, dst)
-    else:
-        shutil.copy2(src, dst)
-    return {"source": source_relative_path, "destination": destination_relative_path, "status": "copied"}
+    return ProjectFileService(current_store()).copy(area, source_relative_path, area, destination_relative_path)
 
 
 def move_project_item(area, source_relative_path, destination_relative_path):
-    src = _path(area, source_relative_path)
-    dst = _path(area, destination_relative_path)
-    if not src.exists():
-        raise FileNotFoundError(source_relative_path)
-    if dst.exists():
-        raise FileExistsError(f"Destination already exists: {destination_relative_path}")
-    if src.is_dir() and (dst == src or src in dst.parents):
-        raise ValueError("Cannot move a folder into itself.")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
-    return {"source": source_relative_path, "destination": destination_relative_path, "status": "moved"}
+    return ProjectFileService(current_store()).move(area, source_relative_path, area, destination_relative_path)
 
 
 def delete_project_item(area, relative_path):
-    p = _path(area, relative_path)
-    if not p.exists():
-        raise FileNotFoundError(relative_path)
-    if p.is_dir():
-        shutil.rmtree(p)
-    else:
-        p.unlink()
-    return {"path": relative_path, "status": "deleted"}
+    return ProjectFileService(current_store()).delete(area, relative_path)
 
 
 def read_project_text(area, relative_path, encoding="utf-8"):
@@ -137,33 +101,14 @@ def read_project_text(area, relative_path, encoding="utf-8"):
 
 
 def write_project_text(area, relative_path, content, encoding="utf-8"):
-    p = _path(area, relative_path)
-    if p.exists():
-        raise FileExistsError(f"Already exists: {relative_path}")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding=encoding)
-    return {"path": relative_path, "status": "created"}
+    return ProjectFileService(current_store()).write_text(area, relative_path, content, encoding=encoding)
 
 
 def edit_project_text(area, relative_path, operation, old_text=None, new_text=None, content=None, encoding="utf-8"):
-    p = _path(area, relative_path)
-    if not p.is_file():
-        raise FileNotFoundError(relative_path)
-    current = p.read_text(encoding=encoding)
-    if operation == "replace":
-        if old_text is None or new_text is None or old_text not in current:
-            raise ValueError("replace requires old_text/new_text and old_text must exist")
-        updated = current.replace(old_text, new_text)
-    elif operation == "append":
-        updated = current + (content or "")
-    elif operation == "prepend":
-        updated = (content or "") + current
-    elif operation == "replace_all":
-        updated = content or ""
-    else:
-        raise ValueError("operation must be replace, append, prepend, or replace_all")
-    p.write_text(updated, encoding=encoding)
-    return {"path": relative_path, "status": "edited"}
+    return ProjectFileService(current_store()).edit_text(
+        area, relative_path, operation, old_text=old_text, new_text=new_text,
+        content=content, encoding=encoding,
+    )
 
 
 
@@ -202,8 +147,7 @@ def propose_source_file(relative_path, content="", change_description="Create so
     workspace_path = (store.workspace / relative).resolve()
     workspace_root = store.workspace.resolve()
     workspace_path.relative_to(workspace_root)
-    workspace_path.parent.mkdir(parents=True, exist_ok=True)
-    workspace_path.write_text(content, encoding="utf-8")
+    ProjectFileService(store).write_text("workspace", relative, content, overwrite=workspace_path.exists(), description=f"Stage source proposal for source/{relative}")
 
     draft = DraftManager(store).create(
         content=content,
@@ -266,8 +210,7 @@ def propose_source_edit(
     workspace_path = (store.workspace / relative).resolve()
     workspace_root = store.workspace.resolve()
     workspace_path.relative_to(workspace_root)
-    workspace_path.parent.mkdir(parents=True, exist_ok=True)
-    workspace_path.write_text(updated, encoding=encoding)
+    ProjectFileService(store).write_text("workspace", relative, updated, overwrite=workspace_path.exists(), encoding=encoding, description=f"Stage source edit for source/{relative}")
 
     draft = DraftManager(store).create(
         content=updated,
@@ -313,16 +256,10 @@ def build_project_file_tools():
     ]
 
 def _workspace_create_folder(relative_path):
-    p=_write_path(relative_path)
-    if p.exists(): raise FileExistsError(f"Already exists: {relative_path}")
-    p.mkdir(parents=True)
-    return {"path":relative_path,"status":"created","area":"workspace"}
+    return ProjectFileService(current_store()).create_folder("workspace", relative_path)
 
 def _workspace_create_file(relative_path,content=""):
-    p=_write_path(relative_path)
-    if p.exists(): raise FileExistsError(f"Already exists: {relative_path}")
-    p.parent.mkdir(parents=True,exist_ok=True); p.write_text(content,encoding="utf-8")
-    return {"path":relative_path,"status":"created","area":"workspace"}
+    return ProjectFileService(current_store()).write_text("workspace", relative_path, content)
 
 def _workspace_copy(src,dst):
     return copy_project_item("workspace",src,dst)
