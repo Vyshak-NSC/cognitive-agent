@@ -176,6 +176,11 @@ class ApprovalEngine:
         return d
 
     def _approve_source(self, d, m, target_path, relative):
+        # Persist the exact source/workspace/cognition/log tree before applying
+        # an authoritative source mutation. Recovery must never depend on chat.
+        pre_commit = self.vcs.backup_authoritative_state(
+            m.get("change_description", "Pre-state backup before source approval")
+        )
         existed, old, new = self._apply_content(d, target_path)
         try:
             # Reingest receives SOURCE-relative target information only.
@@ -214,6 +219,7 @@ class ApprovalEngine:
         self.drafts.save(d)
         desc = m.get("change_description", "Approved agent change")
         self._write_log(d, desc, "source", relative)
+        d["pre_state_git_commit"] = pre_commit
         d["commit"] = self.vcs.commit(desc)
         self.drafts.save(d)
         return d
