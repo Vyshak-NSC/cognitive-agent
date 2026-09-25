@@ -9,6 +9,7 @@ from ragapp.core.drafts import DraftManager
 from ragapp.core.approval import ApprovalEngine
 from ragapp.core.instructions import InstructionStore
 from ragapp.core.vcs import VCSManager
+from ragapp.core.agents import AgentStore
 from ragapp.cognition.compiler import compile_project
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.chat_sessions import ChatSessionStore
@@ -17,7 +18,7 @@ from ragapp.tools.cognition_tools import _world_model_snapshot, _validate, _impa
 
 app=FastAPI(title='Agentic State Layer API',version='0.1.0')
 initialize_database()
-class Query(BaseModel): username:str; project_id:str; messages:list[dict]; session_id:str|None=None
+class Query(BaseModel): username:str; project_id:str; messages:list[dict]; session_id:str|None=None; agent_id:str|None=None
 class Project(BaseModel): username:str; project_id:str
 class Reject(BaseModel): reason:str=''
 class Instruction(BaseModel): content:str; scope:str='situational'; tagged_entity_id:str|None=None
@@ -48,7 +49,7 @@ def query(q:Query):
         answer,calls,drafts=run_agent(
             transcript,
             build_default_tools(q.username,s,True,session_id=session_id),
-            s,q.project_id,session_id=session_id,
+            s,q.project_id,session_id=session_id,agent_id=q.agent_id,
         )
     except Exception as e: raise HTTPException(500,str(e))
     user_message=next((m for m in reversed(transcript) if m.get('role')=='user'), {'role':'user','content':''})
@@ -195,3 +196,35 @@ def vcs_checkpoint(username:str, project_id:str, body:Checkpoint):
         return {'commit':VCSManager(store_for(username, project_id)).checkpoint(body.message)}
     except Exception as e:
         raise HTTPException(400, str(e))
+
+
+# ---- Persistent Agents ----------------------------------------------------
+class AgentSpec(BaseModel):
+    id: str|None=None
+    name: str
+    description: str=''
+    objective: str=''
+    instructions: list[str]=[]
+    data_sources: list[str]=[]
+    output_targets: list[str]=[]
+    allowed_tools: list[str]=[]
+    denied_tools: list[str]=[]
+    workflow_steps: list[dict]=[]
+    trigger: dict={'type':'manual'}
+    require_mutation_approval: bool=True
+    enabled: bool=True
+
+@app.get('/agents/{username}/{project_id}')
+def list_agent_specs(username,project_id): return AgentStore(store_for(username,project_id)).list()
+
+@app.get('/agents/{username}/{project_id}/{agent_id}')
+def get_agent_spec(username,project_id,agent_id):
+    x=AgentStore(store_for(username,project_id)).get(agent_id)
+    if not x: raise HTTPException(404,'Agent not found')
+    return x
+
+@app.put('/agents/{username}/{project_id}')
+def put_agent_spec(username,project_id,a:AgentSpec): return AgentStore(store_for(username,project_id)).save(a.model_dump())
+
+@app.delete('/agents/{username}/{project_id}/{agent_id}')
+def delete_agent_spec(username,project_id,agent_id): return {'deleted':AgentStore(store_for(username,project_id)).delete(agent_id)}
