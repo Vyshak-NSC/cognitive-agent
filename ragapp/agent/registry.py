@@ -2,13 +2,12 @@ class ToolRegistry:
     def __init__(self,tools):
         self._tools={t.name:t for t in tools}
 
+    def add(self, tool):
+        self._tools[tool.name] = tool
+
     def as_function_declarations(self, allowed=None):
         tools = self._tools.values() if allowed is None else (self._tools[n] for n in allowed if n in self._tools)
         return [{"name":t.name,"description":t.description,"parameters":t.parameters} for t in tools]
-
-    @property
-    def names(self):
-        return set(self._tools)
 
     def call(self,name,args):
         if name not in self._tools:

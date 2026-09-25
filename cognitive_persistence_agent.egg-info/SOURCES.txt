@@ -17,8 +17,11 @@ ragapp/logging_config.py
 ragapp/settings.py
 ragapp/agent/__init__.py
 ragapp/agent/cognitive_cycle.py
+ragapp/agent/context_selector.py
 ragapp/agent/loop.py
 ragapp/agent/registry.py
+ragapp/agent/router.py
+ragapp/agent/run_context.py
 ragapp/auth/__init__.py
 ragapp/auth/cli.py
 ragapp/auth/db.py
@@ -29,6 +32,7 @@ ragapp/cognition/__init__.py
 ragapp/cognition/classifier.py
 ragapp/cognition/code_compiler.py
 ragapp/cognition/code_parser.py
+ragapp/cognition/cognition_tools.py
 ragapp/cognition/compiler.py
 ragapp/cognition/document_compiler.py
 ragapp/cognition/document_index.py
@@ -36,15 +40,19 @@ ragapp/cognition/merge.py
 ragapp/cognition/session_memory.py
 ragapp/cognition/store.py
 ragapp/core/__init__.py
+ragapp/core/agents.py
 ragapp/core/approval.py
 ragapp/core/drafts.py
 ragapp/core/instructions.py
 ragapp/core/metadata.py
 ragapp/core/metadata_sync.py
+ragapp/core/project_files.py
 ragapp/core/reingest.py
 ragapp/core/retrieval.py
 ragapp/core/review.py
+ragapp/core/semantic_index.py
 ragapp/core/vcs.py
+ragapp/core/workflows.py
 ragapp/execution/project.py
 ragapp/extractors/base.py
 ragapp/extractors/code_extractor.py
@@ -67,6 +75,7 @@ ragapp/llm/tool_calling/azure_openai.py
 ragapp/llm/tool_calling/gemini.py
 ragapp/llm/tool_calling/openrouter.py
 ragapp/tools/__init__.py
+ragapp/tools/agent_tools.py
 ragapp/tools/binary_files.py
 ragapp/tools/cognition_tools.py
 ragapp/tools/definitions.py
@@ -76,6 +85,8 @@ ragapp/tools/pdf_files.py
 ragapp/tools/pptx_files.py
 ragapp/tools/project_files.py
 ragapp/tools/regular_files.py
+ragapp/tools/vcs_tools.py
+ragapp/tools/workflow_tools.py
 ragapp/tools/workspace_files.py
 ragapp/tools/xlsx_files.py
 ragapp/tools/xml_files.py

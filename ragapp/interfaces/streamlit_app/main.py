@@ -19,6 +19,7 @@ from ragapp.execution.project import (
 )
 from ragapp.workspace.manager import set_current_project
 from ragapp.agent.loop import run_agent
+from ragapp.agent.run_context import AgentRunContext
 from ragapp.tools import build_default_tools
 from ragapp.chat_sessions import ChatSessionStore
 from ragapp.interfaces.streamlit_app.file_manager import (
@@ -1490,17 +1491,15 @@ if nav_section == "chat":
                                 include_cognition=True,
                             )
 
-                            answer, calls, drafts = run_agent(
-                                st.session_state.messages,
-                                tools,
-                                store,
-                                store.project_id,
-                                session_id=(
-                                    st.session_state.chat_session_id
-                                ),
+                            answer, calls, drafts = run_agent(AgentRunContext(
+                                transcript=st.session_state.messages,
+                                tools=tools,
+                                cognition=store,
+                                project_id=store.project_id,
+                                session_id=st.session_state.chat_session_id,
                                 on_section=_on_section,
                                 agent_id=(st.session_state.get("active_agent_id") or None),
-                            )
+                            ))
 
                     except Exception as exc:
                         # --------------------------------------------------

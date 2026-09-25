@@ -19,8 +19,7 @@ from ragapp.llm.tool_calling import (
     to_provider_contents,
     build_function_response_content,
 )
-from ragapp.llm.prompts import build_prompt
-from ragapp.agent.router import route_request, allowed_tool_names
+from ragapp.llm.prompts import COGNITIVE_AGENT_PROMPT
 from ragapp.llm.provider import generate_step as provider_generate_step
 from ragapp.settings import MAX_AGENT_STEPS, MAX_CONTEXT_CHARS
 from ragapp.core.drafts import DraftManager
@@ -28,6 +27,9 @@ from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
+from ragapp.agent.context_selector import ContextSelector
+from ragapp.agent.run_context import AgentRunContext
+from ragapp.tools.definitions import Tool
 from ragapp.logging_config import configure_logging
 
 configure_logging()
@@ -193,23 +195,29 @@ def _load_persistent_instructions(cognition):
     except Exception:
         return []
     return instructions or []
-def _build_system_instruction(active_instructions, route):
-    """Build only the prompt modules required by this request route."""
-    system_instruction = build_prompt(route.capabilities)
-    if not active_instructions:
-        return system_instruction
+def _build_system_instruction(active_instructions, modules=None):
+    """Build a bounded system instruction from the invariant kernel plus selected context."""
+    system_instruction = COGNITIVE_AGENT_PROMPT
+    system_instruction += "\n\nNever reproduce internal tool results, retrieval envelopes, JSON context payloads, or controller metadata in the user-facing answer."
+    system_instruction += (
+        "\n\nWhen the user explicitly approves applying one or more arbitrary changes to canonical cognition "
+        "(including deleting an entity/fact/relationship or changes whose consequences may affect connected cognition), "
+        "emit exactly one <STATE_UPDATE> JSON block with a semantic_changes array containing the approved changes in plain language. "
+        "Do not manually enumerate guessed cascade edits as deltas; the cognition transaction runtime loads connected cognition, "
+        "performs semantic cascade planning with the LLM, applies it atomically, cleans references, and commits the new state. "
+        "Use ordinary deltas only for simple isolated entity attribute state observations where no semantic cascade is requested."
+    )
+    module_lines = [str(x).strip() for x in (modules or []) if str(x).strip()]
+    if module_lines:
+        system_instruction += "\n\nTASK-RELEVANT RUNTIME GUIDANCE:\n" + "\n".join(f"- {x}" for x in module_lines)
     lines = []
-    for instruction in active_instructions:
+    for instruction in active_instructions or []:
         content = instruction.get("content", "") if isinstance(instruction, dict) else str(instruction)
         content = str(content).strip()
         if content:
             lines.append(f"- {content}")
     if lines:
-        system_instruction += (
-            "\n\nPERSISTENT PROJECT INSTRUCTIONS:\n"
-            "Follow these active project-level instructions when applicable:\n"
-            + "\n".join(lines)
-        )
+        system_instruction += "\n\nAPPLICABLE PROJECT INSTRUCTIONS:\n" + "\n".join(lines)
     return system_instruction
 
 def _record_tool_call(
@@ -273,18 +281,27 @@ def _persist_state_updates(
                 "events",
                 [],
             )
-            if not isinstance(deltas, list):
-                raise ValueError(
-                    "STATE_UPDATE.deltas must be an array."
+            semantic_changes = payload.get("semantic_changes")
+            if semantic_changes:
+                from ragapp.cognition.merge import apply_semantic_mutation
+                result = apply_semantic_mutation(
+                    cognition,
+                    semantic_changes,
+                    source_label=f"agent:{project_id}",
                 )
-            result = merge_deltas(
-                cognition,
-                deltas,
-                source_label=(
-                    f"agent:{project_id}"
-                ),
-                events=events,
-            )
+            else:
+                if not isinstance(deltas, list):
+                    raise ValueError(
+                        "STATE_UPDATE.deltas must be an array."
+                    )
+                result = merge_deltas(
+                    cognition,
+                    deltas,
+                    source_label=(
+                        f"agent:{project_id}"
+                    ),
+                    events=events,
+                )
             _record_tool_call(
                 calls,
                 "cognition.merge_state_deltas",
@@ -292,38 +309,24 @@ def _persist_state_updates(
                 result,
             )
             applied += 1
-        except TypeError:
-            # Backward compatibility for merge_deltas versions
-            # that do not accept events=.
+        except TypeError as exc:
+            # Compatibility fallback applies only to legacy ordinary deltas.
+            # Semantic transactions must fail closed rather than silently
+            # degrading into an empty/non-cascading state update.
             try:
                 payload = json.loads(state_raw)
-                deltas = payload.get(
-                    "deltas",
-                    [],
-                )
+                if payload.get("semantic_changes"):
+                    raise exc
+                deltas = payload.get("deltas", [])
                 result = merge_deltas(
                     cognition,
                     deltas,
-                    source_label=(
-                        f"agent:{project_id}"
-                    ),
+                    source_label=f"agent:{project_id}",
                 )
-                _record_tool_call(
-                    calls,
-                    "cognition.merge_state_deltas",
-                    payload,
-                    result,
-                )
+                _record_tool_call(calls, "cognition.merge_state_deltas", payload, result)
                 applied += 1
-            except Exception as exc:
-                _record_tool_call(
-                    calls,
-                    "cognition.merge_state_deltas",
-                    {},
-                    {
-                        "error": str(exc)
-                    },
-                )
+            except Exception as inner_exc:
+                _record_tool_call(calls, "cognition.merge_state_deltas", {}, {"error": str(inner_exc)})
         except Exception as exc:
             try:
                 safe_payload = json.loads(
@@ -438,20 +441,21 @@ def _persist_drafts(
             draft,
         )
     return drafts, skipped
-def run_agent(
-    transcript,
-    tools,
-    cognition,
-    project_id,
-    max_steps=MAX_AGENT_STEPS,
-    session_id=None,
-    on_section=None,
-):
+def run_agent(context: AgentRunContext):
     """Run the cognitive agent loop.
     Durable fiction/lore changes are represented by STATE_UPDATE and are
     merged directly into cognition. Source-backed implementation changes
     continue to use workspace drafts and approval.
     """
+    if not isinstance(context, AgentRunContext):
+        raise TypeError("run_agent() requires AgentRunContext")
+    transcript = context.transcript
+    tools = context.tools
+    cognition = context.cognition
+    project_id = context.project_id
+    session_id = context.session_id
+    on_section = context.on_section
+    max_steps = context.max_steps if context.max_steps is not None else MAX_AGENT_STEPS
     LOGGER.info(
         "Agent start project=%s session=%s messages=%d max_steps=%d tools=%d",
         project_id, session_id or "none", len(transcript), max_steps, len(tools),
@@ -470,39 +474,56 @@ def run_agent(
         else None
     )
     # --------------------------------------------------------------
-    # Persistent instructions remain part of the system instruction.
-    # They are small and are not source retrieval.
-    # --------------------------------------------------------------
-    route = route_request(_latest_user_query(transcript))
-    active_instructions = _load_persistent_instructions(cognition)
-    system_instruction = _build_system_instruction(active_instructions, route)
-    LOGGER.info("Request route project=%s route=%s capabilities=%s", project_id, route.reason, sorted(route.capabilities))
-    # --------------------------------------------------------------
-    # Cognition-first retrieval.  Candidate discovery is deterministic local
-    # search, not model inference.  Only a bounded compact projection is
-    # injected; the model can refine/broaden it with cognition tools.
+    # Local semantic selection. One local embedding query selects candidate
+    # capabilities, cognition, prompt modules and situational instructions.
+    # No generative/API routing call is made here.
     # --------------------------------------------------------------
     calls = []
-    prefetched = _prefetch_cognition(cognition, transcript) if route.has("cognition") else None
+    query = _latest_user_query(transcript)
+    selector = ContextSelector(cognition, tools)
+    if _is_simple_chat(transcript):
+        selection = {"tool_names": [], "modules": [], "instructions": [], "prefetched": None, "mode": "simple_chat"}
+    else:
+        selection = selector.select(query)
+    selected_modules = list(selection.get("modules") or [])
+    selected_modules.extend(context.agent_guidance())
+    system_instruction = _build_system_instruction(selection.get("instructions"), selected_modules)
+    prefetched = selection.get("prefetched")
     if prefetched and prefetched.get("requests"):
         calls.append({
-            "tool": "controller.prefetch_cognition",
-            "args": {"query": prefetched.get("query"), "limit": 8, "max_chars": 8000},
+            "tool": "controller.semantic_prefetch",
+            "args": {"query": query, "limit": 4, "max_chars": 4000, "mode": selection.get("mode")},
             "result": _json_safe(prefetched),
         })
         system_instruction += (
-            "\n\nCONTROLLER-PREFETCHED CANONICAL COGNITION "
-            "(current authoritative project state; use this before old transcript claims):\n"
+            "\n\nRELEVANT CANONICAL COGNITION (locally selected candidates; current project state):\n"
             + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
         )
-    # --------------------------------------------------------------
-    # Tool declarations
-    # --------------------------------------------------------------
-    if _is_simple_chat(transcript):
-        function_declarations = []
-    else:
-        allowed_tools = allowed_tool_names(route, registry.names)
-        function_declarations = registry.as_function_declarations(allowed=allowed_tools)
+    allowed_tool_names = list(selection.get("tool_names") or [])
+    def _discover_tools(requirement, limit=6):
+        try:
+            hits = selector.index.search("tools", requirement, limit=max(1, min(int(limit or 6), 12)), min_score=0.15)
+            return {"matches": [{"name": h["id"], "description": h["text"], "score": h["score"]} for h in hits]}
+        except Exception as exc:
+            return {"error": str(exc)}
+    registry.add(Tool(
+        "discover_tools",
+        "Fallback capability discovery. Use only when the currently exposed tools do not cover the required project operation. Describe the missing capability semantically.",
+        {"type": "object", "properties": {"requirement": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["requirement"]},
+        _discover_tools,
+    ))
+    if not _is_simple_chat(transcript):
+        allowed_tool_names.append("discover_tools")
+    function_declarations = registry.as_function_declarations(allowed_tool_names)
+    LOGGER.info(
+        "Context selection project=%s mode=%s tools=%d cognition=%d modules=%d instructions=%d",
+        project_id,
+        selection.get("mode"),
+        len(selection.get("tool_names") or []),
+        len((prefetched or {}).get("requests") or []),
+        len(selection.get("modules") or []),
+        len(selection.get("instructions") or []),
+    )
     # --------------------------------------------------------------
     # Agent loop
     # --------------------------------------------------------------
@@ -642,13 +663,10 @@ def run_agent(
                 }
             else:
                 try:
-                    if tool_name not in allowed_tools:
-                        result = {"status": "error", "error": f"Tool not allowed for this request route: {tool_name}"}
-                    else:
-                        result = registry.call(
-                            tool_name,
-                            tool_args,
-                        )
+                    result = registry.call(
+                        tool_name,
+                        tool_args,
+                    )
                 except Exception as exc:
                     result = {
                         "error": str(exc),
@@ -657,33 +675,15 @@ def run_agent(
             safe_result = _json_safe(
                 result
             )
-            # Canonical retrieval continuation is controller-owned.  Consume
-            # resumable requests deterministically, with duplicate/round caps,
-            # before exposing the result to the model.
-            if tool_name == "request_cognition_context" and isinstance(safe_result, dict):
-                pending = list(safe_result.get("next_requests") or [])
-                seen_pending = set()
-                continuation_rounds = 0
-                while pending and continuation_rounds < 32:
-                    follow = pending.pop(0)
-                    key = json.dumps(follow, ensure_ascii=False, sort_keys=True, default=str)
-                    if key in seen_pending:
-                        continue
-                    seen_pending.add(key)
-                    continuation_rounds += 1
-                    follow_args = {
-                        "requests": [follow],
-                        "max_chars": int(tool_args.get("max_chars", 12000) or 12000),
-                    }
-                    follow_result = _json_safe(registry.call(tool_name, follow_args))
-                    _record_tool_call(calls, tool_name, follow_args, follow_result)
-                    if not isinstance(follow_result, dict) or follow_result.get("error"):
-                        break
-                    safe_result.setdefault("requests", []).extend(follow_result.get("requests", []))
-                    pending.extend(follow_result.get("next_requests") or [])
-                safe_result.pop("next_requests", None)
-                safe_result["continuations_consumed"] = continuation_rounds
-                safe_result["continuation_complete"] = not pending
+            if tool_name == "discover_tools" and isinstance(safe_result, dict):
+                for match in safe_result.get("matches") or []:
+                    name = str(match.get("name") or "")
+                    if name and name not in allowed_tool_names:
+                        allowed_tool_names.append(name)
+                function_declarations = registry.as_function_declarations(allowed_tool_names)
+            # Retrieval continuation is deliberately NOT auto-consumed.  A bounded
+            # first page is returned to the model; another page is fetched only if
+            # the model explicitly determines the supplied evidence is insufficient.
             if isinstance(safe_result, dict) and (safe_result.get("error") or safe_result.get("status") == "error"):
                 LOGGER.warning("Tool failed project=%s step=%d tool=%s error=%s", project_id, step_number + 1, tool_name, safe_result.get("error", "unknown error"))
             else:
