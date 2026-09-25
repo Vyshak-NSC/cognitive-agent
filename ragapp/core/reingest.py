@@ -4,7 +4,7 @@ from ragapp.cognition.compiler import compile_project
 
 
 class ReingestPipeline:
-    """Selectively rebuild cognition using canonical-object provenance."""
+    """Selectively extend cognition using canonical-object provenance."""
 
     def __init__(self, store):
         self.store = store
@@ -34,7 +34,7 @@ class ReingestPipeline:
         return compile_project(self.store, selected_files=selected, reconcile_selected=True)
 
     def full(self):
-        """Rebuild source-derived cognition without deleting chat/agent state."""
+        """Recompile all source files additively without deleting cognition."""
         source_files = self._source_files()
         return compile_project(
             self.store,

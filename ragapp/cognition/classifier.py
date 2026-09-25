@@ -550,21 +550,10 @@ def compile_project(
         files,
     )
 
-    # A selected source compilation is a replacement projection, not an
-    # append-only merge. Remove only the selected source artifacts before
-    # extracting them again. Reingest can disable this because it performs
-    # the same cleanup immediately before calling the compiler.
-    if reconcile_selected and selected_set is not None:
-        selected_source_artifacts = {
-            artifact_ids[(area, rel)]
-            for area, rel in selected_set
-            if area == "source" and (area, rel) in artifact_ids
-        }
-        if selected_source_artifacts:
-            store.remove_source_projection(selected_source_artifacts)
-            # The cleanup removed the artifact records, so register the
-            # current files again for this compilation.
-            artifact_ids = _build_artifact_ids(store, files)
+    # Recompilation is additive. Existing source-derived cognition is not
+    # deleted simply because a file is selected again. Stable signatures in
+    # the store deduplicate repeated observations, while durable chat/agent
+    # state remains authoritative over source observations.
 
     # Seed from existing cognition rather than starting blank.
     #

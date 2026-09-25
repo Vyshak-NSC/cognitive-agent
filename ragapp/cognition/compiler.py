@@ -416,20 +416,23 @@ def compile_project(
     selected_files=None,
     reconcile_selected=True,
 ):
-    """Compile project files with rollback for selective replacement.
+    """Compile project files additively, preserving existing cognition.
 
-    Selective compilation replaces the source projection for the selected
-    files. A filesystem rollback snapshot protects against an API, parsing, or
-    persistence failure, while Git preserves the exact pre-compilation state
-    for recovery. The same Git pre-state checkpoint is taken for full builds.
+    Compilation is monotonic by default: a later compile may add new source
+    observations and provenance, but it never deletes an existing cognition
+    projection merely because a source file was selected again. Durable
+    chat/agent state remains authoritative over source observations.
+
+    ``reconcile_selected`` is retained for API compatibility only. Destructive
+    source-projection replacement is intentionally not part of compilation.
     """
     if selected_files is not None:
         selected_files = list(selected_files)
 
     # Compilation can mutate canonical cognition, so preserve the exact
-    # pre-compilation project state in Git before any source projection is
-    # removed or any new cognition is written. Git is the recovery layer; the
-    # filesystem-backed cognition remains authoritative at runtime.
+    # pre-compilation project state in Git before any new observations are
+    # merged. Git is the recovery layer; the filesystem-backed cognition
+    # remains authoritative at runtime.
     pre_state_git_commit = store.commit_authoritative_change(
         "Pre-state backup before cognition compilation"
     )
@@ -567,24 +570,11 @@ def _compile_project_impl(
         if item not in code_files
     ]
 
-    # A selective compile is a replacement projection for the selected source
-    # files. Remove the old projection BEFORE either deterministic or LLM
-    # compilation so the newly compiled cognition represents the new source.
-    if reconcile_selected and selected_set is not None:
-        selected_source_artifacts = {
-            f"source:{rel}"
-            for area, rel in selected_set
-            if area == "source"
-        }
-        if selected_source_artifacts:
-            # If one canonical cognition object is supported by multiple source
-            # artifacts, rebuild all of those contributing artifacts together.
-            selected_source_artifacts = store.expand_source_artifacts(selected_source_artifacts)
-            if selected_set is not None:
-                for artifact_id in selected_source_artifacts:
-                    if artifact_id.startswith("source:"):
-                        selected_set.add(("source", artifact_id[len("source:"):]))
-            store.remove_source_projection(selected_source_artifacts)
+    # IMPORTANT: recompilation is additive. Do not remove the previous source
+    # projection here. Existing cognition is persistent state; recompiling a
+    # source only contributes observations that are not already present.
+    # Explicit user/agent state changes are durable and are resolved ahead of
+    # source-derived observations by CognitionStore.latest_attribute_state().
 
     deterministic_result = None
     if code_files:
