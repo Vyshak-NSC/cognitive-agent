@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import re
 
+from ragapp.core.semantic_index import SemanticIndex
+
 
 CANONICAL_KINDS = ("entity", "relationship", "event", "location", "concept", "definition", "knowledge")
 
@@ -37,10 +39,44 @@ class RetrievalStore:
         return out
 
     def search_metadata_candidates(self, query, limit=8):
-        """One authoritative search path: CognitionStore all-kind canonical search."""
+        """Semantic canonical candidate search with lexical compatibility fallback."""
         limit = max(1, min(int(limit or 8), 50))
-        result = self.store.search_cognition_metadata(query, limit=limit)
-        candidates = list(result.get("candidates", [])) if isinstance(result, dict) else []
+        candidates = []
+        try:
+            index = SemanticIndex(self.store)
+            records = []
+            for kind in CANONICAL_KINDS:
+                for rec in self.store._all_kind_records(kind):
+                    ident = str(rec.get("id") or "").strip()
+                    if not ident:
+                        continue
+                    searchable = {
+                        k: rec.get(k)
+                        for k in ("id", "name", "title", "type", "description", "summary", "state", "participants", "relation_type", "attributes", "effects", "location", "valid_from", "valid_to")
+                        if rec.get(k) not in (None, "", [], {})
+                    }
+                    records.append({
+                        "id": f"{kind}:{ident}",
+                        "text": f"{kind}. " + json.dumps(searchable, ensure_ascii=False, default=str),
+                        "metadata": {"kind": kind, "object_id": ident},
+                    })
+            index.sync("cognition", records)
+            hits = index.search("cognition", query, limit=limit, min_score=0.20)
+            for hit in hits:
+                kind = hit["metadata"].get("kind")
+                ident = hit["metadata"].get("object_id")
+                rec = self._read_kind(kind, ident) if kind and ident else {}
+                if rec:
+                    candidates.append({
+                        "id": str(ident), "kind": str(kind), "type": rec.get("type"),
+                        "name": rec.get("name") or rec.get("title") or str(ident),
+                        "summary": (rec.get("summary") or rec.get("description") or "")[:1000],
+                        "provenance": rec.get("provenance", [])[:3] if isinstance(rec.get("provenance"), list) else [],
+                        "semantic_score": hit["score"],
+                    })
+        except Exception:
+            result = self.store.search_cognition_metadata(query, limit=limit)
+            candidates = list(result.get("candidates", [])) if isinstance(result, dict) else []
         return {
             "query": str(query or ""),
             "candidates": candidates[:limit],
@@ -92,11 +128,18 @@ class RetrievalStore:
             return {**base, "provenance": (rec.get("provenance") or [])[:3]}
 
         if detail in {"summary", "compact"}:
+            # Compact means answer-oriented, not "canonical object minus provenance".
+            # Attribute histories are intentionally excluded: they contain temporal
+            # positions, locators and provenance and were the main query-time token leak.
             out = dict(base)
-            # Small, semantically useful fields.  Avoid dumping histories/provenance by default.
-            for key in ("participants", "relation_type", "state", "attributes", "effects", "location", "valid_from", "valid_to"):
-                if key in rec and rec.get(key) not in (None, "", [], {}):
-                    out[key] = rec.get(key)
+            if kind == "entity":
+                state = base.get("current_state") or {}
+                if state:
+                    out["current_state"] = state
+            for key in ("participants", "relation_type", "state", "effects", "location", "valid_from", "valid_to"):
+                value = rec.get(key)
+                if value not in (None, "", [], {}):
+                    out[key] = value
             return out
 
         if detail == "state" and kind == "entity":

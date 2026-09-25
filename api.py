@@ -4,6 +4,7 @@ from ragapp.auth.db import initialize_database
 from ragapp.execution.project import get_project,list_projects,create_project
 from ragapp.workspace.manager import set_current_project
 from ragapp.agent.loop import run_agent
+from ragapp.agent.run_context import AgentRunContext
 from ragapp.tools import build_default_tools
 from ragapp.core.drafts import DraftManager
 from ragapp.core.approval import ApprovalEngine
@@ -46,11 +47,14 @@ def query(q:Query):
         if key not in existing:
             transcript.append(msg); existing.add(key)
     try:
-        answer,calls,drafts=run_agent(
-            transcript,
-            build_default_tools(q.username,s,True,session_id=session_id),
-            s,q.project_id,session_id=session_id,agent_id=q.agent_id,
-        )
+        answer,calls,drafts=run_agent(AgentRunContext(
+            transcript=transcript,
+            tools=build_default_tools(q.username,s,True,session_id=session_id),
+            cognition=s,
+            project_id=q.project_id,
+            session_id=session_id,
+            agent_id=q.agent_id,
+        ))
     except Exception as e: raise HTTPException(500,str(e))
     user_message=next((m for m in reversed(transcript) if m.get('role')=='user'), {'role':'user','content':''})
     chats.append_turn(
