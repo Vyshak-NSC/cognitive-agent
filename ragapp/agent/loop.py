@@ -27,6 +27,8 @@ from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
+from ragapp.core.agents import AgentStore
+from ragapp.core.workflows import run_deterministic_prefix
 from ragapp.logging_config import configure_logging
 
 configure_logging()
@@ -464,6 +466,7 @@ def run_agent(
     max_steps=MAX_AGENT_STEPS,
     session_id=None,
     on_section=None,
+    agent_id=None,
 ):
     """Run the cognitive agent loop.
     Durable fiction/lore changes are represented by STATE_UPDATE and are
@@ -475,6 +478,9 @@ def run_agent(
         project_id, session_id or "none", len(transcript), max_steps, len(tools),
     )
     registry = ToolRegistry(tools)
+    active_agent = AgentStore(cognition).get(agent_id) if (agent_id and cognition is not None) else None
+    if active_agent and not active_agent.get("enabled", True):
+        raise ValueError(f"Agent {agent_id!r} is disabled")
     contents = to_provider_contents(
         transcript,
         cognition,
@@ -493,12 +499,39 @@ def run_agent(
     # --------------------------------------------------------------
     active_instructions = _load_persistent_instructions(cognition)
     system_instruction = _build_system_instruction(active_instructions)
+    if active_agent:
+        system_instruction += "\n\nACTIVE AGENT EXECUTION CONTRACT:\n" + json.dumps({
+            "name": active_agent.get("name"), "objective": active_agent.get("objective"),
+            "instructions": active_agent.get("instructions", []), "data_sources": active_agent.get("data_sources", []),
+            "output_targets": active_agent.get("output_targets", []), "require_mutation_approval": active_agent.get("require_mutation_approval", True),
+            "reinforcements": [
+                "Prefer deterministic workflow/tool execution over model reasoning.",
+                "Use an inference step only when the workflow explicitly reaches one.",
+                "Reuse persistent cognition rather than re-deriving established state.",
+                "Do not overwrite durable user/chat cognition merely because source is reprocessed.",
+                "Do not claim an action succeeded without tool evidence.",
+                "Respect declared source/output/tool boundaries and approval requirements."
+            ]
+        }, ensure_ascii=False)
     # --------------------------------------------------------------
     # Cognition-first retrieval.  Candidate discovery is deterministic local
     # search, not model inference.  Only a bounded compact projection is
     # injected; the model can refine/broaden it with cognition tools.
     # --------------------------------------------------------------
     calls = []
+    if active_agent and active_agent.get("workflow_steps"):
+        allowed = active_agent.get("allowed_tools") or None
+        denied = set(active_agent.get("denied_tools") or [])
+        if allowed is None:
+            allowed = [d["name"] for d in registry.as_function_declarations() if d["name"] not in denied]
+        else:
+            allowed = [x for x in allowed if x not in denied]
+        wf = run_deterministic_prefix(active_agent.get("workflow_steps"), registry, allowed)
+        calls.extend(wf.calls)
+        if wf.completed:
+            return (json.dumps({"status":"completed","agent":active_agent.get("name"),"workflow_outputs":wf.outputs}, ensure_ascii=False, indent=2), calls, [])
+        system_instruction += "\n\nDETERMINISTIC WORKFLOW RESULTS:\n" + json.dumps(wf.outputs, ensure_ascii=False)
+        system_instruction += "\n\nINFERENCE BOUNDARY:\n" + json.dumps(wf.inference.get("step",{}), ensure_ascii=False)
     prefetched = _prefetch_cognition(cognition, transcript)
     if prefetched and prefetched.get("requests"):
         calls.append({
@@ -518,7 +551,9 @@ def run_agent(
         function_declarations = []
     else:
         function_declarations = (
-            registry.as_function_declarations()
+            registry.as_function_declarations(
+                allowed=([n for n in (active_agent.get("allowed_tools") or []) if n not in set(active_agent.get("denied_tools") or [])] if active_agent and active_agent.get("allowed_tools") else None)
+            )
         )
     # --------------------------------------------------------------
     # Agent loop

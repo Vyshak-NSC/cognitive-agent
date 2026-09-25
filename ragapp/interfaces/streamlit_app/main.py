@@ -26,6 +26,7 @@ from ragapp.interfaces.streamlit_app.file_manager import (
     _prepare_html_preview,
 )
 from ragapp.core.drafts import DraftManager
+from ragapp.core.agents import AgentStore
 from ragapp.core.approval import ApprovalEngine
 from ragapp.core.instructions import InstructionStore
 from ragapp.core.vcs import VCSManager
@@ -556,6 +557,20 @@ with st.sidebar:
     )
 
     st.divider()
+
+    st.markdown("### Active agent")
+    _agent_specs = AgentStore(store).list(enabled_only=True)
+    _agent_ids = [""] + [a["id"] for a in _agent_specs]
+    _agent_names = {"": "Default agent", **{a["id"]: a["name"] for a in _agent_specs}}
+    st.session_state.setdefault("active_agent_id", "")
+    if st.session_state["active_agent_id"] not in _agent_ids:
+        st.session_state["active_agent_id"] = ""
+    st.session_state["active_agent_id"] = st.selectbox(
+        "Active agent", _agent_ids,
+        index=_agent_ids.index(st.session_state["active_agent_id"]),
+        format_func=lambda x: _agent_names.get(x, x),
+        label_visibility="collapsed", key="active_agent_selector",
+    )
 
     st.markdown("### Project")
 
@@ -1484,6 +1499,7 @@ if nav_section == "chat":
                                     st.session_state.chat_session_id
                                 ),
                                 on_section=_on_section,
+                                agent_id=(st.session_state.get("active_agent_id") or None),
                             )
 
                     except Exception as exc:
