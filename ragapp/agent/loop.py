@@ -19,7 +19,8 @@ from ragapp.llm.tool_calling import (
     to_provider_contents,
     build_function_response_content,
 )
-from ragapp.llm.prompts import COGNITIVE_AGENT_PROMPT
+from ragapp.llm.prompts import build_prompt
+from ragapp.agent.router import route_request, allowed_tool_names
 from ragapp.llm.provider import generate_step as provider_generate_step
 from ragapp.settings import MAX_AGENT_STEPS, MAX_CONTEXT_CHARS
 from ragapp.core.drafts import DraftManager
@@ -27,8 +28,6 @@ from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
-from ragapp.core.agents import AgentStore
-from ragapp.core.workflows import run_deterministic_prefix
 from ragapp.logging_config import configure_logging
 
 configure_logging()
@@ -194,44 +193,25 @@ def _load_persistent_instructions(cognition):
     except Exception:
         return []
     return instructions or []
-def _build_system_instruction(active_instructions):
-    """Build the actual system instruction sent to the provider."""
-    system_instruction = COGNITIVE_AGENT_PROMPT + """
-
-TEMPORAL COGNITION RETRIEVAL PROTOCOL:
-- Treat narrative/document order and story-world time as separate axes. Never use one as a substitute for the other.
-- For present/current questions, retrieve current state (timeline=latest) unless the user explicitly specifies another point.
-- For an explicit chapter/session/turn or other document-order reference, request narrative_position/as_of on the narrative axis.
-- For an explicit in-world date, age, era, chapter-in-the-world, or flashback point, request story_time/as_of on the story axis.
-- A flashback changes the requested story-time state; do not assume the surrounding chapter's current state applies.
-- If the temporal reference is ambiguous or cannot be represented precisely, do not guess. Ask for clarification or retrieve without temporal resolution only when the question does not depend on historical state.
-- When requesting historical entity state, include the relevant attributes when known and use request_cognition_context rather than relying on metadata summaries.
-- Do not invent temporal coordinates merely to make a retrieval request resolvable.
-"""
+def _build_system_instruction(active_instructions, route):
+    """Build only the prompt modules required by this request route."""
+    system_instruction = build_prompt(route.capabilities)
     if not active_instructions:
         return system_instruction
     lines = []
     for instruction in active_instructions:
-        if isinstance(instruction, dict):
-            content = instruction.get(
-                "content",
-                "",
-            )
-        else:
-            content = str(instruction)
+        content = instruction.get("content", "") if isinstance(instruction, dict) else str(instruction)
         content = str(content).strip()
         if content:
             lines.append(f"- {content}")
     if lines:
         system_instruction += (
-            "\n\n"
-            "PERSISTENT PROJECT INSTRUCTIONS:\n"
-            "The following instructions are persistent "
-            "project-level instructions. Follow them when "
-            "responding and using tools.\n"
+            "\n\nPERSISTENT PROJECT INSTRUCTIONS:\n"
+            "Follow these active project-level instructions when applicable:\n"
             + "\n".join(lines)
         )
     return system_instruction
+
 def _record_tool_call(
     calls,
     name,
@@ -466,7 +446,6 @@ def run_agent(
     max_steps=MAX_AGENT_STEPS,
     session_id=None,
     on_section=None,
-    agent_id=None,
 ):
     """Run the cognitive agent loop.
     Durable fiction/lore changes are represented by STATE_UPDATE and are
@@ -478,9 +457,6 @@ def run_agent(
         project_id, session_id or "none", len(transcript), max_steps, len(tools),
     )
     registry = ToolRegistry(tools)
-    active_agent = AgentStore(cognition).get(agent_id) if (agent_id and cognition is not None) else None
-    if active_agent and not active_agent.get("enabled", True):
-        raise ValueError(f"Agent {agent_id!r} is disabled")
     contents = to_provider_contents(
         transcript,
         cognition,
@@ -497,42 +473,17 @@ def run_agent(
     # Persistent instructions remain part of the system instruction.
     # They are small and are not source retrieval.
     # --------------------------------------------------------------
+    route = route_request(_latest_user_query(transcript))
     active_instructions = _load_persistent_instructions(cognition)
-    system_instruction = _build_system_instruction(active_instructions)
-    if active_agent:
-        system_instruction += "\n\nACTIVE AGENT EXECUTION CONTRACT:\n" + json.dumps({
-            "name": active_agent.get("name"), "objective": active_agent.get("objective"),
-            "instructions": active_agent.get("instructions", []), "data_sources": active_agent.get("data_sources", []),
-            "output_targets": active_agent.get("output_targets", []), "require_mutation_approval": active_agent.get("require_mutation_approval", True),
-            "reinforcements": [
-                "Prefer deterministic workflow/tool execution over model reasoning.",
-                "Use an inference step only when the workflow explicitly reaches one.",
-                "Reuse persistent cognition rather than re-deriving established state.",
-                "Do not overwrite durable user/chat cognition merely because source is reprocessed.",
-                "Do not claim an action succeeded without tool evidence.",
-                "Respect declared source/output/tool boundaries and approval requirements."
-            ]
-        }, ensure_ascii=False)
+    system_instruction = _build_system_instruction(active_instructions, route)
+    LOGGER.info("Request route project=%s route=%s capabilities=%s", project_id, route.reason, sorted(route.capabilities))
     # --------------------------------------------------------------
     # Cognition-first retrieval.  Candidate discovery is deterministic local
     # search, not model inference.  Only a bounded compact projection is
     # injected; the model can refine/broaden it with cognition tools.
     # --------------------------------------------------------------
     calls = []
-    if active_agent and active_agent.get("workflow_steps"):
-        allowed = active_agent.get("allowed_tools") or None
-        denied = set(active_agent.get("denied_tools") or [])
-        if allowed is None:
-            allowed = [d["name"] for d in registry.as_function_declarations() if d["name"] not in denied]
-        else:
-            allowed = [x for x in allowed if x not in denied]
-        wf = run_deterministic_prefix(active_agent.get("workflow_steps"), registry, allowed)
-        calls.extend(wf.calls)
-        if wf.completed:
-            return (json.dumps({"status":"completed","agent":active_agent.get("name"),"workflow_outputs":wf.outputs}, ensure_ascii=False, indent=2), calls, [])
-        system_instruction += "\n\nDETERMINISTIC WORKFLOW RESULTS:\n" + json.dumps(wf.outputs, ensure_ascii=False)
-        system_instruction += "\n\nINFERENCE BOUNDARY:\n" + json.dumps(wf.inference.get("step",{}), ensure_ascii=False)
-    prefetched = _prefetch_cognition(cognition, transcript)
+    prefetched = _prefetch_cognition(cognition, transcript) if route.has("cognition") else None
     if prefetched and prefetched.get("requests"):
         calls.append({
             "tool": "controller.prefetch_cognition",
@@ -550,11 +501,8 @@ def run_agent(
     if _is_simple_chat(transcript):
         function_declarations = []
     else:
-        function_declarations = (
-            registry.as_function_declarations(
-                allowed=([n for n in (active_agent.get("allowed_tools") or []) if n not in set(active_agent.get("denied_tools") or [])] if active_agent and active_agent.get("allowed_tools") else None)
-            )
-        )
+        allowed_tools = allowed_tool_names(route, registry.names)
+        function_declarations = registry.as_function_declarations(allowed=allowed_tools)
     # --------------------------------------------------------------
     # Agent loop
     # --------------------------------------------------------------
@@ -694,10 +642,13 @@ def run_agent(
                 }
             else:
                 try:
-                    result = registry.call(
-                        tool_name,
-                        tool_args,
-                    )
+                    if tool_name not in allowed_tools:
+                        result = {"status": "error", "error": f"Tool not allowed for this request route: {tool_name}"}
+                    else:
+                        result = registry.call(
+                            tool_name,
+                            tool_args,
+                        )
                 except Exception as exc:
                     result = {
                         "error": str(exc),

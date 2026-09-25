@@ -6,6 +6,10 @@ class ToolRegistry:
         tools = self._tools.values() if allowed is None else (self._tools[n] for n in allowed if n in self._tools)
         return [{"name":t.name,"description":t.description,"parameters":t.parameters} for t in tools]
 
+    @property
+    def names(self):
+        return set(self._tools)
+
     def call(self,name,args):
         if name not in self._tools:
             return {"status":"error","error":f"Unknown tool: {name}","available_tools":sorted(self._tools.keys())}
