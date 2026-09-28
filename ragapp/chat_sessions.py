@@ -10,6 +10,7 @@ def _safe_name(value: str) -> str:
     return value.strip("._") or "chat"
 
 def _mid(): return uuid.uuid4().hex
+_PARENT_UNSET = object()
 
 class ChatSessionStore:
     SCHEMA_VERSION = 2
@@ -67,17 +68,27 @@ class ChatSessionStore:
         return out
     def active_transcript(self,session_id):
         s=self.load(session_id); return self.active_transcript_data(s) if s else []
-    def append_turn(self,session_id,user_message,assistant_message,title_from=None,*,parent_id=None,state_before=None,state_after=None,effects=None,turn_id=None):
-        s=self.load(session_id) or self._new(session_id); s.pop("messages",None); tid=turn_id or _mid(); parent_id=s.get("active_leaf_id") if parent_id is None else parent_id
+    def append_turn(self,session_id,user_message,assistant_message,title_from=None,*,parent_id=_PARENT_UNSET,state_before=None,state_after=None,effects=None,turn_id=None):
+        s=self.load(session_id) or self._new(session_id); s.pop("messages",None); tid=turn_id or _mid(); parent_id=s.get("active_leaf_id") if parent_id is _PARENT_UNSET else parent_id
         s["turns"][tid]={"id":tid,"parent_id":parent_id,"created_at":now_iso(),"user":dict(user_message),"assistant":dict(assistant_message),"state_before":state_before,"state_after":state_after,"effects":effects or {}}
         s["active_leaf_id"]=tid
         if title_from and s.get("title")=="New chat": s["title"]=title_from[:60].strip() or "New chat"
         return self.save(s)
-    def fork_turn(self,session_id,turn_id,new_user_message,assistant_message,*,state_before=None,state_after=None,effects=None):
+    def fork_turn(self,session_id,replaced_turn_id,new_user_message,assistant_message,*,state_before=None,state_after=None,effects=None,new_turn_id=None,title_from=None):
         s=self.load(session_id)
-        if not s or turn_id not in s.get("turns",{}): raise KeyError(turn_id)
-        parent=s["turns"][turn_id].get("parent_id")
-        return self.append_turn(session_id,new_user_message,assistant_message,parent_id=parent,state_before=state_before,state_after=state_after,effects=effects)
+        if not s or replaced_turn_id not in s.get("turns",{}): raise KeyError(replaced_turn_id)
+        parent=s["turns"][replaced_turn_id].get("parent_id")
+        return self.append_turn(
+            session_id,
+            new_user_message,
+            assistant_message,
+            title_from=title_from,
+            parent_id=parent,
+            state_before=state_before,
+            state_after=state_after,
+            effects=effects,
+            turn_id=new_turn_id,
+        )
     def set_active_leaf(self,session_id,turn_id):
         s=self.load(session_id)
         if not s or turn_id not in s.get("turns",{}): raise KeyError(turn_id)

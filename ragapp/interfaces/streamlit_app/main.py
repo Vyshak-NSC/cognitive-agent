@@ -1433,7 +1433,7 @@ if nav_section == "chat":
                 state_before=state_before,
                 state_after=state_after,
                 effects=effects,
-                turn_id=turn_id,
+                new_turn_id=turn_id,
                 title_from=user_text,
             )
         else:
