@@ -441,6 +441,51 @@ def _persist_drafts(
             draft,
         )
     return drafts, skipped
+_BASE_PROJECT_MUTATION_TOOLS = (
+    "list_project_files",
+    "read_project_text",
+    "create_project_file",
+    "edit_project_text",
+    "propose_source_file",
+    "propose_source_edit",
+)
+
+
+def _ensure_available_tools(selected, registry, names):
+    """Add runtime-required capabilities when they exist in the active policy."""
+    available = {str(getattr(t, "name", "")) for t in getattr(registry, "_tools", {}).values()} if isinstance(getattr(registry, "_tools", None), dict) else set()
+    for name in names:
+        if name in available and name not in selected:
+            selected.append(name)
+
+
+def _successful_project_mutation(calls):
+    """Return True only for an actual successful workspace/source proposal mutation."""
+    mutation_tools = {
+        "create_project_file", "edit_project_text", "create_project_folder",
+        "copy_project_item", "move_project_item", "delete_project_item",
+        "propose_source_file", "propose_source_edit",
+    }
+    for call in calls:
+        if call.get("tool") not in mutation_tools:
+            continue
+        result = call.get("result")
+        if isinstance(result, dict) and not result.get("error") and result.get("status") != "error":
+            return True
+    return False
+
+
+def _prime_project_mutation_context(registry, calls):
+    """Inspect the authoritative source tree before the first mutation model turn.
+
+    This is runtime orchestration, not LLM discretion. A user asking to change an
+    existing project should never have to tell the model to look at the project.
+    """
+    result = _json_safe(registry.call("list_project_files", {"area": "source", "relative_path": ""}))
+    _record_tool_call(calls, "list_project_files", {"area": "source", "relative_path": ""}, result)
+    return result
+
+
 def run_agent(context: AgentRunContext):
     """Run the cognitive agent loop.
     Durable fiction/lore changes are represented by STATE_UPDATE and are
@@ -482,11 +527,19 @@ def run_agent(context: AgentRunContext):
     query = _latest_user_query(transcript)
     selector = ContextSelector(cognition, tools)
     if _is_simple_chat(transcript):
-        selection = {"tool_names": [], "modules": [], "instructions": [], "prefetched": None, "mode": "simple_chat"}
+        selection = {"tool_names": [], "modules": [], "instructions": [], "prefetched": None, "intent": "conversation", "intent_score": 0.0, "mode": "simple_chat"}
     else:
         selection = selector.select(query)
     selected_modules = list(selection.get("modules") or [])
     selected_modules.extend(context.agent_guidance())
+    execution_intent = selection.get("intent") == "project_mutation"
+    if execution_intent:
+        selected_modules.append(
+            "This turn is an explicit project mutation request. Inspect the existing project with project tools, "
+            "make the requested change in /workspace, and create the normal pending source review proposal. "
+            "Do not ask the user to paste a project file that can be discovered/read with project tools. "
+            "Do not stop at a plan, example, or offer to implement."
+        )
     system_instruction = _build_system_instruction(selection.get("instructions"), selected_modules)
     prefetched = selection.get("prefetched")
     if prefetched and prefetched.get("requests"):
@@ -500,6 +553,19 @@ def run_agent(context: AgentRunContext):
             + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
         )
     allowed_tool_names = list(selection.get("tool_names") or [])
+    if execution_intent:
+        _ensure_available_tools(allowed_tool_names, registry, _BASE_PROJECT_MUTATION_TOOLS)
+        # Project inspection is a base-runtime responsibility. Prime the model
+        # with the real source tree instead of hoping it chooses discovery first.
+        source_tree = _prime_project_mutation_context(registry, calls)
+        if isinstance(source_tree, dict) and not source_tree.get("error"):
+            system_instruction += (
+                "\n\nCURRENT AUTHORITATIVE SOURCE TREE (runtime-inspected before this turn):\n"
+                + json.dumps(source_tree, ensure_ascii=False)
+                + "\nUse read_project_text on the relevant existing files before editing. "
+                  "Stage the completed source change with propose_source_edit/propose_source_file; "
+                  "that tool creates the pending Review item."
+            )
     def _discover_tools(requirement, limit=6):
         try:
             hits = selector.index.search("tools", requirement, limit=max(1, min(int(limit or 6), 12)), min_score=0.15)
@@ -527,6 +593,7 @@ def run_agent(context: AgentRunContext):
     # --------------------------------------------------------------
     # Agent loop
     # --------------------------------------------------------------
+    execution_gate_retries = 0
     for step_number in range(max_steps):
         LOGGER.info("Agent model step=%d/%d project=%s", step_number + 1, max_steps, project_id)
         try:
@@ -550,6 +617,28 @@ def run_agent(context: AgentRunContext):
         # Model finished
         # ----------------------------------------------------------
         if not step["function_calls"]:
+            # A project mutation request is executable work. The base runtime does
+            # not allow the first model turn to downgrade it into advice, a plan,
+            # or a request for files that the project tools can inspect directly.
+            if execution_intent and not _successful_project_mutation(calls):
+                if execution_gate_retries < 2:
+                    execution_gate_retries += 1
+                    system_instruction += (
+                        "\n\nEXECUTION GATE: The requested project mutation has not been performed yet. "
+                        "Do not answer conversationally. Use list_project_files/read_project_text as needed, "
+                        "then write the change to workspace and use propose_source_edit/propose_source_file so "
+                        "the user receives it in Review."
+                    )
+                    LOGGER.warning(
+                        "Blocked non-executing mutation response project=%s step=%d retry=%d",
+                        project_id, step_number + 1, execution_gate_retries,
+                    )
+                    continue
+                return (
+                    "I could not execute the requested project change because the mutation tools were not successfully used.",
+                    calls,
+                    [],
+                )
             text = step["text"] or ""
             metadata_blocks, text = (
                 _extract_blocks(

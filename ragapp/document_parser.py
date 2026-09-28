@@ -384,41 +384,121 @@ def _scene_number(title):
     return m.group(1) if m else None
 
 
+def _docx_table_rows(table):
+    """Return table rows as lists of cell text, collapsing merged cells.
+
+    python-docx repeats the same cell object for every grid column a merged
+    cell spans; without de-duplication a merged header is emitted several times.
+    """
+    rows = []
+    for row in table.rows:
+        cells, last_tc = [], None
+        for cell in row.cells:
+            if cell._tc is last_tc:
+                continue
+            last_tc = cell._tc
+            cells.append(" ".join(cell.text.split()))
+        rows.append(cells)
+    return rows
+
+
 def _parse_docx(path, area, rel, artifact_id, max_chars):
+    """Parse a .docx in true document order.
+
+    Paragraphs AND tables are walked from the body element in the order they
+    appear, so a table belongs to the chapter/section it is written under.
+    (Previously every table was appended after all paragraphs, which moved all
+    tables into the last chapter and separated them from their headings.)
+    """
     from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
     doc = Document(str(path))
-    nodes = {}; root = _new_node(nodes, "document", 0, title=path.stem, locator={"format":"docx"}); raw=[]
+    nodes = {}
+    root = _new_node(nodes, "document", 0, title=path.stem, locator={"format": "docx"})
+    raw = []
     current_chapter = current_scene = current_section = None
     order = 1
-    for i, p in enumerate(doc.paragraphs):
-        text = p.text.strip()
-        if not text: continue
-        style = p.style.name if p.style else None
-        kind, title = _heading_kind(text, style)
-        loc = {"paragraph_index": i, "paragraph_start": i, "paragraph_end": i, "style": style}
-        if kind == "chapter":
-            current_chapter = _new_node(nodes, "chapter", order, title=title, parent_id=root.id, locator=loc, attributes={"chapter_number": _chapter_number(title)}); order+=1
-            current_scene=None; current_section=current_chapter; raw.append(current_chapter); continue
-        if kind == "scene":
-            current_scene = _new_node(nodes, "scene", order, title=title, parent_id=current_chapter.id if current_chapter else root.id, locator=loc, attributes={"scene_number": _scene_number(title)}); order+=1
-            current_section=current_scene; raw.append(current_scene); continue
-        node = _new_node(nodes, kind or "paragraph", order, text=text, title=title,
-                         parent_id=current_section.id if current_section else root.id, locator=loc,
-                         attributes={"chapter_id": current_chapter.id if current_chapter else None,
-                                     "scene_id": current_scene.id if current_scene else None,
-                                     "section_id": current_section.id if current_section else None,
-                                     "style": style,
-                                     "runs": [{"text":r.text,"bold":r.bold,"italic":r.italic,"underline":r.underline} for r in p.runs]})
-        raw.append(node); order += 1
-    for ti, table in enumerate(doc.tables):
-        rows=[]
-        for row in table.rows:
-            rows.append([cell.text for cell in row.cells])
-        node=_new_node(nodes,"table",100000+ti,text="\n".join(" | ".join(r) for r in rows),parent_id=current_section.id if current_section else root.id,
-                       locator={"table_index":ti},attributes={"rows":len(rows),"columns":max((len(r) for r in rows),default=0)})
-        raw.append(node)
+    para_index = -1      # index into doc.paragraphs (matches read_docx / UI locators)
+    table_index = -1
+    last_para_index = 0  # body position used to anchor table locators
+
+    def _ctx_attrs(**extra):
+        attrs = {
+            "chapter_id": current_chapter.id if current_chapter else None,
+            "scene_id": current_scene.id if current_scene else None,
+            "section_id": current_section.id if current_section else None,
+        }
+        attrs.update(extra)
+        return attrs
+
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+
+        if tag == "p":
+            para_index += 1
+            last_para_index = para_index
+            p = Paragraph(child, doc)
+            text = p.text.strip()
+            if not text:
+                continue
+            style = p.style.name if p.style else None
+            kind, title = _heading_kind(text, style)
+            loc = {"paragraph_index": para_index, "paragraph_start": para_index,
+                   "paragraph_end": para_index, "style": style}
+            if kind == "chapter":
+                current_chapter = _new_node(nodes, "chapter", order, title=title, parent_id=root.id, locator=loc,
+                                            attributes={"chapter_number": _chapter_number(title)})
+                order += 1
+                current_scene = None
+                current_section = current_chapter
+                raw.append(current_chapter)
+                continue
+            if kind == "scene":
+                current_scene = _new_node(nodes, "scene", order, title=title,
+                                          parent_id=current_chapter.id if current_chapter else root.id, locator=loc,
+                                          attributes={"scene_number": _scene_number(title)})
+                order += 1
+                current_section = current_scene
+                raw.append(current_scene)
+                continue
+            node = _new_node(nodes, kind or "paragraph", order, text=text, title=title,
+                             parent_id=current_section.id if current_section else root.id, locator=loc,
+                             attributes=_ctx_attrs(
+                                 style=style,
+                                 runs=[{"text": r.text, "bold": r.bold, "italic": r.italic, "underline": r.underline}
+                                       for r in p.runs]))
+            raw.append(node)
+            order += 1
+            # Section/subsection/heading nodes open a new section so the
+            # paragraphs and tables that follow are attached to them.
+            if kind in {"section", "subsection", "heading"}:
+                current_section = node
+
+        elif tag == "tbl":
+            table_index += 1
+            table = Table(child, doc)
+            rows = _docx_table_rows(table)
+            if not any(any(c for c in r) for r in rows):
+                continue
+            body = "\n".join(" | ".join(r) for r in rows)
+            loc = {"table_index": table_index,
+                   # Anchor to the paragraph position so structural range
+                   # closing (paragraph_start/end) stays correct.
+                   "paragraph_index": last_para_index,
+                   "paragraph_start": last_para_index,
+                   "paragraph_end": last_para_index}
+            node = _new_node(nodes, "table", order, text=f"TABLE {table_index + 1}:\n{body}",
+                             parent_id=current_section.id if current_section else root.id, locator=loc,
+                             attributes=_ctx_attrs(rows=len(rows),
+                                                   columns=max((len(r) for r in rows), default=0)))
+            raw.append(node)
+            order += 1
+
     return _finalize(path, area, rel, artifact_id, "docx", path.stem, nodes, root, raw, max_chars,
-                     {"paragraph_count":len(doc.paragraphs),"table_count":len(doc.tables),"locator_kind":"paragraph"})
+                     {"paragraph_count": len(doc.paragraphs), "table_count": len(doc.tables),
+                      "locator_kind": "paragraph"})
 
 
 def _parse_pptx(path, area, rel, artifact_id, max_chars):

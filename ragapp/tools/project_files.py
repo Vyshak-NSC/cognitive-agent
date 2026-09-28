@@ -87,7 +87,17 @@ def delete_project_item(area, relative_path):
     return ProjectFileService(current_store()).delete(area, relative_path)
 
 
-def read_project_text(area, relative_path, encoding="utf-8"):
+_STRUCTURED_SUFFIXES = {".docx", ".pdf", ".pptx", ".xlsx"}
+
+
+def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars=20000):
+    """Read a file as text from source or workspace.
+
+    Plain text files are decoded with ``encoding``. DOCX/PDF/PPTX/XLSX files are
+    binary containers, so they are flattened through the structural document
+    parser instead of being decoded as UTF-8 (which always fails). Output is
+    paged: follow ``next_offset`` until it is null.
+    """
     if relative_path.startswith("cognition/") or relative_path == "cognition":
         raise ValueError(
             "cognition/ lives outside the source/workspace areas and its entity files are not "
@@ -97,7 +107,32 @@ def read_project_text(area, relative_path, encoding="utf-8"):
     p = _path(area, relative_path)
     if not p.is_file():
         raise FileNotFoundError(relative_path)
-    return {"path": relative_path, "content": p.read_text(encoding=encoding)}
+
+    suffix = p.suffix.lower()
+    if suffix in _STRUCTURED_SUFFIXES:
+        from ragapp.tools.extractors import extract_text
+        text = extract_text(p)
+        fmt = suffix.lstrip(".")
+    else:
+        try:
+            text = p.read_text(encoding=encoding)
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"{relative_path} is a binary file and cannot be read as {encoding} text. "
+                "Use the format-specific tool (read_docx, read_pdf, read_pptx, read_xlsx) "
+                "or read_binary_file."
+            ) from exc
+        fmt = "text"
+
+    offset = max(0, int(offset or 0))
+    max_chars = max(1000, int(max_chars or 20000))
+    chunk = text[offset:offset + max_chars]
+    end = offset + len(chunk)
+    return {
+        "path": relative_path, "area": area, "format": fmt,
+        "content": chunk, "offset": offset, "total_chars": len(text),
+        "next_offset": end if end < len(text) else None,
+    }
 
 
 def write_project_text(area, relative_path, content, encoding="utf-8"):
@@ -244,7 +279,7 @@ def build_project_file_tools():
     write_props={"relative_path":{"type":"string"}}
     return [
         Tool("list_project_files", "List files/folders in source or workspace.", {"type":"object","properties":read_props,"required":["area"]}, lambda area, relative_path="": list_project_files(area, relative_path)),
-        Tool("read_project_text", "Read a text file from source or workspace.", {"type":"object","properties":read_props,"required":["area","relative_path"]}, lambda area, relative_path: read_project_text(area, relative_path)),
+        Tool("read_project_text", "Read a file from source or workspace as text. Works for plain text and also flattens DOCX/PDF/PPTX/XLSX documents. Output is paged: follow next_offset until it is null.", {"type":"object","properties":{**read_props,"offset":{"type":"integer"},"max_chars":{"type":"integer"}},"required":["area","relative_path"]}, lambda area, relative_path, offset=0, max_chars=20000: read_project_text(area, relative_path, offset=offset, max_chars=max_chars)),
         Tool("create_project_folder", "Create a folder in the AI workspace. Writes to authoritative source are forbidden to agent tools.", {"type":"object","properties":write_props,"required":["relative_path"]}, lambda relative_path: _workspace_create_folder(relative_path)),
         Tool("create_project_file", "Create a text file in the AI workspace.", {"type":"object","properties":{**write_props,"content":{"type":"string"}},"required":["relative_path"]}, lambda relative_path, content="": _workspace_create_file(relative_path, content)),
         Tool("copy_project_item", "Copy a file or folder within the AI workspace.", {"type":"object","properties":{"source_relative_path":{"type":"string"},"destination_relative_path":{"type":"string"}},"required":["source_relative_path","destination_relative_path"]}, lambda source_relative_path,destination_relative_path: _workspace_copy(source_relative_path,destination_relative_path)),
