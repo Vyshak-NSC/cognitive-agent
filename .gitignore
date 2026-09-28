@@ -11,3 +11,4 @@ projects/
 *.sqlite3
 .streamlit/secrets.toml
 *.zip
+*.egg-info/

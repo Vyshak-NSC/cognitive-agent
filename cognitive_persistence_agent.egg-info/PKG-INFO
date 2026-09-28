@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: cognitive-persistence-agent
-Version: 8.5.0
-Summary: Agentic AI with deterministic cognitive persistence and a mutable artifact workspace
+Version: 9.2.2
+Summary: Persistent agent runtime with canonical cognition, semantic retrieval, review-gated project mutation, and Git-backed state
 Requires-Python: <3.13,>=3.12
 Description-Content-Type: text/markdown
 Requires-Dist: anthropic==1.5.0
@@ -33,18 +33,161 @@ Requires-Dist: uvicorn[standard]==0.52.4
 
 # Cognitive Persistence Agent
 
-Version 8.5.0
+**Version 9.2.2**
 
-A local agentic application with persistent cognition, project workspaces, document/code ingestion, multiple LLM providers, and a Streamlit interface.
+Cognitive Persistence Agent (CPA) is a local, project-scoped agent runtime that combines persistent canonical cognition, semantic/structural retrieval, tool-using chat, an isolated workspace, review-gated source changes, Git-backed project history, document/code ingestion, reusable agents/workflows, and multiple LLM providers.
+
+Version 9.2.2 is the current v9.x snapshot represented by this repository.
+
+## What CPA does
+
+CPA maintains a durable project state outside the chat transcript. Source files and user-provided information can be compiled into canonical cognition containing entities, relationships, events, concepts, knowledge, temporal/state information, and provenance. Later conversations retrieve bounded relevant cognition instead of requiring the model to reinterpret the full source on every turn.
+
+For project modifications, normal chat can inspect authoritative `/source`, work through `/workspace`, and create review proposals. Agent tools do not directly overwrite authoritative source files; source edits are staged and require approval through the Review workflow.
+
+## Version 9.2.2 feature set
+
+### Persistent canonical cognition
+
+- Project-scoped cognition persisted independently of chat history.
+- Canonical entities, relationships, events, concepts, definitions/knowledge, state, timeline information, and provenance.
+- Document and code cognition compilation.
+- Additive source recompilation through the `recompile_source` capability.
+- Durable compilation overrides are supplied to document compilation so persisted higher-authority state can participate in reconciliation.
+- Semantic mutation/reconciliation support for existing cognition.
+- Cognition validation, contradiction inspection, impact analysis, state maps, ledgers, world-model snapshots, and session distillation.
+- Git-backed pre-compilation/state history support through the project VCS layer.
+
+### Semantic + structural retrieval
+
+- Local embeddings through FastEmbed.
+- `BAAI/bge-small-en-v1.5`-based local semantic indexing through the configured FastEmbed stack.
+- `sqlite-vec` storage for local vector search.
+- One query embedding can be reused across tool/capability, cognition, instruction, prompt-module, and runtime-intent selection.
+- Semantic retrieval selects candidate cognition and capabilities.
+- Canonical cognition candidates are expanded through structural references rather than treating semantic top-K as the complete answer set.
+- Bounded context hydration keeps model context smaller than loading the full cognition store.
+- Compatibility fallback remains available when local semantic selection is unavailable.
+
+### Base-chat project execution
+
+- Ordinary chat can recognize imperative project-change requests such as adding UI elements, changing code, or modifying project behavior.
+- Project mutation intent receives the project inspection/edit/review capability path without requiring a custom Agent definition.
+- The runtime can prime mutation turns with the current source tree.
+- Relevant source files can be read before modification.
+- Workspace/source-proposal tools are made available for project mutation requests.
+- The agent loop tracks successful project mutation/proposal tool calls so a text-only response is not treated as a completed implementation.
+
+### Source / workspace / review boundary
+
+- `/source` is authoritative project material.
+- `/workspace` is the AI-editable working area.
+- Agent-invoked direct writes are restricted to workspace paths.
+- `propose_source_edit` copies and edits an existing source file in workspace and creates a pending review draft.
+- `propose_source_file` stages a new source file and creates a pending review draft.
+- Review items can be approved, rejected, or edited before approval.
+- Approval promotes the reviewed change into authoritative source through the approval layer.
+
+### Project files and format-aware tools
+
+- List and inspect source/workspace trees.
+- Read plain-text project files with paging.
+- `read_project_text` also extracts readable content from DOCX, PDF, PPTX, and XLSX instead of treating those formats as raw binary text.
+- Create, edit, copy, move, rename, and delete workspace files/folders.
+- DOCX tools.
+- PDF read/write/edit/page-copy tools.
+- PPTX tools.
+- XLSX read/write/edit tools.
+- XML tools.
+- Regular text/file tools and binary-file support.
+- Streamlit file preview for project files, including parsed DOCX preview rather than displaying the underlying ZIP/XML bytes.
+
+### Git/VCS project history
+
+- Project file history.
+- Historical revision retrieval.
+- Revision diffs.
+- Restore historical content as a new revision rather than rewriting history.
+- Explicit project checkpoints.
+- API endpoints for history, revision content, diff, restore, and checkpoint operations.
+
+### Persistent instructions
+
+- Project-scoped instruction storage.
+- System-scoped instructions remain unconditional runtime invariants.
+- Other instructions can be semantically selected for the current request.
+- Instructions are manageable through the UI/API layer.
+
+### Agents and workflows
+
+- Persistent project-scoped Agent definitions.
+- Agent name, description, objective, instructions, data sources, output targets, allowed/denied tools, workflow steps, trigger metadata, mutation-approval requirement, and enabled state.
+- Manual agent execution context shared with the main runtime.
+- Deterministic workflow prefix execution support.
+- Workflow inspection exposes deterministic vs inference-step boundaries.
+- Agent CRUD API endpoints.
+
+### Chat/session persistence
+
+- Persistent project chat sessions.
+- Session memory storage and retrieval.
+- Tool-call execution traces surfaced by the chat UI.
+- Project/session identity carried through the runtime execution context.
+
+### LLM providers
+
+Enabled provider adapters in this snapshot:
+
+- OpenAI
+- Azure OpenAI
+- Google Gemini
+- OpenRouter
+
+Anthropic configuration is recognized, but the provider adapter is explicitly disabled in this installation.
+
+Provider configuration can be stored per project in `.system/config.yaml`; environment variables are also supported. Provider request throttling is project/provider scoped.
+
+### Streamlit interface
+
+The main UI includes:
+
+- Chat
+- Files
+- Cognition
+- Review, including pending-review count
+- Instructions
+- History
+- Settings
+- File preview dialog
+- Cognition compilation controls and status
+- Tool execution trace display
+- Project/session navigation
+
+### FastAPI interface
+
+The API exposes operations for:
+
+- Health
+- Projects
+- Agent queries
+- Draft/review approval and rejection
+- Instructions
+- Git log and project VCS operations
+- Ingestion
+- Cognition inspection/validation/impact
+- Sessions and session memory
+- Project file editing/history/revision/diff/restore/move/copy
+- VCS checkpoints
+- Agent CRUD
 
 ## Requirements
 
 - Windows, macOS, or Linux
 - Python 3.12.x
 - `uv`
-- An API key for at least one configured LLM provider
+- An API key for at least one enabled LLM provider
 
-The project is intentionally constrained to Python 3.12. The dependency versions in `pyproject.toml` are pinned to the known-good development environment, and `uv.lock` should be committed with the project.
+The project is intentionally constrained to Python 3.12. `pyproject.toml` declares direct dependencies and `uv.lock` records the resolved environment. Commit both when dependency metadata changes.
 
 ## Fresh-machine setup
 
@@ -55,15 +198,15 @@ git clone <repository-url>
 cd cognitive-agent
 ```
 
-Install `uv` if it is not already installed. Then create the project environment and install the locked dependencies:
+Create the environment and install the locked dependencies:
 
 ```powershell
 uv sync
 ```
 
-`uv sync` creates `.venv` automatically and installs the versions recorded by `uv.lock`.
+`uv sync` creates `.venv` automatically.
 
-Do not manually install the individual Python packages with `pip`. The repository's `pyproject.toml` and `uv.lock` are the dependency source of truth.
+Do not manually maintain the environment with ad-hoc `pip install` commands. Add required runtime packages to `pyproject.toml` and regenerate the lock file.
 
 ## Environment configuration
 
@@ -73,8 +216,6 @@ Copy the example environment file:
 Copy-Item .env.example .env
 ```
 
-Then configure at least one provider.
-
 Supported provider environment variables include:
 
 - `GEMINI_API_KEY`
@@ -83,9 +224,9 @@ Supported provider environment variables include:
 - `AZURE_OPENAI_API_KEY`
 - `OPENROUTER_API_KEY`
 
-The application can also store provider configuration in the project's `.system/config.yaml` through its Project Settings interface. Do not commit API keys or `.env`.
+Anthropic credentials can be configured, but the Anthropic runtime adapter is disabled in this snapshot.
 
-Other useful settings in `.env` include:
+Other useful settings include:
 
 - `CHAT_MODEL`
 - `OPENAI_MODEL`
@@ -94,13 +235,13 @@ Other useful settings in `.env` include:
 - `PROJECTS_ROOT`
 - `MAX_AGENT_STEPS`
 
-For a local installation, the default project root is:
+Do not commit `.env` or real API keys.
+
+The default local project root is:
 
 ```text
 ./projects
 ```
-
-The `projects/` directory is intentionally ignored by Git because it contains runtime/project state.
 
 ## Run the application
 
@@ -122,21 +263,13 @@ uv run python -m streamlit run ragapp/interfaces/streamlit_app/main.py
 uv run cognitive-agent
 ```
 
-The launcher offers the Streamlit application and terminal chat.
-
 ### API
-
-Run the FastAPI application with Uvicorn:
 
 ```powershell
 uv run uvicorn api:app --reload
 ```
 
-The repository's `run_api.bat` helper runs the same API entrypoint.
-
-## Windows helper scripts
-
-The repository also contains:
+Windows helper scripts are also included:
 
 ```text
 run.bat
@@ -144,110 +277,135 @@ run_streamlit.bat
 run_api.bat
 ```
 
-The Streamlit helper uses `uv`.
+## Project data model
 
-For a new machine, `uv sync` should be run first. The `uv` commands above are the preferred reproducible path.
-
-## Dependency reproducibility
-
-The project uses two files together:
-
-```text
-pyproject.toml
-    direct project dependencies and supported Python version
-
-uv.lock
-    exact resolved dependency graph
-```
-
-The lock file should be committed to Git.
-
-After changing a dependency intentionally:
-
-```powershell
-uv lock
-uv sync
-```
-
-Then test the application before committing the updated `pyproject.toml` and `uv.lock`.
-
-Do not run an unrestricted `pip install -U` in the project environment. That can move the environment away from the locked dependency set.
-
-## Cognition and project data
-
-Application project data lives below:
+Runtime project data lives under:
 
 ```text
 projects/
 ```
 
-This includes persistent project state, cognition, sessions, metadata, source artifacts, and workspace data.
+A project can contain authoritative source, workspace artifacts, cognition, sessions, metadata/indexes, review drafts, instructions, agent definitions, configuration, and Git history.
 
-It is ignored by Git by design. The source repository contains the application code; project-specific runtime cognition is separate.
+The repository's application code and project runtime state are intentionally separate. `projects/` is ignored by application-repository Git.
 
-If an existing project must be moved to another machine, copy that project's directory under `projects/` separately.
+### Source and workspace
 
-## Development
+The key mutation boundary is:
 
-Check the active Python interpreter:
+```text
+/source
+    authoritative project material
+
+/workspace
+    AI-editable working material
+
+Review
+    pending proposed source changes
+
+Approval
+    promotes reviewed changes to /source
+```
+
+Normal project implementation requests should use this base runtime behavior; a custom Agent is not required merely to enforce workspace/review safety.
+
+## Cognition compilation and recompilation
+
+Cognition can be compiled from supported project artifacts. The source recompilation capability uses the same compilation pipeline as the application and can compile all source files or a selected subset.
+
+Recompilation is additive: existing cognition is not cleared as a prerequisite to compilation. The compiler also supplies persisted durable compilation overrides to the document compiler for reconciliation with newly observed source information.
+
+Compilation may invoke the configured LLM per document segment and can therefore take time and consume provider tokens.
+
+## Retrieval architecture
+
+The v9.2.2 read path is designed around local candidate selection followed by bounded hydration:
+
+```text
+user request
+    -> local query embedding
+    -> semantic capability / cognition / instruction / module selection
+    -> structural cognition expansion
+    -> bounded context
+    -> main LLM/tool execution
+```
+
+Semantic similarity is candidate generation, not the canonical knowledge store itself. Once cognition IDs are selected, structural references can expand connected cognition before context is hydrated.
+
+## Development checks
+
+Confirm the interpreter:
 
 ```powershell
 uv run python --version
 uv run python -c "import sys; print(sys.executable)"
 ```
 
-Expected Python major/minor version:
+Expected major/minor version:
 
 ```text
 Python 3.12.x
 ```
 
-Check the installed locked environment:
-
-```powershell
-uv pip freeze
-```
-
-Run a syntax check over the application:
+Syntax-check the application:
 
 ```powershell
 uv run python -m compileall ragapp api.py main.py
 ```
 
+Run the current test suite:
+
+```powershell
+uv run pytest
+```
+
+Inspect the resolved environment:
+
+```powershell
+uv pip freeze
+```
+
+## Dependency updates
+
+After intentionally changing dependencies or project package metadata:
+
+```powershell
+uv lock
+uv sync
+```
+
+Then test before committing `pyproject.toml` and `uv.lock`.
+
 ## Common clean-machine problems
 
 ### `ModuleNotFoundError`
 
-Do not immediately install the missing package with pip.
-
-First run:
+Run:
 
 ```powershell
 uv sync
 ```
 
-If the package is a project dependency, it should come from `pyproject.toml`/`uv.lock`.
+If the dependency is required by the application, declare it in `pyproject.toml` rather than manually installing it into `.venv`.
 
 ### Wrong Python version
-
-Check:
 
 ```powershell
 uv run python --version
 ```
 
-The project targets Python 3.12.x.
+CPA v9.2.2 targets Python 3.12.x.
 
-### Stale or damaged environment
+### Stale environment
 
-The environment can be recreated without changing the repository:
+PowerShell:
 
 ```powershell
 Remove-Item -Recurse -Force .venv
 uv sync
 ```
 
-On Unix-like systems:
+Unix-like systems:
 
 ```bash
 rm -rf .venv
@@ -256,27 +414,30 @@ uv sync
 
 ### Missing API key
 
-Check `.env` or configure the provider through Project Settings. Never commit the real key.
+Check `.env` or configure the provider through project Settings. Never commit the real key.
 
 ## Versioning
 
-The repository uses `main` as the current promoted/stable line for the
-active major version.
+The current development line is:
 
-For version 8, ongoing development happens on:
+```text
+v9.x
+```
 
-    v8.x
+This repository snapshot is:
 
-Minor milestones are represented by commits/tags such as:
+```text
+v9.2.2
+```
 
-    v8.5.0
-    v8.6.0
-    v8.7.0
+Create the release tag after the code and metadata are committed:
 
-When a v8.x milestone is ready for promotion, it is merged/promoted
-to `main`.
+```powershell
+git tag -a v9.2.2 -m "v9.2.2"
+git push origin v9.2.2
+```
 
-Historical versions remain available through Git tags.
+Historical releases remain available through Git history/tags.
 
 ## Repository hygiene
 
@@ -286,9 +447,8 @@ Do not commit:
 - `.env`
 - `.env.*` except `.env.example`
 - `projects/`
-- SQLite runtime databases
-- Python bytecode
-- `__pycache__/`
+- runtime SQLite databases
+- Python bytecode / `__pycache__/`
 - local ZIP archives
 
-The existing `.gitignore` is intended to keep these out of the repository.
+Generated packaging metadata such as `*.egg-info/` should normally also be excluded from source control and regenerated by the packaging toolchain rather than maintained manually.

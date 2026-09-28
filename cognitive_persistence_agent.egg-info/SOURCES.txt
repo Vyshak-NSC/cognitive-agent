@@ -78,6 +78,7 @@ ragapp/tools/__init__.py
 ragapp/tools/agent_tools.py
 ragapp/tools/binary_files.py
 ragapp/tools/cognition_tools.py
+ragapp/tools/compile_tools.py
 ragapp/tools/definitions.py
 ragapp/tools/docx_files.py
 ragapp/tools/extractors.py

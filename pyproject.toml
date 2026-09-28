@@ -1,7 +1,7 @@
 [project]
 name = "cognitive-persistence-agent"
-version = "8.5.0"
-description = "Agentic AI with deterministic cognitive persistence and a mutable artifact workspace"
+version = "9.2.2"
+description = "Persistent agent runtime with canonical cognition, semantic retrieval, review-gated project mutation, and Git-backed state"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
