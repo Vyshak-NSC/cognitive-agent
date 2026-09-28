@@ -63,6 +63,19 @@ class DraftManager:
                 continue
         return sorted(out, key=lambda x: x.get("created_at", ""), reverse=True)
 
+    def set_session_active_drafts(self, session_id, active_ids):
+        """Hide pending review items produced only by inactive chat branches."""
+        active=set(active_ids or [])
+        changed=0
+        for p in self.root.glob("*.json"):
+            try: d=json.loads(p.read_text(encoding="utf-8"))
+            except (OSError,json.JSONDecodeError): continue
+            if d.get("session_id") != session_id or d.get("status") != "pending": continue
+            desired=d.get("id") in active
+            if d.get("branch_active",True) != desired:
+                d["branch_active"]=desired; p.write_text(json.dumps(d,indent=2,ensure_ascii=False),encoding="utf-8"); changed+=1
+        return changed
+
     def load(self, did):
         p = self.root / f"{did}.json"
         return json.loads(p.read_text(encoding="utf-8"))

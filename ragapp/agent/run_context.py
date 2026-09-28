@@ -20,6 +20,8 @@ class AgentRunContext:
     cognition: Any
     project_id: str
     session_id: str | None = None
+    turn_id: str | None = None
+    active_turn_ids: list[str] = field(default_factory=list)
     agent_id: str | None = None
     on_section: Callable[[dict], None] | None = None
     max_steps: int | None = None
