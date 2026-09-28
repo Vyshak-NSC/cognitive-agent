@@ -124,6 +124,17 @@ class SemanticIndex:
         query = str(query or "").strip()
         return _embed([query])[0] if query else None
 
+    def item_vector(self, namespace, item_id):
+        """Return a stored item vector without performing another embedding call."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT vector,dims FROM semantic_items WHERE namespace=? AND item_id=? AND model=?",
+                (str(namespace), str(item_id), _DEFAULT_MODEL),
+            ).fetchone()
+        if not row:
+            return None
+        return np.frombuffer(row["vector"], dtype=np.float32, count=int(row["dims"])).copy()
+
     def search(self, namespace, query=None, limit=8, min_score=0.0, query_vector=None):
         query = str(query or "").strip()
         qvec = query_vector if query_vector is not None else (self.embed_query(query) if query else None)

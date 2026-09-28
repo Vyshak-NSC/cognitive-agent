@@ -410,6 +410,55 @@ def _build_artifact_ids(store, files):
     return artifact_ids
 
 
+def _durable_compilation_overrides(store: CognitionStore) -> list[str]:
+    """Return explicit durable canonical state that source compilation may not regress.
+
+    These are not inferred from source. They are user/agent-approved current-state
+    observations already persisted in canonical cognition. Passing them into the
+    document compiler makes the existing authority rule visible to the semantic
+    compiler instead of relying only on the post-merge read view.
+    """
+    overrides = []
+    metadata = store.master_metadata()
+
+    for entity_id in sorted((metadata.get("entities") or {}).keys()):
+        try:
+            current = store.latest_entity_state(entity_id) or {}
+        except Exception:
+            current = {}
+        durable = {}
+        for attribute, state in current.items():
+            if not isinstance(state, dict) or state.get("authority") != "durable":
+                continue
+            durable[str(attribute)] = {
+                "value": state.get("value"),
+                "summary": state.get("summary"),
+                "valid_from": state.get("valid_from"),
+                "valid_to": state.get("valid_to"),
+            }
+        if durable:
+            overrides.append(json.dumps({
+                "kind": "entity",
+                "id": str(entity_id),
+                "current_state": durable,
+                "authority": "durable",
+            }, ensure_ascii=False))
+
+    # Entity deletion is already enforced mechanically by CognitionStore, but
+    # expose tombstones to the semantic compiler so it does not generate
+    # connected prose/claims that assume a deleted entity is currently active.
+    for entity_id, tombstone in sorted((metadata.get("deleted_entities") or {}).items()):
+        overrides.append(json.dumps({
+            "kind": "entity",
+            "id": str(entity_id),
+            "deleted": True,
+            "tombstone": tombstone,
+            "authority": "durable",
+        }, ensure_ascii=False))
+
+    return overrides
+
+
 def compile_project(
     store: CognitionStore,
     progress_callback=None,
@@ -610,6 +659,7 @@ def _compile_project_impl(
     document_result = DocumentCognitionCompiler(store).compile_files(
         [(area, p) for area, _, p in llm_files],
         progress_callback=progress_callback,
+        authoritative_changes=_durable_compilation_overrides(store),
     )
 
     document_result["deterministic_code"] = deterministic_result or {}

@@ -14,6 +14,42 @@ from ragapp.core.semantic_index import SemanticIndex
 
 CANONICAL_KINDS = ("entity", "relationship", "event", "location", "concept", "definition", "knowledge")
 
+# Single source of truth for what text represents a cognition object in the
+# semantic index. Both the per-turn context selector and the
+# search_cognition_metadata tool write the SAME "cognition" namespace; when they
+# built different text, each overwrote (and re-embedded) the other's records.
+INDEX_FIELDS = (
+    "id", "name", "title", "type", "tags", "description", "summary", "state",
+    "participants", "relation_type", "effects", "location", "valid_from", "valid_to",
+)
+
+# A group tag made only of these words is too generic to define a group.
+_GROUP_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "is", "are", "was", "were",
+    "list", "all", "name", "what", "who", "which", "show", "me", "tell", "about", "give",
+    "their", "them", "these", "those", "every", "each", "many", "how", "there", "any",
+    "other", "thing", "entity", "character",
+})
+# A tag shared by more entities than this is a topic, not a listable group.
+_MAX_GROUP_SIZE = 25
+
+
+def cognition_index_records(store):
+    """Records for the semantic 'cognition' namespace (identical for every caller)."""
+    records = []
+    for kind in CANONICAL_KINDS:
+        for rec in store._all_kind_records(kind):
+            ident = str(rec.get("id") or "").strip()
+            if not ident:
+                continue
+            searchable = {k: rec.get(k) for k in INDEX_FIELDS if rec.get(k) not in (None, "", [], {})}
+            records.append({
+                "id": f"{kind}:{ident}",
+                "text": f"{kind}. " + json.dumps(searchable, ensure_ascii=False, default=str),
+                "metadata": {"kind": kind, "object_id": ident},
+            })
+    return records
+
 
 class RetrievalStore:
     def __init__(self, store):
@@ -38,28 +74,72 @@ class RetrievalStore:
                 }
         return out
 
+    @staticmethod
+    def _norm_words(text):
+        """Lower-cased word list with '_' split and a light plural strip (beasts -> beast)."""
+        words = re.findall(r"[a-z0-9]+", str(text or "").casefold().replace("_", " "))
+        return [w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words]
+
+    @staticmethod
+    def _contains_phrase(tokens, phrase):
+        n = len(phrase)
+        return n > 0 and any(tokens[i:i + n] == phrase for i in range(len(tokens) - n + 1))
+
+    def group_candidates(self, query, limit=25):
+        """Deterministic lexical candidates: entities named in, or grouped by a tag named in, the query.
+
+        Example: "list the god beast names" contains the phrase "god beast",
+        which is a tag on every God Beast entity, so all of them are returned
+        regardless of how the embedding model ranks them against each other.
+        """
+        tokens = self._norm_words(query)
+        if not tokens:
+            return []
+        entities = self.store.master_metadata().get("entities", {}) or {}
+        name_hits, tag_groups = [], {}
+        for eid, meta in entities.items():
+            name_words = self._norm_words(meta.get("name"))
+            if name_words and self._contains_phrase(tokens, name_words):
+                name_hits.append(eid)
+            seen = set()
+            for tag in meta.get("tags") or []:
+                words = tuple(self._norm_words(tag))
+                if not words or words in seen or all(w in _GROUP_STOPWORDS for w in words):
+                    continue
+                seen.add(words)
+                if self._contains_phrase(tokens, list(words)):
+                    tag_groups.setdefault(words, []).append(eid)
+
+        ordered = [(eid, "name") for eid in sorted(name_hits)]
+        # More specific (longer) tag phrases first, then smaller groups.
+        for words, members in sorted(tag_groups.items(), key=lambda kv: (-len(kv[0]), len(kv[1]), kv[0])):
+            if len(members) > _MAX_GROUP_SIZE:
+                continue
+            ordered.extend((eid, "tag:" + " ".join(words)) for eid in sorted(members))
+
+        out, seen_ids = [], set()
+        for eid, why in ordered:
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            meta = entities.get(eid) or {}
+            out.append({
+                "kind": "entity", "id": str(eid), "type": meta.get("type"),
+                "name": meta.get("name") or str(eid),
+                "summary": str(meta.get("summary") or "")[:1000],
+                "provenance": [], "semantic_score": None, "match": why,
+            })
+            if len(out) >= limit:
+                break
+        return out
+
     def search_metadata_candidates(self, query, limit=8):
         """Semantic canonical candidate search with lexical compatibility fallback."""
         limit = max(1, min(int(limit or 8), 50))
         candidates = []
         try:
             index = SemanticIndex(self.store)
-            records = []
-            for kind in CANONICAL_KINDS:
-                for rec in self.store._all_kind_records(kind):
-                    ident = str(rec.get("id") or "").strip()
-                    if not ident:
-                        continue
-                    searchable = {
-                        k: rec.get(k)
-                        for k in ("id", "name", "title", "type", "description", "summary", "state", "participants", "relation_type", "attributes", "effects", "location", "valid_from", "valid_to")
-                        if rec.get(k) not in (None, "", [], {})
-                    }
-                    records.append({
-                        "id": f"{kind}:{ident}",
-                        "text": f"{kind}. " + json.dumps(searchable, ensure_ascii=False, default=str),
-                        "metadata": {"kind": kind, "object_id": ident},
-                    })
+            records = cognition_index_records(self.store)
             index.sync("cognition", records)
             hits = index.search("cognition", query, limit=limit, min_score=0.20)
             for hit in hits:
@@ -77,9 +157,22 @@ class RetrievalStore:
         except Exception:
             result = self.store.search_cognition_metadata(query, limit=limit)
             candidates = list(result.get("candidates", [])) if isinstance(result, dict) else []
+        candidates = candidates[:limit]
+        # Semantic top-k cannot enumerate a group ("list the God Beasts") because
+        # several members compete for the same few slots. Add every entity whose
+        # tag/name is named in the query, on top of the semantic hits.
+        try:
+            have = {(str(c.get("kind")), str(c.get("id"))) for c in candidates}
+            for extra in self.group_candidates(query):
+                key = (extra["kind"], extra["id"])
+                if key not in have:
+                    have.add(key)
+                    candidates.append(extra)
+        except Exception:
+            pass
         return {
             "query": str(query or ""),
-            "candidates": candidates[:limit],
+            "candidates": candidates[:50],
             "content_loaded": False,
             "instruction": "Hydrate only the canonical candidates needed for the answer.",
         }
@@ -290,6 +383,85 @@ class RetrievalStore:
             result["truncated"] = True
             result["next_requests"] = deduped
         return result
+
+    @staticmethod
+    def _reference_ids(value):
+        """Yield stable ids from the reference shapes used by canonical cognition."""
+        if isinstance(value, str):
+            if value.strip():
+                yield value.strip()
+            return
+        if isinstance(value, dict):
+            ident = value.get("id") or value.get("entity_id") or value.get("event_id")
+            if ident:
+                yield str(ident)
+            return
+        if isinstance(value, list):
+            for item in value:
+                yield from RetrievalStore._reference_ids(item)
+
+    def expand_candidates(self, candidates, max_depth=1, max_items=24):
+        """Bounded deterministic graph expansion after semantic candidate selection.
+
+        Embeddings locate an entry point; canonical references determine its semantic
+        neighbourhood.  This prevents top-k similarity from being mistaken for a
+        complete set of related project knowledge.
+        """
+        kind_for_field = {
+            "relationships": "relationship", "events": "event", "locations": "location",
+            "concepts": "concept", "definitions": "definition", "knowledge_links": "knowledge",
+            "related_entity_ids": "entity", "entity_ids": "entity", "entities": "entity",
+            "related_event_ids": "event", "event_ids": "event",
+            "related_concept_ids": "concept", "concept_ids": "concept",
+            "related_location_ids": "location", "location_ids": "location",
+            "related_relationship_ids": "relationship", "relationship_ids": "relationship",
+        }
+        ordered, seen, frontier = [], set(), []
+        for candidate in candidates or []:
+            kind, ident = str(candidate.get("kind") or ""), str(candidate.get("id") or "")
+            if kind in CANONICAL_KINDS and ident and (kind, ident) not in seen:
+                seen.add((kind, ident)); ordered.append(dict(candidate)); frontier.append((kind, ident))
+        depth = 0
+        while frontier and depth < max(0, int(max_depth or 0)) and len(ordered) < max_items:
+            next_frontier = []
+            selected_ids = {ident for _, ident in frontier}
+            for kind, ident in frontier:
+                rec = self._read_kind(kind, ident) or {}
+                for field, target_kind in kind_for_field.items():
+                    for ref_id in self._reference_ids(rec.get(field)):
+                        key = (target_kind, ref_id)
+                        if key in seen or not self._read_kind(*key):
+                            continue
+                        seen.add(key); ordered.append({"kind": target_kind, "id": ref_id, "score": None, "match": "graph"})
+                        next_frontier.append(key)
+                        if len(ordered) >= max_items: break
+                    if len(ordered) >= max_items: break
+                if len(ordered) >= max_items: break
+                # Participant records are typed references and may point to entities
+                # or other canonical objects.
+                for participant in rec.get("participants") or []:
+                    if not isinstance(participant, dict) or not participant.get("id"): continue
+                    pk = str(participant.get("kind") or "entity").rstrip("s")
+                    key = (pk, str(participant["id"]))
+                    if pk in CANONICAL_KINDS and key not in seen and self._read_kind(*key):
+                        seen.add(key); ordered.append({"kind": pk, "id": key[1], "score": None, "match": "graph"}); next_frontier.append(key)
+                        if len(ordered) >= max_items: break
+            # Backlinks matter when only the relationship/event knows about the
+            # selected object. Scan canonical records locally; no LLM/API call.
+            if len(ordered) < max_items and selected_ids:
+                for other_kind in CANONICAL_KINDS:
+                    for rec in self.store._all_kind_records(other_kind):
+                        oid = str(rec.get("id") or "")
+                        key = (other_kind, oid)
+                        if not oid or key in seen: continue
+                        blob = json.dumps({k: rec.get(k) for k in (*kind_for_field.keys(), "participants") if rec.get(k)}, ensure_ascii=False, default=str)
+                        if any(ref_id in blob for ref_id in selected_ids):
+                            seen.add(key); ordered.append({"kind": other_kind, "id": oid, "score": None, "match": "backlink"}); next_frontier.append(key)
+                            if len(ordered) >= max_items: break
+                    if len(ordered) >= max_items: break
+            frontier = next_frontier
+            depth += 1
+        return ordered
 
     def retrieve_candidates(self, candidates, detail="compact", max_chars=8000):
         requests = [

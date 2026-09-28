@@ -2,7 +2,7 @@
 import docx
 from docx.enum.text import WD_BREAK
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 
 def _path(username, p): return resolve_workspace_path(username, p)
@@ -15,16 +15,69 @@ def _paragraph_json(p, index):
         "text": p.text,
     }
 
-def read_docx(username, relative_path, offset=0, limit=100):
-    path = _path(username, relative_path)
-    if not path.is_file(): raise FileNotFoundError(f"File not found: {relative_path}")
+def _read_path(username, relative_path, area):
+    """Resolve a read target. Reads may use source or workspace; writes stay workspace-only."""
+    area = (area or "workspace").strip().lower()
+    if area == "workspace":
+        return _path(username, relative_path)
+    if area == "source":
+        return resolve_source_path(username, relative_path)
+    raise ValueError("area must be 'workspace' or 'source'")
+
+
+def _table_json(table, index, after_paragraph_index):
+    rows = []
+    for row in table.rows:
+        cells, last_tc = [], None
+        for cell in row.cells:
+            if cell._tc is last_tc:  # merged cell repeats across grid columns
+                continue
+            last_tc = cell._tc
+            cells.append(cell.text)
+        rows.append(cells)
+    return {"index": index, "after_paragraph_index": after_paragraph_index, "rows": rows}
+
+
+def read_docx(username, relative_path, offset=0, limit=100, area="workspace"):
+    """Read paragraphs and tables from a DOCX in the workspace or (read-only) source."""
+    from docx.table import Table
+    path = _read_path(username, relative_path, area)
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {area}/{relative_path}")
     doc = docx.Document(path)
     all_paragraphs = [_paragraph_json(p, i) for i, p in enumerate(doc.paragraphs)]
-    return {"path": relative_path, "paragraphs": all_paragraphs[offset:offset+limit],
-            "total_paragraphs": len(all_paragraphs), "offset": offset, "limit": limit,
-            "tables": [...], "sections": len(doc.sections)}
-    
-    
+
+    tables, para_seen, table_seen = [], -1, -1
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            para_seen += 1
+        elif tag == "tbl":
+            table_seen += 1
+            tables.append(_table_json(Table(child, doc), table_seen, para_seen))
+
+    offset = max(0, int(offset or 0))
+    limit = max(1, int(limit or 100))
+    window = all_paragraphs[offset:offset + limit]
+    last_included = offset + len(window) - 1
+    # Each table is assigned to the window holding the paragraph it follows
+    # (tables before the first paragraph go with offset 0), so paging through
+    # a document returns every table exactly once.
+    windowed_tables = [
+        t for t in tables
+        if (offset <= t["after_paragraph_index"] <= last_included)
+        or (offset == 0 and t["after_paragraph_index"] == -1)
+    ]
+    return {
+        "path": relative_path, "area": area,
+        "paragraphs": window, "total_paragraphs": len(all_paragraphs),
+        "offset": offset, "limit": limit,
+        "next_offset": offset + limit if offset + limit < len(all_paragraphs) else None,
+        "tables": windowed_tables, "total_tables": len(tables),
+        "sections": len(doc.sections),
+    }
+
+
 def write_docx(username, relative_path, document_spec):
     path = _path(username, relative_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,7 +155,25 @@ def _edit_docx_handler(username, **args):
 
 def build_docx_tools(username):
     return [
-        Tool("read_docx", "Read raw paragraph/table structure from a DOCX file. Only use this when editing the file or when compiled cognition entities do not contain the needed information. Do NOT use this to answer general questions about project content when the project is already compiled — use request_cognition_context instead.", {"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]}, lambda relative_path: read_docx(username, relative_path)),
+        Tool(
+            "read_docx",
+            "Read paragraph and table structure from a DOCX file. Set area='source' to read an authoritative "
+            "source document (read-only) or area='workspace' (default) for workspace files. Paged: use offset/limit "
+            "and follow next_offset until it is null. Tables are returned as rows of cell text with the paragraph "
+            "they follow. Prefer compiled cognition for ordinary content questions; use this for raw document "
+            "inspection, for confirming what the source actually says, or before editing.",
+            {
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "area": {"type": "string", "enum": ["workspace", "source"]},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["relative_path"],
+            },
+            lambda relative_path, area="workspace", offset=0, limit=100: read_docx(username, relative_path, offset, limit, area),
+        ),
         Tool(
             "write_docx",
             "Create a real .docx from a structured document specification containing paragraphs/runs and tables.",

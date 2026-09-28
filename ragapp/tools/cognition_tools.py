@@ -41,13 +41,53 @@ def _entity_metadata_with_current_state(store, names):
         out.append(meta)
     return {"entities": out}
 
+
+def _compile_cognition(store, files=None):
+    """Compile/recompile authoritative source files into canonical cognition."""
+    from ragapp.cognition.compiler import compile_project
+
+    available = []
+    if store.source.exists():
+        for path in sorted(store.source.rglob("*")):
+            if path.is_file():
+                available.append(path.relative_to(store.source).as_posix())
+
+    requested = [str(x).replace("\\", "/").lstrip("/") for x in (files or []) if str(x).strip()]
+    if requested:
+        missing = [x for x in requested if x not in available]
+        if missing:
+            return {"status": "error", "error": "source file not found", "missing": missing, "available": available}
+        selected = [("source", x) for x in requested]
+    else:
+        selected = [("source", x) for x in available]
+
+    if not selected:
+        return {"status": "no_source_files", "compiled": []}
+
+    result = compile_project(store, selected_files=selected, reconcile_selected=True)
+    if isinstance(result, dict):
+        result.setdefault("compiled", [x for _, x in selected])
+        result.setdefault("status", "compiled")
+    return result
+
 def build_cognition_tools(store, session_id=None):
     retrieval = RetrievalStore(store)
 
     return [
         Tool(
+            "compile_cognition",
+            "Compile or recompile canonical cognition from authoritative project source files. If files is omitted, compile every file in the project source directory. Use this for explicit requests to compile/recompile source cognition; do not try to decode DOCX/PDF manually first.",
+            {
+                "type": "object",
+                "properties": {
+                    "files": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            lambda files=None: _compile_cognition(store, files),
+        ),
+        Tool(
             "search_cognition_metadata",
-            "Search compact canonical metadata across entities, relationships, events, locations, concepts, definitions, and knowledge. The controller performs an initial search automatically for project-content turns; call this tool only to refine or broaden retrieval.",
+            "FIRST retrieval step for project-content questions. Search only compact local metadata and return candidate entities/files/source pointers. Never returns source content. Use the result to choose or refine the next targeted retrieval.",
             {
                 "type": "object",
                 "properties": {
@@ -72,7 +112,7 @@ def build_cognition_tools(store, session_id=None):
         ),
         Tool(
             "request_cognition_context",
-            "Retrieve targeted canonical cognition. Prefer compact/state/section; request full only when necessary. Continuation is explicit. Request additional pages only when the returned evidence is insufficient.",
+            "Retrieve targeted cognition after a candidate has been identified. Prefer metadata/summary/state/section; request full only when necessary. If a full result returns next_requests, repeat the same request with the supplied chunk_index until complete.",
             {
                 "type": "object",
                 "properties": {
@@ -81,9 +121,6 @@ def build_cognition_tools(store, session_id=None):
                         "items": {
                             "type": "object",
                             "properties": {
-                                "kind": {"type": "string", "enum": ["entity", "relationship", "event", "location", "concept", "definition", "knowledge"]},
-                                "id": {"type": "string"},
-                                "ids": {"type": "array", "items": {"type": "string"}},
                                 "entity_id": {"type": "string"},
                                 "entity_ids": {"type": "array", "items": {"type": "string"}},
                                 "event_id": {"type": "string"},
@@ -98,7 +135,7 @@ def build_cognition_tools(store, session_id=None):
                                 "story_time": {"type": "object"},
                                 "narrative_position": {"type": "object"},
                                 "temporal_position": {"type": "object"},
-                                "detail": {"type": "string", "enum": ["metadata", "summary", "compact", "state", "section", "full"]},
+                                "detail": {"type": "string", "enum": ["metadata", "summary", "state", "section", "full"]},
                                 "include_source": {"type": "boolean"},
                                 "chunk_index": {"type": "integer", "minimum": 0},
                             },
@@ -108,7 +145,7 @@ def build_cognition_tools(store, session_id=None):
                 },
                 "required": ["requests"],
             },
-            lambda requests, max_chars=4000: retrieval.retrieve(requests, max_chars=max_chars),
+            lambda requests, max_chars=12000: retrieval.retrieve(requests, max_chars=max_chars),
         ),
         Tool(
             "get_entity_metadata",

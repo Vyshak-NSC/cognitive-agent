@@ -1,5 +1,6 @@
 from pathlib import Path
 import base64
+from io import BytesIO
 import json
 import os
 import signal
@@ -1093,6 +1094,55 @@ def _render_selected_file(path: Path, root: Path) -> None:
             '</iframe>',
             unsafe_allow_html=True,
         )
+        return
+
+    if suffix == ".docx":
+        # DOCX is a ZIP package containing XML, so decoding the raw bytes as
+        # UTF-8 displays the PK header and compressed garbage. Parse the Word
+        # package and render its document content instead.
+        try:
+            from docx import Document
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+
+            document = Document(BytesIO(raw))
+            rendered_any = False
+
+            # python-docx >= 1.1 exposes iter_inner_content(), which preserves
+            # paragraph/table order. Fall back gracefully for older versions.
+            if hasattr(document, "iter_inner_content"):
+                blocks = document.iter_inner_content()
+            else:
+                blocks = [*document.paragraphs, *document.tables]
+
+            for block in blocks:
+                if isinstance(block, Paragraph):
+                    text = block.text.strip()
+                    if not text:
+                        continue
+                    rendered_any = True
+                    style_name = (block.style.name or "") if block.style else ""
+                    if style_name.startswith("Heading"):
+                        try:
+                            level = int(style_name.split()[-1])
+                        except (TypeError, ValueError):
+                            level = 3
+                        level = max(1, min(level, 6))
+                        st.markdown(f"{'#' * level} {text}")
+                    elif style_name in {"Title", "Subtitle"}:
+                        st.markdown(f"## {text}")
+                    else:
+                        st.write(text)
+                elif isinstance(block, Table):
+                    rows = [[cell.text for cell in row.cells] for row in block.rows]
+                    if rows:
+                        rendered_any = True
+                        st.table(rows)
+
+            if not rendered_any:
+                st.info("This Word document contains no previewable text or tables.")
+        except Exception as exc:
+            st.error(f"Could not preview Word document `{path.name}`: {exc}")
         return
 
     try:
