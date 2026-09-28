@@ -35,35 +35,28 @@ def project(p:Project): return {'project_id':create_project(p.username,p.project
 @app.post('/query')
 def query(q:Query):
     s=store_for(q.username,q.project_id); set_current_project(s)
-    session_id=q.session_id or uuid.uuid4().hex
-    chats=ChatSessionStore(s)
-    stored=chats.load(session_id)
-    transcript=list((stored or {}).get('messages', []))
-    # Accept either a latest-message request or a client-supplied transcript
-    # without duplicating messages already persisted server-side.
-    existing={(m.get('role'), str(m.get('content',''))) for m in transcript if isinstance(m,dict)}
+    session_id=q.session_id or uuid.uuid4().hex; chats=ChatSessionStore(s); stored=chats.load(session_id)
+    transcript=chats.active_transcript(session_id) if stored else []
+    existing={(m.get('role'),str(m.get('content',''))) for m in transcript if isinstance(m,dict)}
     for msg in q.messages or []:
-        key=(msg.get('role'), str(msg.get('content','')))
-        if key not in existing:
-            transcript.append(msg); existing.add(key)
+        key=(msg.get('role'),str(msg.get('content','')))
+        if key not in existing: transcript.append(msg); existing.add(key)
+    user_message=next((m for m in reversed(transcript) if m.get('role')=='user'),{'role':'user','content':''})
+    turn_id=uuid.uuid4().hex; user_message=dict(user_message); user_message['turn_id']=turn_id
+    if transcript and transcript[-1].get('role')=='user': transcript[-1]=user_message
+    vcs=VCSManager(s); state_before=vcs.checkpoint(f"Before API chat turn: {str(user_message.get('content',''))[:48]}")
+    active_ids=(chats.lineage_ids(session_id) if stored else [])+[turn_id]
     try:
         answer,calls,drafts=run_agent(AgentRunContext(
-            transcript=transcript,
-            tools=build_default_tools(q.username,s,True,session_id=session_id),
-            cognition=s,
-            project_id=q.project_id,
-            session_id=session_id,
-            agent_id=q.agent_id,
+            transcript=transcript, tools=build_default_tools(q.username,s,True,session_id=session_id), cognition=s,
+            project_id=q.project_id, session_id=session_id, turn_id=turn_id, active_turn_ids=active_ids, agent_id=q.agent_id,
         ))
     except Exception as e: raise HTTPException(500,str(e))
-    user_message=next((m for m in reversed(transcript) if m.get('role')=='user'), {'role':'user','content':''})
-    chats.append_turn(
-        session_id,
-        user_message,
-        {'role':'assistant','content':answer,'tool_calls':calls},
-        title_from=str(user_message.get('content','')),
-    )
-    return {'session_id':session_id,'answer':answer,'calls':calls,'drafts':drafts}
+    state_after=vcs.checkpoint(f"After API chat turn: {str(user_message.get('content',''))[:48]}")
+    chats.append_turn(session_id,user_message,{'role':'assistant','content':answer,'tool_calls':calls,'turn_id':turn_id},
+        title_from=str(user_message.get('content','')),state_before=state_before,state_after=state_after,
+        effects={'draft_ids':[d.get('id') for d in drafts if isinstance(d,dict)],'tool_count':len(calls)},turn_id=turn_id)
+    return {'session_id':session_id,'turn_id':turn_id,'answer':answer,'calls':calls,'drafts':drafts}
 @app.get('/drafts/{username}/{project_id}')
 def drafts(username,project_id): return DraftManager(store_for(username,project_id)).list()
 @app.post('/drafts/{username}/{project_id}/{draft_id}/approve')
@@ -106,6 +99,48 @@ def sessions(username,project_id):
 @app.get('/sessions/{username}/{project_id}/{session_id}/memory')
 def session_memory(username,project_id,session_id):
     return SessionMemory(store_for(username,project_id)).list(session_id)
+
+
+class SessionEdit(BaseModel):
+    turn_id: str
+    content: str
+
+class SessionActivate(BaseModel):
+    turn_id: str
+
+@app.get('/sessions/{username}/{project_id}/{session_id}')
+def session_detail(username,project_id,session_id):
+    chats=ChatSessionStore(store_for(username,project_id)); data=chats.load(session_id)
+    if not data: raise HTTPException(404,'session not found')
+    return data
+
+@app.post('/sessions/{username}/{project_id}/{session_id}/activate')
+def session_activate(username,project_id,session_id,p:SessionActivate):
+    s=store_for(username,project_id); chats=ChatSessionStore(s); data=chats.load(session_id)
+    if not data or p.turn_id not in data.get('turns',{}): raise HTTPException(404,'turn not found')
+    turn=data['turns'][p.turn_id]; target=turn.get('state_after') or turn.get('state_before')
+    if target: VCSManager(s).materialize_state(target,message=f'Activate chat branch {p.turn_id[:8]}')
+    return chats.set_active_leaf(session_id,p.turn_id)
+
+@app.post('/sessions/{username}/{project_id}/{session_id}/edit')
+def session_edit(username,project_id,session_id,p:SessionEdit):
+    s=store_for(username,project_id); set_current_project(s); chats=ChatSessionStore(s); data=chats.load(session_id)
+    if not data or p.turn_id not in data.get('turns',{}): raise HTTPException(404,'turn not found')
+    old=data['turns'][p.turn_id]; parent_id=old.get('parent_id'); vcs=VCSManager(s)
+    if old.get('state_before'): vcs.materialize_state(old['state_before'],message=f'Fork chat before {p.turn_id[:8]}')
+    state_before=vcs.checkpoint(f'Before edited chat turn: {p.content[:48]}'); turn_id=uuid.uuid4().hex
+    transcript=chats.active_transcript_data(data,parent_id) if parent_id else []
+    user={'role':'user','content':p.content,'turn_id':turn_id}; transcript.append(user)
+    active_ids=(chats.lineage_ids_data(data,parent_id) if parent_id else [])+[turn_id]
+    try:
+        answer,calls,drafts=run_agent(AgentRunContext(transcript=transcript,tools=build_default_tools(username,s,True,session_id=session_id),cognition=s,project_id=project_id,session_id=session_id,turn_id=turn_id,active_turn_ids=active_ids))
+    except Exception as e: raise HTTPException(500,str(e))
+    state_after=vcs.checkpoint(f'After edited chat turn: {p.content[:48]}')
+    updated=chats.append_turn(session_id,user,{'role':'assistant','content':answer,'tool_calls':calls,'turn_id':turn_id},parent_id=parent_id,state_before=state_before,state_after=state_after,effects={'draft_ids':[d.get('id') for d in drafts if isinstance(d,dict)],'tool_count':len(calls)},turn_id=turn_id)
+    active_drafts=[]
+    for tid in chats.lineage_ids_data(updated): active_drafts.extend(((updated.get('turns') or {}).get(tid,{}).get('effects') or {}).get('draft_ids') or [])
+    DraftManager(s).set_session_active_drafts(session_id,active_drafts)
+    return {'session_id':session_id,'turn_id':turn_id,'answer':answer,'calls':calls,'drafts':drafts}
 
 # ---- Project file VCS API -------------------------------------------------
 # These endpoints expose the same deterministic service used by UI/agent tools.

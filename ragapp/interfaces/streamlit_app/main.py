@@ -6,6 +6,7 @@ import os
 import signal
 import threading
 import time
+import uuid
 
 import streamlit as st
 from ragapp.auth.db import initialize_database
@@ -1353,339 +1354,154 @@ def _render_tool_calls(tool_calls):
 # ===========================================================================
 
 if nav_section == "chat":
-    preview_enabled = st.toggle(
-        "Show file preview",
-        value=False,
-        key="chat_preview_enabled",
-        help=(
-            "Show or hide the optional file preview panel."
-        ),
-    )
+    from ragapp.core.vcs import VCSManager
 
+    preview_enabled = st.toggle("Show file preview", value=False, key="chat_preview_enabled", help="Show or hide the optional file preview panel.")
     chat_col = st.container()
 
+    def _activate_turn(target_turn_id):
+        """Switch chat lineage and materialize that lineage's project state."""
+        current = sessions.load(st.session_state.chat_session_id)
+        turn = (current.get("turns") or {}).get(target_turn_id) if current else None
+        if not turn:
+            return
+        target_state = turn.get("state_after") or turn.get("state_before")
+        if target_state:
+            VCSManager(store).materialize_state(target_state, message=f"Activate chat branch {target_turn_id[:8]}")
+        refreshed=sessions.set_active_leaf(st.session_state.chat_session_id, target_turn_id)
+        active_drafts=[]
+        for active_tid in sessions.lineage_ids_data(refreshed):
+            active_drafts.extend(((refreshed.get("turns") or {}).get(active_tid,{}).get("effects") or {}).get("draft_ids") or [])
+        DraftManager(store).set_session_active_drafts(st.session_state.chat_session_id, active_drafts)
+        st.session_state.messages=refreshed.get("messages",[])
+
+    def _run_chat_turn(user_text, *, parent_id=None, replacing_turn_id=None):
+        current=sessions.load(st.session_state.chat_session_id) or session
+        turns=current.get("turns") or {}
+        if replacing_turn_id:
+            old=turns.get(replacing_turn_id) or {}
+            parent_id=old.get("parent_id")
+            # Editing means fork from the exact state before the old turn.
+            base_state=old.get("state_before")
+            if base_state:
+                VCSManager(store).materialize_state(base_state, message=f"Fork chat before {replacing_turn_id[:8]}")
+        elif parent_id is None:
+            parent_id=current.get("active_leaf_id")
+
+        vcs=VCSManager(store)
+        state_before=vcs.checkpoint(f"Before chat turn: {user_text[:48]}")
+        turn_id=uuid.uuid4().hex
+        base_transcript=sessions.active_transcript_data(current,parent_id) if parent_id else []
+        user_message={"role":"user","content":user_text,"turn_id":turn_id}
+        transcript=base_transcript+[user_message]
+        active_ids=sessions.lineage_ids_data(current,parent_id) if parent_id else []
+        active_ids=active_ids+[turn_id]
+        calls=[]; drafts=[]; answer=""; tool_calls=[]
+        placeholder=st.empty()
+        stream_state={"rendered":"","plan":None,"done":[]}
+        def _render_plan():
+            return "**Planned sections:**\n"+"\n".join(f"- {'✅' if i < len(stream_state['done']) else '⏳'} {title}" for i,title in enumerate(stream_state["plan"] or []))
+        def _on_section(event):
+            if event["type"]=="plan":
+                stream_state["plan"]=event["sections"]; stream_state["done"]=[]; placeholder.markdown(_render_plan())
+            elif event["type"]=="section":
+                if stream_state["plan"] is not None: stream_state["done"].append(event["title"])
+                stream_state["rendered"]+=("\n\n" if stream_state["rendered"] else "")+event["content"]; placeholder.markdown(stream_state["rendered"])
+        try:
+            with st.spinner("Executing…"):
+                set_current_project(store)
+                tools=build_default_tools(username,store,include_cognition=True,session_id=st.session_state.chat_session_id)
+                answer,calls,drafts=run_agent(AgentRunContext(
+                    transcript=transcript, tools=tools, cognition=store, project_id=store.project_id,
+                    session_id=st.session_state.chat_session_id, turn_id=turn_id, active_turn_ids=active_ids,
+                    on_section=_on_section, agent_id=(st.session_state.get("active_agent_id") or None),
+                ))
+            answer=(answer or "").strip() or stream_state["rendered"] or "⚠️ The agent produced no response for this turn. Try again."
+            tool_calls=_serialise_tool_calls(calls); placeholder.markdown(answer); _render_tool_calls(tool_calls)
+        except Exception as exc:
+            answer=(stream_state["rendered"]+"\n\n" if stream_state["rendered"] else "")+"The agent encountered an error while executing this request."
+            tool_calls=_serialise_tool_calls(calls)+[{"tool":"agent_error","args":{},"result":str(exc)}]; placeholder.markdown(answer); _render_tool_calls(tool_calls)
+        state_after=vcs.checkpoint(f"After chat turn: {user_text[:48]}")
+        assistant_message={"role":"assistant","content":answer,"tool_calls":tool_calls,"turn_id":turn_id}
+        effects={"draft_ids":[d.get("id") for d in drafts if isinstance(d,dict)],"tool_count":len(calls)}
+        if replacing_turn_id:
+            refreshed=sessions.fork_turn(
+                st.session_state.chat_session_id,
+                replacing_turn_id,
+                user_message,
+                assistant_message,
+                state_before=state_before,
+                state_after=state_after,
+                effects=effects,
+                turn_id=turn_id,
+                title_from=user_text,
+            )
+        else:
+            refreshed=sessions.append_turn(
+                st.session_state.chat_session_id,
+                user_message,
+                assistant_message,
+                title_from=user_text,
+                parent_id=parent_id,
+                state_before=state_before,
+                state_after=state_after,
+                effects=effects,
+                turn_id=turn_id,
+            )
+        active_drafts=[]
+        for active_tid in sessions.lineage_ids_data(refreshed):
+            active_drafts.extend(((refreshed.get("turns") or {}).get(active_tid,{}).get("effects") or {}).get("draft_ids") or [])
+        DraftManager(store).set_session_active_drafts(st.session_state.chat_session_id, active_drafts)
+        st.session_state.messages=refreshed.get("messages",[])
+
     with chat_col:
-        # ------------------------------------------------------------------
-        # ONE bounded scrolling transcript.
-        # ------------------------------------------------------------------
-
-        chat_box = st.container(
-            height=350,
-            border=False,
-        )
-
+        chat_box=st.container(height=350,border=False)
+        current_session=sessions.load(st.session_state.chat_session_id) or session
+        active_ids=current_session and sessions.lineage_ids_data(current_session) or []
         with chat_box:
-            if not st.session_state.messages:
-                st.markdown(
-                    "Start a task. You can ask the agent to "
-                    "create, inspect, edit, move, copy, or delete "
-                    "project files without uploading anything first."
-                )
+            if not active_ids:
+                st.markdown("Start a task. You can ask the agent to create, inspect, edit, move, copy, or delete project files without uploading anything first.")
+            for tid in active_ids:
+                turn=current_session["turns"][tid]
+                with st.chat_message("user"):
+                    st.markdown((turn.get("user") or {}).get("content",""))
+                    parent=turn.get("parent_id")
+                    siblings=[x for x in (current_session.get("turns") or {}).values() if x.get("parent_id")==parent]
+                    cols=st.columns([1,1,6])
+                    if cols[0].button("Edit",key=f"edit_{tid}"):
+                        st.session_state[f"editing_{tid}"]=True
+                    if len(siblings)>1:
+                        idx=next((i for i,x in enumerate(siblings) if x.get("id")==tid),0)
+                        cols[1].caption(f"{idx+1}/{len(siblings)}")
+                    if st.session_state.get(f"editing_{tid}"):
+                        edited=st.text_area("Edit prompt",value=(turn.get("user") or {}).get("content",""),key=f"edit_text_{tid}")
+                        ec1,ec2=st.columns(2)
+                        if ec1.button("Submit edit",key=f"submit_edit_{tid}"):
+                            st.session_state["pending_chat_edit"]={"turn_id":tid,"text":edited}; st.session_state[f"editing_{tid}"]=False; st.rerun()
+                        if ec2.button("Cancel",key=f"cancel_edit_{tid}"):
+                            st.session_state[f"editing_{tid}"]=False; st.rerun()
+                with st.chat_message("assistant"):
+                    a=turn.get("assistant") or {}; st.markdown(a.get("content","")); _render_tool_calls(a.get("tool_calls",[]))
+                    # Switch among sibling branches without deleting either branch.
+                    siblings=[x for x in (current_session.get("turns") or {}).values() if x.get("parent_id")==turn.get("parent_id")]
+                    if len(siblings)>1:
+                        labels=[((x.get("user") or {}).get("content","")[:35] or x["id"][:8]) for x in siblings]
+                        chosen=st.selectbox("Branch",range(len(siblings)),format_func=lambda i:labels[i],index=next((i for i,x in enumerate(siblings) if x["id"]==tid),0),key=f"branch_{tid}",label_visibility="collapsed")
+                        if siblings[chosen]["id"]!=tid:
+                            _activate_turn(siblings[chosen]["id"]); st.rerun()
 
-            for m in st.session_state.messages:
-                with st.chat_message(
-                    m["role"]
-                ):
-                    st.markdown(
-                        m.get(
-                            "content",
-                            "",
-                        )
-                    )
-
-                    # ------------------------------------------------------
-                    # Persisted tool trace.
-                    #
-                    # Existing messages without tool_calls simply render
-                    # normally.
-                    # ------------------------------------------------------
-                    _render_tool_calls(
-                        m.get(
-                            "tool_calls",
-                            [],
-                        )
-                    )
-
-        # ------------------------------------------------------------------
-        # Chat input deliberately remains OUTSIDE the scrolling container.
-        # ------------------------------------------------------------------
-
-        prompt = st.chat_input(
-            "Ask a question or give the agent a task…"
-        )
-
-        if prompt:
-            # --------------------------------------------------------------
-            # Persist the user message immediately.
-            # --------------------------------------------------------------
-
-            user_message = {
-                "role": "user",
-                "content": prompt,
-            }
-
-            st.session_state.messages.append(
-                user_message
-            )
-
-            session = (
-                sessions.load(
-                    st.session_state.chat_session_id
-                )
-                or session
-            )
-
-            session["messages"] = (
-                st.session_state.messages
-            )
-
-            if session.get("title") == "New chat":
-                session["title"] = (
-                    prompt[:60].strip()
-                    or "New chat"
-                )
-
-            sessions.save(
-                session
-            )
-
-            # --------------------------------------------------------------
-            # Current turn is rendered into chat_box too.
-            # --------------------------------------------------------------
-
+        pending=st.session_state.pop("pending_chat_edit",None)
+        if pending:
             with chat_box:
-                with st.chat_message(
-                    "user"
-                ):
-                    st.markdown(
-                        prompt
-                    )
+                with st.chat_message("assistant"):
+                    _run_chat_turn(pending["text"],replacing_turn_id=pending["turn_id"])
+            st.rerun()
 
-                with st.chat_message(
-                    "assistant"
-                ):
-                    placeholder = st.empty()
-
-                    stream_state = {
-                        "rendered": "",
-                        "plan": None,
-                        "done": [],
-                    }
-
-                    def _render_plan():
-                        lines = [
-                            (
-                                f"- "
-                                f"{'✅' if i < len(stream_state.get('done', [])) else '⏳'} "
-                                f"{title}"
-                            )
-                            for i, title in enumerate(
-                                stream_state["plan"]
-                            )
-                        ]
-
-                        return (
-                            "**Planned sections:**\n"
-                            + "\n".join(lines)
-                        )
-
-                    def _on_section(event):
-                        if event["type"] == "plan":
-                            stream_state["plan"] = (
-                                event["sections"]
-                            )
-
-                            stream_state["done"] = []
-
-                            placeholder.markdown(
-                                _render_plan()
-                            )
-
-                        elif event["type"] == "section":
-                            if (
-                                stream_state["plan"]
-                                is not None
-                            ):
-                                stream_state["done"].append(
-                                    event["title"]
-                                )
-
-                            stream_state["rendered"] += (
-                                (
-                                    "\n\n"
-                                    if stream_state["rendered"]
-                                    else ""
-                                )
-                                + event["content"]
-                            )
-
-                            placeholder.markdown(
-                                stream_state["rendered"]
-                            )
-
-                    calls = []
-                    drafts = []
-                    answer = ""
-
-                    try:
-                        with st.spinner(
-                            "Executing…"
-                        ):
-                            set_current_project(
-                                store
-                            )
-
-                            tools = build_default_tools(
-                                username,
-                                store,
-                                include_cognition=True,
-                            )
-
-                            answer, calls, drafts = run_agent(AgentRunContext(
-                                transcript=st.session_state.messages,
-                                tools=tools,
-                                cognition=store,
-                                project_id=store.project_id,
-                                session_id=st.session_state.chat_session_id,
-                                on_section=_on_section,
-                                agent_id=(st.session_state.get("active_agent_id") or None),
-                            ))
-
-                    except Exception as exc:
-                        # --------------------------------------------------
-                        # IMPORTANT:
-                        # Preserve the failure in the assistant message
-                        # instead of letting it appear detached below the
-                        # chat input.
-                        # --------------------------------------------------
-
-                        error_text = (
-                            "The agent encountered an error while "
-                            "executing this request."
-                        )
-
-                        if stream_state["rendered"]:
-                            answer = (
-                                stream_state["rendered"]
-                                + "\n\n"
-                                + error_text
-                            )
-                        else:
-                            answer = error_text
-
-                        calls = calls or []
-
-                        tool_calls = _serialise_tool_calls(
-                            calls
-                        )
-
-                        if exc:
-                            tool_calls.append(
-                                {
-                                    "tool": "agent_error",
-                                    "args": {},
-                                    "result": str(exc),
-                                }
-                            )
-
-                        placeholder.markdown(
-                            answer
-                        )
-
-                        _render_tool_calls(
-                            tool_calls
-                        )
-
-                    else:
-                        final_text = (
-                            answer.strip()
-                            if answer
-                            and answer.strip()
-                            else (
-                                stream_state["rendered"]
-                                or (
-                                    _render_plan()
-                                    + "\n\n⚠️ No sections were "
-                                    "delivered before the model stopped."
-                                    if stream_state.get("plan")
-                                    else
-                                    "⚠️ The agent produced no response "
-                                    "for this turn. Try again."
-                                )
-                            )
-                        )
-
-                        placeholder.markdown(
-                            final_text
-                        )
-
-                        answer = final_text
-
-                        # --------------------------------------------------
-                        # Convert the runtime trace into persistent data.
-                        # --------------------------------------------------
-
-                        tool_calls = _serialise_tool_calls(
-                            calls
-                        )
-
-                        # --------------------------------------------------
-                        # Show the same trace immediately for the current
-                        # response.
-                        # --------------------------------------------------
-
-                        _render_tool_calls(
-                            tool_calls
-                        )
-
-                        if drafts:
-                            ids = ", ".join(
-                                f"`{d['id'][:8]}`"
-                                for d in drafts
-                            )
-
-                            st.info(
-                                f"{'Draft' if len(drafts) == 1 else 'Drafts'} "
-                                f"created: {ids}. Review "
-                                f"{'it' if len(drafts) == 1 else 'them'} "
-                                "in the Review tab before "
-                                f"{'it' if len(drafts) == 1 else 'they'} "
-                                "can affect /source."
-                            )
-
-                    # ------------------------------------------------------
-                    # CRITICAL:
-                    # Store tool_calls WITH the assistant message.
-                    # ------------------------------------------------------
-
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": answer,
-                        "tool_calls": tool_calls,
-                    }
-
-                    st.session_state.messages.append(
-                        assistant_message
-                    )
-
-                    # ------------------------------------------------------
-                    # Persist the complete message, including execution
-                    # trace.
-                    # ------------------------------------------------------
-
-                    session["messages"] = (
-                        st.session_state.messages
-                    )
-
-                    sessions.save(
-                        session
-                    )
-
-            # --------------------------------------------------------------
-            # Rerender so the newly-created assistant message becomes part
-            # of the persistent transcript on the next Streamlit run.
-            # --------------------------------------------------------------
-
+        prompt=st.chat_input("Ask a question or give the agent a task…")
+        if prompt:
+            with chat_box:
+                with st.chat_message("user"): st.markdown(prompt)
+                with st.chat_message("assistant"): _run_chat_turn(prompt)
             st.rerun()
 
     if preview_enabled:
@@ -1711,33 +1527,32 @@ if nav_section == "cognition":
 
     state = store.state_map()
 
-    # Keep one placeholder per canonical kind so compilation callbacks can
-    # refresh the visible totals without waiting for a full Streamlit rerun.
-    metric_slots = {}
-    metric_labels = (
-        ("entities", "Entities"),
-        ("relationships", "Relationships"),
-        ("events", "Events"),
-        ("locations", "Locations"),
-        ("concepts", "Concepts"),
-        ("definitions", "Definitions"),
-        ("knowledge", "Knowledge"),
+    a, b, c = st.columns(3)
+
+    a.metric(
+        "Entities",
+        len(
+            state.get(
+                "entities",
+                {}
+            )
+        ),
     )
-    row1 = st.columns(4)
-    row2 = st.columns(4)
-    for idx, (kind, label) in enumerate(metric_labels):
-        column = (row1 + row2)[idx]
-        metric_slots[kind] = column.empty()
-    version_slot = (row1 + row2)[7].empty()
 
-    def render_cognition_metrics():
-        counts = store.cognition_counts()
-        for kind, label in metric_labels:
-            metric_slots[kind].metric(label, counts.get(kind, 0))
-        version_slot.metric("Version", store.state_map().get("current_version", 0))
-        return counts
+    b.metric(
+        "Version",
+        state.get(
+            "current_version",
+            0,
+        ),
+    )
 
-    render_cognition_metrics()
+    c.metric(
+        "Relationships",
+        len(
+            store.relationships()
+        ),
+    )
 
     if st.session_state.get(
         "compile_success_msg"
@@ -1816,24 +1631,32 @@ if nav_section == "cognition":
             disabled=not chosen,
         ):
             try:
-                progress = st.progress(0)
+                progress_box = st.empty()
+                status_box = st.empty()
+
+                progress = st.progress(
+                    0
+                )
+
                 status = st.empty()
 
-                def on_progress(done, total):
-                    progress.progress(done / total if total else 0)
-                    # Canonical files are merged segment-by-segment. Read their
-                    # live totals here so the Cognition dashboard changes while
-                    # compilation is running, not only after st.rerun().
-                    counts = render_cognition_metrics()
-                    status.info(
-                        f"Compiling batch {done}/{total} · "
-                        f"{counts.get('entities', 0)} entities · "
-                        f"{counts.get('relationships', 0)} relationships · "
-                        f"{counts.get('events', 0)} events · "
-                        f"{counts.get('concepts', 0)} concepts"
+                def on_progress(
+                    done,
+                    total,
+                ):
+                    progress.progress(
+                        done / total
+                        if total
+                        else 0
                     )
 
-                status.info("Compilation started — preparing source...")
+                    status.info(
+                        f"Compiling batch {done}/{total}"
+                    )
+
+                status.info(
+                    "Compilation started — preparing source..."
+                )
 
                 result = compile_project(
                     store,
@@ -1841,9 +1664,13 @@ if nav_section == "cognition":
                     progress_callback=on_progress,
                 )
 
-                progress.progress(1.0)
-                render_cognition_metrics()
-                status.success("Compilation complete.")
+                progress_box.progress(
+                    1.0
+                )
+
+                status_box.success(
+                    "Compilation complete."
+                )
 
                 st.session_state[
                     "compile_success_msg"

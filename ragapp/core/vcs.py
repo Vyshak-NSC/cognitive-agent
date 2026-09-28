@@ -82,6 +82,37 @@ class VCSManager:
         """Persist the exact current versioned tree before a mutation."""
         return self.commit(str(message), bind_timeline=False)
 
+    def head(self):
+        """Return the current project-state commit, creating no history."""
+        self.init()
+        return self._run("rev-parse", "HEAD") if self._has_head() else None
+
+    def materialize_state(self, commit, *, message=None):
+        """Materialize a historical project state as a new forward commit.
+
+        Conversation branching uses this instead of reset/checkout history
+        rewriting. The current tree is checkpointed first, then the selected
+        commit's versioned areas become the working state and are committed as
+        a new revision. Sessions are deliberately outside the versioned areas.
+        """
+        if not commit:
+            return {"commit": self.head(), "restored_from": None}
+        self.init()
+        self.checkpoint("Pre conversation-branch switch")
+        # Remove current tracked versioned content so files absent in the target
+        # revision are removed too, then restore the target tree.
+        import shutil
+        for area in self.VERSIONED_AREAS:
+            target=self.root/area
+            if target.exists(): shutil.rmtree(target)
+            target.mkdir(parents=True,exist_ok=True)
+        tree_paths=set(self._run("ls-tree", "-d", "--name-only", str(commit)).splitlines())
+        for area in self.VERSIONED_AREAS:
+            if area in tree_paths:
+                subprocess.run(["git","checkout",str(commit),"--",area],cwd=self.root,check=True,capture_output=True,text=True)
+        new_commit=self.commit(message or f"Activate conversation state {str(commit)[:12]}",bind_timeline=False)
+        return {"commit":new_commit,"restored_from":str(commit)}
+
     # Backwards-compatible name used by approval code.
     def backup_authoritative_state(self, message="Pre-state backup"):
         return self.checkpoint(message)

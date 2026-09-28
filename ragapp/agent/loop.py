@@ -499,6 +499,8 @@ def run_agent(context: AgentRunContext):
     cognition = context.cognition
     project_id = context.project_id
     session_id = context.session_id
+    turn_id = context.turn_id
+    active_turn_ids = list(context.active_turn_ids or [])
     on_section = context.on_section
     max_steps = context.max_steps if context.max_steps is not None else MAX_AGENT_STEPS
     LOGGER.info(
@@ -701,17 +703,11 @@ def run_agent(context: AgentRunContext):
                     ),
                 )
                 try:
-                    SessionMemory(
-                        cognition
-                    ).distill(
+                    SessionMemory(cognition).distill(
                         session_id or "unknown",
-                        transcript
-                        + [
-                            {
-                                "role": "assistant",
-                                "content": text,
-                            }
-                        ],
+                        transcript + [{"role": "assistant", "content": text, "turn_id": turn_id}],
+                        turn_id=turn_id,
+                        active_turn_ids=active_turn_ids or None,
                     )
                 except Exception:
                     pass
