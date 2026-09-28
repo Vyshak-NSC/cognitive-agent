@@ -152,6 +152,80 @@ class ProjectFileService:
         commit = self._commit(desc)
         return {"source": f"{src_area}/{src_relative}", "destination": f"{dst_area}/{dst_relative}", "status": "copied", "pre_commit": pre, "commit": commit}
 
+    def delete_many(self, area, relatives, description=None):
+        """Delete multiple files/folders as one recoverable Git transition."""
+        unique = list(dict.fromkeys(str(x) for x in relatives))
+        if not unique:
+            return {"area": area, "status": "unchanged", "count": 0, "commit": None}
+        paths = [(rel, self.path(area, rel)) for rel in unique]
+        for rel, p in paths:
+            if not p.exists():
+                raise FileNotFoundError(rel)
+        desc = description or f"delete {len(paths)} item(s) from {area}"
+        pre = self._checkpoint(desc)
+        for _, p in paths:
+            if not p.exists():
+                continue
+            shutil.rmtree(p) if p.is_dir() else p.unlink()
+        commit = self._commit(desc)
+        return {"area": area, "status": "deleted", "count": len(paths), "pre_commit": pre, "commit": commit}
+
+    def copy_many(self, src_area, relatives, dst_area, dst_folder="", description=None):
+        """Copy multiple files/folders into one destination as one Git transition."""
+        unique = list(dict.fromkeys(str(x) for x in relatives))
+        if not unique:
+            return {"status": "unchanged", "count": 0, "commit": None}
+        dst_root = self.path(dst_area, dst_folder)
+        if dst_root.exists() and not dst_root.is_dir():
+            raise ValueError("Destination must be a folder.")
+        prepared = []
+        for rel in unique:
+            src = self.path(src_area, rel)
+            if not src.exists():
+                raise FileNotFoundError(rel)
+            dst = dst_root / src.name
+            dst.relative_to(self.root(dst_area))
+            if dst.exists():
+                raise FileExistsError(dst.relative_to(self.root(dst_area)).as_posix())
+            if src.is_dir() and (dst == src or src in dst.parents):
+                raise ValueError("Cannot copy a folder into itself.")
+            prepared.append((src, dst))
+        desc = description or f"copy {len(prepared)} item(s) from {src_area} to {dst_area}"
+        pre = self._checkpoint(desc)
+        for src, dst in prepared:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dst) if src.is_dir() else shutil.copy2(src, dst)
+        commit = self._commit(desc)
+        return {"status": "copied", "count": len(prepared), "pre_commit": pre, "commit": commit}
+
+    def move_many(self, src_area, relatives, dst_area, dst_folder="", description=None):
+        """Move multiple files/folders into one destination as one Git transition."""
+        unique = list(dict.fromkeys(str(x) for x in relatives))
+        if not unique:
+            return {"status": "unchanged", "count": 0, "commit": None}
+        dst_root = self.path(dst_area, dst_folder)
+        if dst_root.exists() and not dst_root.is_dir():
+            raise ValueError("Destination must be a folder.")
+        prepared = []
+        for rel in unique:
+            src = self.path(src_area, rel)
+            if not src.exists():
+                raise FileNotFoundError(rel)
+            dst = dst_root / src.name
+            dst.relative_to(self.root(dst_area))
+            if dst.exists():
+                raise FileExistsError(dst.relative_to(self.root(dst_area)).as_posix())
+            if src.is_dir() and (dst == src or src in dst.parents):
+                raise ValueError("Cannot move a folder into itself.")
+            prepared.append((src, dst))
+        desc = description or f"move {len(prepared)} item(s) from {src_area} to {dst_area}"
+        pre = self._checkpoint(desc)
+        for src, dst in prepared:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+        commit = self._commit(desc)
+        return {"status": "moved", "count": len(prepared), "pre_commit": pre, "commit": commit}
+
     def history(self, area, relative, limit=50):
         return self.vcs.file_history(self.repo_path(area, relative), limit=limit)
 

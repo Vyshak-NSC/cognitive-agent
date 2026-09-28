@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -188,10 +192,40 @@ class CognitionStore:
             return default
 
     def _write_json(self, path: Path, value):
+        """Atomically write JSON, tolerating short-lived Windows file locks.
+
+        A fixed ``*.tmp`` name allows concurrent writers to collide, and on
+        Windows ``Path.replace`` can transiently fail while antivirus/indexing
+        software or another process has the destination open.  Use a unique
+        sibling temp file and bounded retries; never leave the canonical file
+        half-written.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        payload = json.dumps(value, indent=2, ensure_ascii=False)
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            last_error = None
+            for attempt in range(8):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except PermissionError as exc:
+                    last_error = exc
+                    # A stale read-only bit can also produce WinError 5.
+                    if path.exists():
+                        try:
+                            path.chmod(path.stat().st_mode | stat.S_IWRITE)
+                        except OSError:
+                            pass
+                    time.sleep(0.025 * (2 ** attempt))
+            raise last_error
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
 
     def _write_master(self, value):
         self._write_json(self.master_metadata_path, value)

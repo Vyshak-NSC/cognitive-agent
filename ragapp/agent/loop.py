@@ -27,7 +27,7 @@ from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
-from ragapp.agent.context_selector import ContextSelector
+from ragapp.agent.context_selector import ContextSelector, _looks_like_cognition_mutation, _requests_recompile
 from ragapp.agent.run_context import AgentRunContext
 from ragapp.tools.definitions import Tool
 from ragapp.logging_config import configure_logging
@@ -163,6 +163,43 @@ def _latest_user_query(transcript):
         if str(message.get("role", "")).lower() == "user":
             return str(message.get("content", "") or "").strip()
     return ""
+
+
+def _asserts_known_entity_state(query, cognition):
+    """Recognize a short declarative assertion about an entity already in cognition.
+
+    This is intentionally structural, not semantic: the semantic mutation engine still
+    decides what the assertion means and which connected cognition must change.
+    """
+    q = str(query or "").strip()
+    if not q or cognition is None or not cognition.exists():
+        return False
+    lower = q.lower()
+    if "?" in q or re.match(r"^(what|who|why|how|when|where|is|are|does|do|can|could|would|should)\b", lower):
+        return False
+    # Remove an operational compile clause; the remaining declarative clause may be
+    # an authoritative correction (e.g. "Ash is 22. recompile").
+    semantic_text = re.sub(r"(?i)\b(recompile|re-compile|compile|rebuild|reingest|re-ingest)\b.*$", "", q).strip(" .;,:")
+    if not semantic_text or not re.search(r"(?i)\b(is|are|has|have|became|becomes|was|were)\b", semantic_text):
+        return False
+    try:
+        entity_ids = sorted((cognition.master_metadata().get("entities") or {}).keys())
+        for entity_id in entity_ids:
+            entity = cognition._read_entity(entity_id) or {}
+            names = {str(entity_id), str(entity.get("name") or "")}
+            for name in names:
+                name = name.strip().lower()
+                if name and re.search(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", semantic_text.lower()):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _semantic_change_text(query):
+    """Remove compile-only wording before sending a compound command to mutation planning."""
+    text = re.sub(r"(?i)\b(recompile|re-compile|compile|rebuild|reingest|re-ingest)\b.*$", "", str(query or "")).strip(" .;,:")
+    return text or str(query or "").strip()
 
 
 def _prefetch_cognition(cognition, transcript, max_chars=8000, limit=8):
@@ -532,6 +569,56 @@ def run_agent(context: AgentRunContext):
         selection = {"tool_names": [], "modules": [], "instructions": [], "prefetched": None, "intent": "conversation", "intent_score": 0.0, "mode": "simple_chat"}
     else:
         selection = selector.select(query)
+
+    # Cognition mutation and explicit recompilation are execution contracts, not
+    # optional model behaviours. Apply them before the conversational model turn.
+    # This prevents current cognition from talking the model out of a user correction
+    # and prevents fabricated/stale source paths from being passed to the compiler.
+    explicit_cognition_mutation = (
+        _looks_like_cognition_mutation(query)
+        or _asserts_known_entity_state(query, cognition)
+    )
+    explicit_recompile = _requests_recompile(query)
+    cognition_mutation_result = None
+    recompile_result = None
+    if explicit_cognition_mutation:
+        if cognition is None or not cognition.exists():
+            cognition_mutation_result = {"status": "error", "error": "cognition store does not exist"}
+        else:
+            try:
+                from ragapp.cognition.merge import apply_semantic_mutation
+                change_text = _semantic_change_text(query)
+                cognition_mutation_result = apply_semantic_mutation(
+                    cognition, [change_text], source_label=f"user:{project_id}"
+                )
+            except Exception as exc:
+                LOGGER.exception("Explicit cognition mutation failed project=%s", project_id)
+                cognition_mutation_result = {"status": "error", "error": str(exc)}
+        _record_tool_call(
+            calls, "cognition.semantic_mutation",
+            {"requested_change": _semantic_change_text(query)}, cognition_mutation_result,
+        )
+
+    if explicit_recompile and not explicit_cognition_mutation:
+        # A semantic mutation already recompiles its supporting authoritative
+        # source under the new state. Do not immediately compile the same source
+        # a second time for compound requests such as "Ash is 22. recompile".
+        # Standalone recompile still resolves the real current /source tree.
+        try:
+            recompile_result = _json_safe(registry.call("recompile_source", {}))
+        except Exception as exc:
+            LOGGER.exception("Explicit recompile failed project=%s", project_id)
+            recompile_result = {"status": "error", "error": str(exc)}
+        _record_tool_call(calls, "recompile_source", {}, recompile_result)
+    elif explicit_recompile and explicit_cognition_mutation:
+        if isinstance(cognition_mutation_result, dict):
+            recompile_result = _json_safe(cognition_mutation_result.get("recompilation"))
+
+    # Selection/prefetch was computed before the mutation. Refresh it after a
+    # successful mutation so the model cannot be shown stale pre-mutation state.
+    if explicit_cognition_mutation and isinstance(cognition_mutation_result, dict) and cognition_mutation_result.get("status") == "applied":
+        selection = selector.select(query)
+
     selected_modules = list(selection.get("modules") or [])
     selected_modules.extend(context.agent_guidance())
     execution_intent = selection.get("intent") == "project_mutation"
@@ -543,6 +630,16 @@ def run_agent(context: AgentRunContext):
             "Do not stop at a plan, example, or offer to implement."
         )
     system_instruction = _build_system_instruction(selection.get("instructions"), selected_modules)
+    if cognition_mutation_result is not None:
+        system_instruction += (
+            "\n\nRUNTIME COGNITION MUTATION RESULT (already executed; report only this actual result):\n"
+            + json.dumps(_json_safe(cognition_mutation_result), ensure_ascii=False)
+        )
+    if recompile_result is not None:
+        system_instruction += (
+            "\n\nRUNTIME RECOMPILE RESULT (already executed against the actual current /source tree; report only this actual result):\n"
+            + json.dumps(_json_safe(recompile_result), ensure_ascii=False)
+        )
     prefetched = selection.get("prefetched")
     if prefetched and prefetched.get("requests"):
         calls.append({
@@ -619,6 +716,14 @@ def run_agent(context: AgentRunContext):
         # Model finished
         # ----------------------------------------------------------
         if not step["function_calls"]:
+            # Explicit cognition/recompile commands may only be reported as successful
+            # when the runtime operation above actually succeeded.
+            if explicit_cognition_mutation and (not isinstance(cognition_mutation_result, dict) or cognition_mutation_result.get("status") not in {"applied", "ok", "success"}):
+                error = (cognition_mutation_result or {}).get("error") if isinstance(cognition_mutation_result, dict) else "unknown error"
+                return (f"I could not apply the requested cognition update: {error}", calls, [])
+            if explicit_recompile and (not isinstance(recompile_result, dict) or recompile_result.get("status") not in {"compiled", "ok", "success"}):
+                error = (recompile_result or {}).get("error") if isinstance(recompile_result, dict) else "unknown error"
+                return (f"I could not recompile the project cognition: {error}", calls, [])
             # A project mutation request is executable work. The base runtime does
             # not allow the first model turn to downgrade it into advice, a plan,
             # or a request for files that the project tools can inspect directly.

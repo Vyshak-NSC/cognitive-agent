@@ -62,16 +62,17 @@ def _mutation_prompt(request, context, source_recompile=False):
         "explanation": "short transaction rationale",
     }
     source_rule = (
-        "\n7. Supporting source will be recompiled under this authoritative change after primitive mutation. "
-        "Do NOT rewrite derived summaries, descriptions, or whole knowledge structures merely to propagate the change; "
-        "the compiler will regenerate/reconcile those semantics. Emit only the primitive authoritative mutation(s) "
-        "the user actually requested (for example state_update, delete_object, or a directly requested relationship/object edit)."
+        "\n7. Supporting source will be recompiled under this authoritative change. That does NOT remove your responsibility "
+        "to emit semantic consequences in connected canonical cognition. If the requested change makes a relationship, "
+        "summary, state, concept, event, or knowledge claim false or incomplete, emit the minimal operation needed to "
+        "reconcile it. The source remains evidence, not authority over the newer user-approved current state."
         if source_recompile else ""
     )
     instructions = (
         "You are applying an explicit user-approved mutation to persistent canonical cognition.\n"
-        "The requested change is authoritative for this transaction. Determine ALL semantic consequences inside the supplied connected cognition. "
-        "Do not invent unrelated changes. Preserve historical facts when the request changes current state; delete historical material only when the user explicitly requests deletion/erasure of the object or fact itself.\n"
+        "The requested change is authoritative for this transaction. Existing canonical cognition is the PRE-MUTATION state to transform, never a reason to reject or argue against the requested change. "
+        "Determine ALL semantic consequences inside the supplied connected cognition. If a current relationship, ordering, summary, label, or derived claim contradicts what follows from the authoritative new state plus unchanged connected facts, you MUST reconcile that claim in this transaction; do not require the user to name the consequence separately. "
+        "Do not invent unrelated changes. Preserve superseded facts as history/provenance when appropriate, but never preserve them as current truth. Preserve historical facts when the request changes current state; delete historical material only when the user explicitly requests deletion/erasure of the object or fact itself.\n"
         "Return ONLY JSON matching the supplied schema.\n"
         "Rules:\n"
         "1. If an entity is explicitly deleted entirely, emit delete_object for it and semantic edits/deletions for connected cognition whose meaning becomes false or incomplete.\n"
@@ -79,7 +80,8 @@ def _mutation_prompt(request, context, source_recompile=False):
         "3. replace_fields deliberately rewrites ONLY named top-level fields. Use it when old derived prose/state is no longer true.\n"
         "4. state_update is for durable entity attribute evolution, not erasure.\n"
         "5. Keep operations minimal but complete across relationships, events, knowledge, concepts and summaries that are semantically affected.\n"
-        "6. Never modify provenance merely to hide the origin of retained knowledge."
+        "6. Never modify provenance merely to hide the origin of retained knowledge.\n"
+        "7. Treat every current claim in the connected cognition as subject to reconciliation. Any claim whose truth, meaning, validity, or completeness depends on changed state must be updated, invalidated, or removed when the resulting state no longer supports it."
         + source_rule
     )
     return (
@@ -88,6 +90,77 @@ def _mutation_prompt(request, context, source_recompile=False):
         + "\n\nUSER-APPROVED CHANGE:\n" + str(request)
         + "\n\nCONNECTED CANONICAL COGNITION:\n" + json.dumps(context, ensure_ascii=False, default=str)
     )
+
+
+def _verification_prompt(request, context):
+    """Ask the semantic model to verify closure of the resulting connected state."""
+    schema = {
+        "valid": True,
+        "conflicts": [{"kind": "...", "id": "...", "reason": "..."}],
+        "operations": [
+            {"operation": "delete_object", "kind": "entity|relationship|event|location|concept|definition|knowledge", "id": "...", "reason": "..."},
+            {"operation": "state_update", "entity": "...", "field": "...", "new": None, "reason": "...", "timeline": None},
+            {"operation": "replace_fields", "kind": "entity|relationship|event|location|concept|definition|knowledge", "id": "...", "fields": {}, "reason": "..."},
+            {"operation": "upsert_entity", "id": "...", "data": {}, "reason": "..."},
+            {"operation": "upsert_object", "kind": "relationship|event|location|concept|definition|knowledge", "id": "...", "data": {}, "reason": "..."},
+        ],
+    }
+    instructions = (
+        "Verify semantic closure after an authoritative cognition mutation. "
+        "The requested mutation is authoritative current state. Inspect ALL supplied connected cognition, not only directly edited objects. "
+        "A result is valid only when no current claim is false, contradictory, stale, or materially incomplete as a consequence of the mutation together with unchanged connected facts. "
+        "Do not defend pre-mutation cognition against the mutation. Do not require the user to enumerate consequences. "
+        "If invalid, return the minimal repair operations needed to make the connected current state semantically consistent. "
+        "Do not invent unrelated changes. Preserve historical/provenance evidence unless it is itself claimed as current state. "
+        "Set valid=true only when no repair operation is required. Return ONLY JSON matching the schema."
+    )
+    return (
+        instructions
+        + "\n\nSCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
+        + "\n\nAUTHORITATIVE MUTATION:\n" + str(request)
+        + "\n\nRESULTING CONNECTED COGNITION:\n" + json.dumps(context, ensure_ascii=False, default=str)
+    )
+
+
+def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit, max_context_chars, max_passes=3):
+    """Bounded generic semantic invariant: verify -> repair -> reverify."""
+    applied = []
+    reports = []
+    generator = _semantic_generator(store)
+    for pass_no in range(1, max_passes + 1):
+        context = _semantic_context(store, request, max_chars=max_context_chars)
+        report = json.loads(generator(_verification_prompt(request, context)))
+        if not isinstance(report, dict) or not isinstance(report.get("operations", []), list):
+            raise ValueError("semantic verification returned an invalid result")
+        reports.append({
+            "pass": pass_no,
+            "valid": bool(report.get("valid")),
+            "conflicts": list(report.get("conflicts") or []),
+            "operations_requested": len(report.get("operations") or []),
+        })
+        operations = list(report.get("operations") or [])
+        if bool(report.get("valid")) and not operations:
+            return applied, reports
+        if not operations:
+            raise RuntimeError("semantic verification found unresolved conflicts but produced no repair operations")
+        repaired, rejected = _apply_semantic_operations(store, operations, source_label, pre_commit)
+        if rejected:
+            raise RuntimeError("semantic verification repair contained rejected operations: " + json.dumps(rejected, ensure_ascii=False))
+        applied.extend(repaired)
+    # Never commit a mutation merely because the repair budget was exhausted.
+    context = _semantic_context(store, request, max_chars=max_context_chars)
+    final = json.loads(generator(_verification_prompt(request, context)))
+    if not isinstance(final, dict):
+        raise ValueError("final semantic verification returned an invalid result")
+    reports.append({
+        "pass": max_passes + 1,
+        "valid": bool(final.get("valid")),
+        "conflicts": list(final.get("conflicts") or []),
+        "operations_requested": len(final.get("operations") or []),
+    })
+    if not bool(final.get("valid")) or final.get("operations"):
+        raise RuntimeError("semantic cognition mutation did not reach a consistent closed state: " + json.dumps(final.get("conflicts") or [], ensure_ascii=False))
+    return applied, reports
 
 
 def _strip_reference(value, deleted_kind, deleted_id):
@@ -290,9 +363,32 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
                 request,
                 files=source_files,
             )
+
+            # Re-plan once against the post-recompile graph, then enforce a
+            # generic semantic-closure invariant. The transaction is not allowed
+            # to commit while any connected current claim remains inconsistent
+            # with the authoritative mutation and unchanged connected state.
+            post_context = _semantic_context(store, request, max_chars=max_context_chars)
+            post_plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, post_context, source_recompile=False)))
+            if not isinstance(post_plan, dict) or not isinstance(post_plan.get("operations"), list):
+                raise ValueError("post-recompile semantic reconciliation returned an invalid operation plan")
+            post_applied, post_rejected = _apply_semantic_operations(store, post_plan.get("operations"), source_label, pre_commit)
+            if post_rejected:
+                raise RuntimeError("post-recompile semantic reconciliation contained rejected operations: " + json.dumps(post_rejected, ensure_ascii=False))
+            applied.extend(post_applied)
+
+            verification_applied, verification_reports = _verify_and_repair_semantic_closure(
+                store, request, source_label, pre_commit, max_context_chars
+            )
+            applied.extend(verification_applied)
+
             store.mark_compiled(); sync_store(store)
             git_commit = store.commit_authoritative_change("Apply semantic cognition mutation")
-            return {"status":"applied", "requested_changes":request, "affected":plan.get("affected") or [], "applied":applied, "explanation":plan.get("explanation", ""), "pre_state_git_commit":pre_commit, "git_commit":git_commit, "recompilation":recompilation}
+            affected = list(plan.get("affected") or [])
+            for item in post_plan.get("affected") or []:
+                if item not in affected:
+                    affected.append(item)
+            return {"status":"applied", "requested_changes":request, "affected":affected, "applied":applied, "explanation":post_plan.get("explanation") or plan.get("explanation", ""), "pre_state_git_commit":pre_commit, "git_commit":git_commit, "recompilation":recompilation, "post_reconciliation": {"performed": True, "operations": len(post_applied)}, "semantic_verification": {"performed": True, "repairs_applied": len(verification_applied), "passes": verification_reports}}
         except Exception:
             if store.cognition.exists(): shutil.rmtree(store.cognition)
             shutil.copytree(backup, store.cognition); sync_store(store); raise
