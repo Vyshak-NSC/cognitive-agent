@@ -73,21 +73,11 @@ class ChatSessionStore:
         s["active_leaf_id"]=tid
         if title_from and s.get("title")=="New chat": s["title"]=title_from[:60].strip() or "New chat"
         return self.save(s)
-    def fork_turn(self,session_id,replaced_turn_id,new_user_message,assistant_message,*,state_before=None,state_after=None,effects=None,turn_id=None,title_from=None):
+    def fork_turn(self,session_id,turn_id,new_user_message,assistant_message,*,state_before=None,state_after=None,effects=None):
         s=self.load(session_id)
-        if not s or replaced_turn_id not in s.get("turns",{}): raise KeyError(replaced_turn_id)
-        parent=s["turns"][replaced_turn_id].get("parent_id")
-        return self.append_turn(
-            session_id,
-            new_user_message,
-            assistant_message,
-            title_from=title_from,
-            parent_id=parent,
-            state_before=state_before,
-            state_after=state_after,
-            effects=effects,
-            turn_id=turn_id,
-        )
+        if not s or turn_id not in s.get("turns",{}): raise KeyError(turn_id)
+        parent=s["turns"][turn_id].get("parent_id")
+        return self.append_turn(session_id,new_user_message,assistant_message,parent_id=parent,state_before=state_before,state_after=state_after,effects=effects)
     def set_active_leaf(self,session_id,turn_id):
         s=self.load(session_id)
         if not s or turn_id not in s.get("turns",{}): raise KeyError(turn_id)
