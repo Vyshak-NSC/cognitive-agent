@@ -95,4 +95,5 @@ ragapp/visualization/__init__.py
 ragapp/visualization/mermaid.py
 ragapp/workspace/__init__.py
 ragapp/workspace/manager.py
+tests/test_chat_branching.py
 tests/test_document_cognition.py
