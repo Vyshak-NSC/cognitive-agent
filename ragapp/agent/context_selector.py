@@ -30,6 +30,13 @@ INTENT_RECORDS = {
             "project files without requesting that the project be changed."
         ),
     },
+    "cognition_mutation": {
+        "description": (
+            "The user is explicitly changing, correcting, updating, deleting, or asserting new canonical "
+            "project cognition such as an entity attribute, relationship, event, fact, world state, or canon. "
+            "This changes persistent cognition rather than project files."
+        ),
+    },
     "conversation": {
         "description": (
             "The user is asking a general question, discussing an idea, or requesting prose that "
@@ -138,6 +145,28 @@ def _looks_like_project_mutation(query: str) -> bool:
     return bool(target)
 
 
+def _looks_like_cognition_mutation(query: str) -> bool:
+    """Deterministic backstop for explicit canonical/cognition state changes."""
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    # Explicit requests to mutate the persistent semantic state.
+    cognition_target = re.search(
+        r"\b(cognition|canon|canonical|world state|project state|state|fact|relationship|entity|knowledge)\b",
+        q,
+    )
+    mutation = re.search(
+        r"\b(update|change|correct|set|make|replace|remove|delete|revise|apply|persist|remember)\b",
+        q,
+    )
+    return bool(cognition_target and mutation)
+
+
+def _requests_recompile(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    return bool(re.search(r"\b(recompile|re-compile|compile|rebuild|reingest|re-ingest)\b", q))
+
+
 class ContextSelector:
     def __init__(self, store, tools):
         self.store = store
@@ -195,10 +224,14 @@ class ContextSelector:
             # (for example, "how do beasts evolve"). The deterministic predicate
             # requires both a mutation verb and a project/code/UI target. Semantic
             # intent remains useful for non-mutating routing and prompt selection.
-            if _looks_like_project_mutation(query):
+            if _looks_like_cognition_mutation(query):
+                intent = "cognition_mutation"
+                intent_score = 1.0
+            elif _looks_like_project_mutation(query):
                 intent = "project_mutation"
                 intent_score = 1.0
-            elif intent == "project_mutation":
+            elif intent in {"project_mutation", "cognition_mutation"}:
+                # Mutation contracts are never activated by nearest-neighbour similarity alone.
                 intent = "conversation"
                 intent_score = 0.0
 

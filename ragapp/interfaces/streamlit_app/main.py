@@ -1521,175 +1521,107 @@ if nav_section == "files":
 # ===========================================================================
 
 if nav_section == "cognition":
-    st.subheader(
-        "Persistent cognition"
-    )
+    st.subheader("Persistent cognition")
 
     state = store.state_map()
+    counts = store.cognition_counts()
 
-    a, b, c = st.columns(3)
+    metric_slots = {}
+    row1 = st.columns(4)
+    row2 = st.columns(4)
+    metric_spec = [
+        ("entities", "Entities"),
+        ("relationships", "Relationships"),
+        ("events", "Events"),
+        ("locations", "Locations"),
+        ("concepts", "Concepts"),
+        ("definitions", "Definitions"),
+        ("knowledge", "Knowledge"),
+        ("version", "Version"),
+    ]
+    for col, (key, label) in zip(row1 + row2, metric_spec):
+        metric_slots[key] = col.empty()
+        value = state.get("current_version", 0) if key == "version" else counts.get(key, 0)
+        metric_slots[key].metric(label, value)
 
-    a.metric(
-        "Entities",
-        len(
-            state.get(
-                "entities",
-                {}
-            )
-        ),
-    )
-
-    b.metric(
-        "Version",
-        state.get(
-            "current_version",
-            0,
-        ),
-    )
-
-    c.metric(
-        "Relationships",
-        len(
-            store.relationships()
-        ),
-    )
-
-    if st.session_state.get(
-        "compile_success_msg"
-    ):
-        st.success(
-            st.session_state.pop(
-                "compile_success_msg"
-            )
-        )
-
+    if st.session_state.get("compile_success_msg"):
+        st.success(st.session_state.pop("compile_success_msg"))
     elif state.get("compiled"):
-        st.success(
-            "Cognition has been compiled from project artifacts."
-        )
-
+        st.success("Cognition has been compiled from project artifacts.")
     else:
         st.info(
-            "Cognition is ready but has not been compiled "
-            "from project artifacts. This does not block "
-            "chat or file work."
+            "Cognition is ready but has not been compiled from project artifacts. "
+            "This does not block chat or file work."
         )
 
-    available = list_available_files(
-        store
-    )
+    available = list_available_files(store)
 
     if not available:
-        st.caption(
-            "No files in Source or Workspace yet — "
-            "add some under the Files tab first."
-        )
-
+        st.caption("No files in Source or Workspace yet — add some under the Files tab first.")
     else:
-        labels = [
-            (
-                f"[{f['area']}] "
-                f"{f['path']}  ·  {f['size']}"
-            )
-            for f in available
-        ]
-
-        label_to_key = {
-            lbl: (
-                f["area"],
-                f["path"],
-            )
-            for lbl, f in zip(
-                labels,
-                available,
-            )
-        }
-
+        labels = [f"[{f['area']}] {f['path']}  ·  {f['size']}" for f in available]
+        label_to_key = {lbl: (f["area"], f["path"]) for lbl, f in zip(labels, available)}
         chosen_labels = st.multiselect(
-            "Files to compile",
-            labels,
-            default=labels,
-            key="compile_file_picker",
+            "Files to compile", labels, default=labels, key="compile_file_picker"
         )
-
-        chosen = [
-            label_to_key[l]
-            for l in chosen_labels
-        ]
-
+        chosen = [label_to_key[l] for l in chosen_labels]
         st.caption(
-            f"{len(chosen)} of {len(available)} "
-            "file(s) selected. Unselected files keep "
-            "whatever cognition was already compiled "
-            "from them — only the selected files are "
-            "(re)extracted and merged in this run."
+            f"{len(chosen)} of {len(available)} file(s) selected. Unselected files keep "
+            "their existing cognition; selected files are extracted and merged in this run."
         )
 
-        if st.button(
-            "Compile selected files",
-            type="primary",
-            disabled=not chosen,
-        ):
+        if st.button("Compile selected files", type="primary", disabled=not chosen):
             try:
-                progress_box = st.empty()
-                status_box = st.empty()
-
-                progress = st.progress(
-                    0
-                )
-
+                baseline = store.cognition_counts()
+                progress = st.progress(0, text="Preparing selected files…")
                 status = st.empty()
+                live = st.empty()
 
-                def on_progress(
-                    done,
-                    total,
-                ):
+                def render_live_counts(done, total):
+                    current = store.cognition_counts()
+                    for key, label in metric_spec:
+                        if key == "version":
+                            metric_slots[key].metric(label, store.state_map().get("current_version", 0))
+                            continue
+                        value = current.get(key, 0)
+                        delta = value - baseline.get(key, 0)
+                        metric_slots[key].metric(label, value, delta if delta else None)
+                    with live.container(border=True):
+                        st.caption("Live durable cognition")
+                        st.write(
+                            " · ".join(
+                                f"{label}: {current.get(key, 0)}"
+                                for key, label in metric_spec
+                                if key != "version"
+                            )
+                        )
                     progress.progress(
-                        done / total
-                        if total
-                        else 0
+                        done / total if total else 0,
+                        text=f"Compiling batch {done}/{total}" if total else "Compiling…",
                     )
-
                     status.info(
-                        f"Compiling batch {done}/{total}"
+                        f"Batch {done}/{total} merged into cognition. Counts above reflect durable state."
+                        if total else "Compiling cognition…"
                     )
 
-                status.info(
-                    "Compilation started — preparing source..."
-                )
-
+                status.info("Compilation started — preparing source…")
                 result = compile_project(
                     store,
                     selected_files=chosen,
-                    progress_callback=on_progress,
+                    progress_callback=render_live_counts,
                 )
-
-                progress_box.progress(
-                    1.0
+                final_counts = store.cognition_counts()
+                render_live_counts(1, 1)
+                progress.progress(1.0, text="Compilation complete")
+                status.success("Compilation complete.")
+                st.session_state["compile_success_msg"] = (
+                    f"Processed {result.get('source_files', 0)} source + "
+                    f"{result.get('workspace_files', 0)} workspace file(s). "
+                    + ", ".join(f"{k}: {v}" for k, v in final_counts.items())
                 )
-
-                status_box.success(
-                    "Compilation complete."
-                )
-
-                st.session_state[
-                    "compile_success_msg"
-                ] = (
-                    f"Processed "
-                    f"{result.get('source_files', 0)} "
-                    "source + "
-                    f"{result.get('workspace_files', 0)} "
-                    "workspace file(s) this run; "
-                    f"{result.get('entities', 0)} "
-                    "total entities now in cognition."
-                )
-
                 st.rerun()
-
             except Exception as exc:
-                st.error(
-                    str(exc)
-                )
+                st.error(str(exc))
 
     with st.expander(
         "Ledger",
