@@ -1711,32 +1711,33 @@ if nav_section == "cognition":
 
     state = store.state_map()
 
-    a, b, c = st.columns(3)
-
-    a.metric(
-        "Entities",
-        len(
-            state.get(
-                "entities",
-                {}
-            )
-        ),
+    # Keep one placeholder per canonical kind so compilation callbacks can
+    # refresh the visible totals without waiting for a full Streamlit rerun.
+    metric_slots = {}
+    metric_labels = (
+        ("entities", "Entities"),
+        ("relationships", "Relationships"),
+        ("events", "Events"),
+        ("locations", "Locations"),
+        ("concepts", "Concepts"),
+        ("definitions", "Definitions"),
+        ("knowledge", "Knowledge"),
     )
+    row1 = st.columns(4)
+    row2 = st.columns(4)
+    for idx, (kind, label) in enumerate(metric_labels):
+        column = (row1 + row2)[idx]
+        metric_slots[kind] = column.empty()
+    version_slot = (row1 + row2)[7].empty()
 
-    b.metric(
-        "Version",
-        state.get(
-            "current_version",
-            0,
-        ),
-    )
+    def render_cognition_metrics():
+        counts = store.cognition_counts()
+        for kind, label in metric_labels:
+            metric_slots[kind].metric(label, counts.get(kind, 0))
+        version_slot.metric("Version", store.state_map().get("current_version", 0))
+        return counts
 
-    c.metric(
-        "Relationships",
-        len(
-            store.relationships()
-        ),
-    )
+    render_cognition_metrics()
 
     if st.session_state.get(
         "compile_success_msg"
@@ -1815,32 +1816,24 @@ if nav_section == "cognition":
             disabled=not chosen,
         ):
             try:
-                progress_box = st.empty()
-                status_box = st.empty()
-
-                progress = st.progress(
-                    0
-                )
-
+                progress = st.progress(0)
                 status = st.empty()
 
-                def on_progress(
-                    done,
-                    total,
-                ):
-                    progress.progress(
-                        done / total
-                        if total
-                        else 0
-                    )
-
+                def on_progress(done, total):
+                    progress.progress(done / total if total else 0)
+                    # Canonical files are merged segment-by-segment. Read their
+                    # live totals here so the Cognition dashboard changes while
+                    # compilation is running, not only after st.rerun().
+                    counts = render_cognition_metrics()
                     status.info(
-                        f"Compiling batch {done}/{total}"
+                        f"Compiling batch {done}/{total} · "
+                        f"{counts.get('entities', 0)} entities · "
+                        f"{counts.get('relationships', 0)} relationships · "
+                        f"{counts.get('events', 0)} events · "
+                        f"{counts.get('concepts', 0)} concepts"
                     )
 
-                status.info(
-                    "Compilation started — preparing source..."
-                )
+                status.info("Compilation started — preparing source...")
 
                 result = compile_project(
                     store,
@@ -1848,13 +1841,9 @@ if nav_section == "cognition":
                     progress_callback=on_progress,
                 )
 
-                progress_box.progress(
-                    1.0
-                )
-
-                status_box.success(
-                    "Compilation complete."
-                )
+                progress.progress(1.0)
+                render_cognition_metrics()
+                status.success("Compilation complete.")
 
                 st.session_state[
                     "compile_success_msg"

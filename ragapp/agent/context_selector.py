@@ -186,13 +186,21 @@ class ContextSelector:
             intent_hits = self.index.search("runtime_intents", limit=3, min_score=0.0, query_vector=query_vector)
             intent = intent_hits[0]["id"] if intent_hits else "conversation"
             intent_score = float(intent_hits[0]["score"]) if intent_hits else 0.0
-            # Execution intent is safety-critical routing, not optional context.
-            # Semantic similarity can miss terse imperatives ("add a box...").
-            # Use a deterministic backstop so those requests always receive the
-            # project read/write/review execution path.
+
+            # Project mutation is an execution contract: selecting it causes the
+            # loop to force source inspection and require a successful workspace /
+            # review mutation before a normal answer may finish. Semantic nearest-
+            # neighbour routing is deliberately *not* sufficient to activate that
+            # contract; ordinary domain questions can otherwise be misclassified
+            # (for example, "how do beasts evolve"). The deterministic predicate
+            # requires both a mutation verb and a project/code/UI target. Semantic
+            # intent remains useful for non-mutating routing and prompt selection.
             if _looks_like_project_mutation(query):
                 intent = "project_mutation"
-                intent_score = max(intent_score, 1.0)
+                intent_score = 1.0
+            elif intent == "project_mutation":
+                intent = "conversation"
+                intent_score = 0.0
 
             module_hits = self.index.search("prompt_modules", limit=module_limit, min_score=0.30, query_vector=query_vector)
             modules = [PROMPT_MODULES[x["id"]]["text"] for x in module_hits if x["id"] in PROMPT_MODULES]

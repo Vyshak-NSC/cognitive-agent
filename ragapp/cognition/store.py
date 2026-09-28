@@ -1484,6 +1484,23 @@ class CognitionStore:
     def summaries(self):
         return {eid: meta.get("summary", "") for eid, meta in self.master_metadata().get("entities", {}).items()}
 
+    def cognition_counts(self):
+        """Return live counts for every canonical cognition object kind.
+
+        Unlike master_metadata["counts"], which is snapshotted by mark_compiled(),
+        this view reads the canonical stores directly so callers can observe a
+        compilation while it is still in progress.
+        """
+        return {
+            "entities": len(self._all_kind_records("entity")),
+            "relationships": len(self._all_kind_records("relationship")),
+            "events": len(self._all_kind_records("event")),
+            "locations": len(self._all_kind_records("location")),
+            "concepts": len(self._all_kind_records("concept")),
+            "definitions": len(self._all_kind_records("definition")),
+            "knowledge": len(self._all_kind_records("knowledge")),
+        }
+
     def state_map(self):
         # Computed view only; no cognition/state_map.json is written.
         m = self.master_metadata()
