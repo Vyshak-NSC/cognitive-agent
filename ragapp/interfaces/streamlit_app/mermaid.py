@@ -23,6 +23,7 @@ _DIRECTION_RE = re.compile(
 _SUBGRAPH_RE = re.compile(r"^subgraph(?:\s+|$)", re.IGNORECASE)
 _END_RE = re.compile(r"^end$", re.IGNORECASE)
 _SEPARATOR_RE = re.compile(r"^[\s\-_=~*#]+$")
+_NODE_SQUARE_RE = re.compile(r'(?P<id>\b[A-Za-z_][\w-]*)\[(?P<label>[^]\n]*)\]')
 
 
 @dataclass(frozen=True)
@@ -46,10 +47,28 @@ def _normalize_diagram(diagram: str) -> str:
         diagram,
     )
 
+    def normalize_square_node(match: re.Match[str]) -> str:
+        node_id = match.group("id")
+        label = match.group("label").strip()
+
+        # Mermaid is much more reliable when labels containing punctuation or
+        # requested line breaks are quoted. LLMs commonly emit `\\n` inside
+        # an unquoted label, e.g. H[HeaderRowData\\n(header)], which Mermaid
+        # parses as invalid syntax.
+        if len(label) >= 2 and label[0] == label[-1] == '"':
+            inner = label[1:-1].replace(r"\n", "<br/>")
+        else:
+            inner = label.replace(r"\n", "<br/>")
+
+        inner = inner.replace('"', "&quot;")
+        return f'{node_id}["{inner}"]'
+
     lines = []
     for line in diagram.splitlines():
         if "style " in line.lower() or "classDef" in line:
             line = re.sub(r"[^\x00-\x7F]", "", line)
+        else:
+            line = _NODE_SQUARE_RE.sub(normalize_square_node, line)
         lines.append(line.rstrip())
 
     return "\n".join(lines).strip()

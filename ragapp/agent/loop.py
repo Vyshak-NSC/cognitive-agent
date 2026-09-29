@@ -572,23 +572,19 @@ def _successful_project_read(calls, area=None):
     counts.  Directory listings, cognition and semantic prefetch do not count.
     """
     for call in calls:
-        tool = call.get("tool")
-        if tool not in {"read_project_text", "read_pdf"}:
+        if call.get("tool") != "read_project_text":
             continue
         args = call.get("args") or {}
         result = call.get("result")
-        call_area = args.get("area", "workspace" if tool == "read_pdf" else None)
-        if area is not None and call_area != area:
+        if area is not None and args.get("area") != area:
             continue
-        if call_area not in {"source", "workspace"}:
+        if args.get("area") not in {"source", "workspace"}:
             continue
         if not isinstance(result, dict):
             continue
         if result.get("error") or result.get("status") == "error":
             continue
-        if tool == "read_project_text" and "content" in result:
-            return True
-        if tool == "read_pdf" and "pages" in result:
+        if "content" in result:
             return True
     return False
 
@@ -734,7 +730,7 @@ def run_agent(context: AgentRunContext):
         selected_modules.append(
             "This turn requires inspection of actual project files. "
             f"Required project areas for this request: {', '.join(required_inspection_areas)}. "
-            "Use list_project_files and read_project_text in every required area; for an exact PDF page/range, use read_pdf with the matching area and page range. "
+            "Use list_project_files and read_project_text in every required area. "
             "Do not answer from cognition, semantic retrieval, filenames, symbol metadata, or assumptions "
             "when the requested information can be obtained from project files. Read the relevant files "
             "before producing the final answer. For requests that combine workspace input data with source "
@@ -799,7 +795,7 @@ def run_agent(context: AgentRunContext):
             + json.dumps(project_trees, ensure_ascii=False)
             + "\n\nPROJECT INSPECTION CONTRACT:\n"
             + "- Required areas: " + ", ".join(required_inspection_areas) + ".\n"
-            + "- You MUST read relevant files in EVERY required area before answering. Use read_project_text generally; for an exact PDF page/range, use read_pdf with area=source/workspace and start_page/end_page.\n"
+            + "- You MUST use read_project_text on relevant files in EVERY required area before answering.\n"
             + "- If workspace contains an input file (for example data.xml), read that actual workspace file.\n"
             + "- If source contains models/schema needed to interpret that input, read those actual source files too.\n"
             + "- Cognition, semantic retrieval, filenames and symbol metadata are navigation aids only.\n"
@@ -893,7 +889,7 @@ def run_agent(context: AgentRunContext):
                         execution_gate_retries += 1
                         system_instruction += (
                             "\n\nPROJECT INSPECTION GATE: You attempted to finish before reading all required "
-                            "project areas. Missing successful file reads for: "
+                            "project areas. Missing successful read_project_text calls for: "
                             + ", ".join(missing_areas)
                             + ". Read the relevant files in those areas now. If an input file such as data.xml "
                               "is in workspace, read it from area='workspace'. If models/schema are in source, "

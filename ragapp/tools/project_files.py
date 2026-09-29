@@ -123,7 +123,7 @@ def delete_project_item(area, relative_path):
 _STRUCTURED_SUFFIXES = {".docx", ".pdf", ".pptx", ".xlsx"}
 
 
-def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars=20000):
+def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars=20000, start_page=None, end_page=None):
     """Read a file as text from source or workspace.
 
     Plain text files are decoded with ``encoding``. DOCX/PDF/PPTX/XLSX files are
@@ -142,6 +142,22 @@ def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars
         raise FileNotFoundError(relative_path)
 
     suffix = p.suffix.lower()
+    if suffix == ".pdf" and (start_page is not None or end_page is not None):
+        from pypdf import PdfReader
+        reader = PdfReader(str(p))
+        total_pages = len(reader.pages)
+        start = 1 if start_page is None else int(start_page)
+        end_page_num = total_pages if end_page is None else int(end_page)
+        if start < 1 or end_page_num < start or start > total_pages or end_page_num > total_pages:
+            raise ValueError(f"Invalid PDF page range {start}-{end_page_num}; PDF has {total_pages} pages")
+        pages = [{"page": i, "text": reader.pages[i - 1].extract_text() or ""} for i in range(start, end_page_num + 1)]
+        return {
+            "path": relative_path, "area": area, "format": "pdf",
+            "page_count": total_pages, "start_page": start, "end_page": end_page_num,
+            "pages": pages,
+            "content": "\n\n".join(f"--- Page {item['page']} ---\n{item['text']}" for item in pages),
+            "offset": 0, "next_offset": None,
+        }
     if suffix in _STRUCTURED_SUFFIXES:
         from ragapp.tools.extractors import extract_text
         text = extract_text(p)
@@ -312,7 +328,7 @@ def build_project_file_tools():
     write_props={"relative_path":{"type":"string"}}
     return [
         Tool("list_project_files", "List files/folders in source or workspace.", {"type":"object","properties":read_props,"required":["area"]}, lambda area, relative_path="": list_project_files(area, relative_path)),
-        Tool("read_project_text", "Read a file from source or workspace as text. Works for plain text and also flattens DOCX/PDF/PPTX/XLSX documents. Output is paged: follow next_offset until it is null.", {"type":"object","properties":{**read_props,"offset":{"type":"integer"},"max_chars":{"type":"integer"}},"required":["area","relative_path"]}, lambda area, relative_path, offset=0, max_chars=20000: read_project_text(area, relative_path, offset=offset, max_chars=max_chars)),
+        Tool("read_project_text", "Read a file from source or workspace. For a PDF page or page range, pass start_page/end_page; this reads those exact physical PDF pages directly from the selected area. For other reads, output is character-paged via next_offset.", {"type":"object","properties":{**read_props,"offset":{"type":"integer"},"max_chars":{"type":"integer"},"start_page":{"type":"integer","minimum":1},"end_page":{"type":"integer","minimum":1}},"required":["area","relative_path"]}, lambda area, relative_path, offset=0, max_chars=20000, start_page=None, end_page=None: read_project_text(area, relative_path, offset=offset, max_chars=max_chars, start_page=start_page, end_page=end_page)),
         Tool("create_project_folder", "Create a folder in the AI workspace. Writes to authoritative source are forbidden to agent tools.", {"type":"object","properties":write_props,"required":["relative_path"]}, lambda relative_path: _workspace_create_folder(relative_path)),
         Tool("create_project_file", "Create a text file in the AI workspace.", {"type":"object","properties":{**write_props,"content":{"type":"string"}},"required":["relative_path"]}, lambda relative_path, content="": _workspace_create_file(relative_path, content)),
         Tool("copy_project_item", "Copy a file or folder within the AI workspace.", {"type":"object","properties":{"source_relative_path":{"type":"string"},"destination_relative_path":{"type":"string"}},"required":["source_relative_path","destination_relative_path"]}, lambda source_relative_path,destination_relative_path: _workspace_copy(source_relative_path,destination_relative_path)),
@@ -423,7 +439,7 @@ def delete_project_item(area, relative_path):
 _STRUCTURED_SUFFIXES = {".docx", ".pdf", ".pptx", ".xlsx"}
 
 
-def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars=20000):
+def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars=20000, start_page=None, end_page=None):
     """Read a file as text from source or workspace.
 
     Plain text files are decoded with ``encoding``. DOCX/PDF/PPTX/XLSX files are
@@ -442,6 +458,22 @@ def read_project_text(area, relative_path, encoding="utf-8", offset=0, max_chars
         raise FileNotFoundError(relative_path)
 
     suffix = p.suffix.lower()
+    if suffix == ".pdf" and (start_page is not None or end_page is not None):
+        from pypdf import PdfReader
+        reader = PdfReader(str(p))
+        total_pages = len(reader.pages)
+        start = 1 if start_page is None else int(start_page)
+        end_page_num = total_pages if end_page is None else int(end_page)
+        if start < 1 or end_page_num < start or start > total_pages or end_page_num > total_pages:
+            raise ValueError(f"Invalid PDF page range {start}-{end_page_num}; PDF has {total_pages} pages")
+        pages = [{"page": i, "text": reader.pages[i - 1].extract_text() or ""} for i in range(start, end_page_num + 1)]
+        return {
+            "path": relative_path, "area": area, "format": "pdf",
+            "page_count": total_pages, "start_page": start, "end_page": end_page_num,
+            "pages": pages,
+            "content": "\n\n".join(f"--- Page {item['page']} ---\n{item['text']}" for item in pages),
+            "offset": 0, "next_offset": None,
+        }
     if suffix in _STRUCTURED_SUFFIXES:
         from ragapp.tools.extractors import extract_text
         text = extract_text(p)
@@ -612,7 +644,7 @@ def build_project_file_tools():
     write_props={"relative_path":{"type":"string"}}
     return [
         Tool("list_project_files", "List files/folders in source or workspace.", {"type":"object","properties":read_props,"required":["area"]}, lambda area, relative_path="": list_project_files(area, relative_path)),
-        Tool("read_project_text", "Read a file from source or workspace as text. Works for plain text and also flattens DOCX/PDF/PPTX/XLSX documents. Output is paged: follow next_offset until it is null.", {"type":"object","properties":{**read_props,"offset":{"type":"integer"},"max_chars":{"type":"integer"}},"required":["area","relative_path"]}, lambda area, relative_path, offset=0, max_chars=20000: read_project_text(area, relative_path, offset=offset, max_chars=max_chars)),
+        Tool("read_project_text", "Read a file from source or workspace. For a PDF page or page range, pass start_page/end_page; this reads those exact physical PDF pages directly from the selected area. For other reads, output is character-paged via next_offset.", {"type":"object","properties":{**read_props,"offset":{"type":"integer"},"max_chars":{"type":"integer"},"start_page":{"type":"integer","minimum":1},"end_page":{"type":"integer","minimum":1}},"required":["area","relative_path"]}, lambda area, relative_path, offset=0, max_chars=20000, start_page=None, end_page=None: read_project_text(area, relative_path, offset=offset, max_chars=max_chars, start_page=start_page, end_page=end_page)),
         Tool("create_project_folder", "Create a folder in the AI workspace. Writes to authoritative source are forbidden to agent tools.", {"type":"object","properties":write_props,"required":["relative_path"]}, lambda relative_path: _workspace_create_folder(relative_path)),
         Tool("create_project_file", "Create a text file in the AI workspace.", {"type":"object","properties":{**write_props,"content":{"type":"string"}},"required":["relative_path"]}, lambda relative_path, content="": _workspace_create_file(relative_path, content)),
         Tool("copy_project_item", "Copy a file or folder within the AI workspace.", {"type":"object","properties":{"source_relative_path":{"type":"string"},"destination_relative_path":{"type":"string"}},"required":["source_relative_path","destination_relative_path"]}, lambda source_relative_path,destination_relative_path: _workspace_copy(source_relative_path,destination_relative_path)),

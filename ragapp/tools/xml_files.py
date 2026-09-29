@@ -1,15 +1,16 @@
 """XML tools using lxml so edits target the XML tree rather than flattening it to text."""
 from lxml import etree
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 def _path(username,p): return resolve_workspace_path(username,p)
-def read_xml(username, relative_path):
-    path=_path(username,relative_path)
+def read_xml(username, relative_path, area="workspace"):
+    area=(area or "workspace").strip().lower(); path=_path(username,relative_path) if area=="workspace" else resolve_source_path(username,relative_path) if area=="source" else None
+    if path is None: raise ValueError("area must be 'workspace' or 'source'")
     if not path.is_file(): raise FileNotFoundError(f"File not found: {relative_path}")
     raw=path.read_text(encoding="utf-8")
     root=etree.fromstring(raw.encode("utf-8"), parser=etree.XMLParser(remove_blank_text=False))
-    return {"path":relative_path,"content":raw,"root":root.tag,"pretty_content":etree.tostring(root,encoding="unicode",pretty_print=True)}
+    return {"path":relative_path,"area":area,"content":raw,"root":root.tag,"pretty_content":etree.tostring(root,encoding="unicode",pretty_print=True)}
 def write_xml(username,relative_path,content):
     path=_path(username,relative_path); path.parent.mkdir(parents=True,exist_ok=True)
     if path.exists(): raise FileExistsError(f"File already exists: {relative_path}")
@@ -41,7 +42,7 @@ def delete_xml(username,relative_path):
     path.unlink(); return {"path":relative_path,"status":"deleted"}
 def build_xml_tools(username):
     return [
-      Tool("read_xml","Read XML as raw content plus parsed structure; preserve XML rather than flattening it.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:read_xml(username,relative_path)),
+      Tool("read_xml","Read XML from workspace or authoritative source while preserving structure.",{"type":"object","properties":{"relative_path":{"type":"string"},"area":{"type":"string","enum":["workspace","source"]}},"required":["relative_path"]},lambda relative_path,area="workspace":read_xml(username,relative_path,area)),
       Tool("write_xml","Create a valid XML file from exact XML content.",{"type":"object","properties":{"relative_path":{"type":"string"},"content":{"type":"string"}},"required":["relative_path","content"]},lambda relative_path,content:write_xml(username,relative_path,content)),
       Tool("edit_xml","Edit XML using XPath operations so attributes/elements remain structured.",{"type":"object","properties":{"relative_path":{"type":"string"},"operation":{"type":"string","enum":["set_text","set_attribute","delete","append"]},"xpath":{"type":"string"},"value":{"type":"string"},"attribute":{"type":"string"},"element_xml":{"type":"string"}},"required":["relative_path","operation","xpath"]},lambda relative_path,operation,xpath=None,value=None,attribute=None,element_xml=None:edit_xml(username,relative_path,operation,xpath,value,attribute,element_xml)),
       Tool("delete_xml","Delete an existing XML file from the AI workspace.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:delete_xml(username,relative_path)),
