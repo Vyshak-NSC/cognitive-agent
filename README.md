@@ -3,11 +3,11 @@
 **Author:** Vyshak
 
 
-**Version 9.5.2**
+**Version 9.5.3**
 
 Cognitive Persistence Agent (CPA) is a local, project-scoped agent runtime that combines persistent canonical cognition, semantic/structural retrieval, tool-using chat, an isolated workspace, review-gated source changes, Git-backed project history, document/code ingestion, reusable agents/workflows, and multiple LLM providers.
 
-Version 9.5.2 is the current v9.x snapshot represented by this repository.
+Version 9.5.3 is the current v9.x snapshot represented by this repository.
 
 ## What CPA does
 
@@ -15,7 +15,7 @@ CPA maintains a durable project state outside the chat transcript. Source files 
 
 For project modifications, normal chat can inspect authoritative `/source`, work through `/workspace`, and create review proposals. Agent tools do not directly overwrite authoritative source files; source edits are staged and require approval through the Review workflow.
 
-## Version 9.5.2 feature set
+## Version 9.5.3 feature set
 
 ### Persistent canonical cognition
 
@@ -31,7 +31,7 @@ For project modifications, normal chat can inspect authoritative `/source`, work
 
 ### Knowledge lifecycle: evidence, hypotheses, decisions, changes, and open questions
 
-Version 9.5.2 turns the project knowledge lifecycle into an active runtime capability rather than leaving these record types as passive storage primitives.
+Version 9.5.3 turns the project knowledge lifecycle into an active runtime capability rather than leaving these record types as passive storage primitives.
 
 - **Evidence** records concrete observations and their provenance.
 - **Hypotheses** represent explanations that are still uncertain and can accumulate supporting or disconfirming evidence.
@@ -99,13 +99,155 @@ This makes the reasoning behind a project change retrievable in later sessions i
 - Read plain-text project files with paging.
 - `read_project_text` also extracts readable content from DOCX, PDF, PPTX, and XLSX instead of treating those formats as raw binary text.
 - Create, edit, copy, move, rename, and delete workspace files/folders.
-- DOCX tools.
-- PDF read/write/edit/page-copy tools.
-- PPTX tools.
+- DOCX read/edit tools plus structured DOCX rendering.
+- PDF read/write/edit/page-copy tools plus professional structured PDF rendering.
+- PPTX tools plus structured 16:9 presentation rendering.
+- HTML and Markdown artifact rendering through the shared Document IR.
+- Theme-driven artifact transformation with `professional`, `minimal`, `academic`, `report`, and `fantasy_codex` styles.
+- Content-preservation validation for document transformation workflows.
 - XLSX read/write/edit tools.
 - XML tools.
 - Regular text/file tools and binary-file support.
 - Streamlit file preview for project files, including parsed DOCX preview rather than displaying the underlying ZIP/XML bytes.
+
+
+### Artifact transformation and professional document rendering
+
+Version 9.5.3 adds a format-independent artifact transformation pipeline for creating clean, structured deliverables from existing project documents without treating formatting as an implicit summarization request.
+
+The pipeline separates document meaning from output formatting:
+
+```text
+source artifact
+    -> parser
+    -> Document IR
+    -> operation intent
+    -> theme
+    -> format-specific renderer
+    -> validation
+    -> final artifact
+```
+
+#### Document Intermediate Representation (Document IR)
+
+CPA can parse source content into a common semantic document model instead of passing a single flattened text blob directly to an output writer. The model preserves document structure such as:
+
+- document metadata and title information;
+- sections and heading levels;
+- paragraphs;
+- ordered and unordered lists;
+- tables and table headers;
+- callouts;
+- images and other supported structured blocks;
+- explicit page/section breaks where represented by the source.
+
+The same semantic representation can then be rendered differently for each target format. A heading remains a heading in the IR, while the PDF, PowerPoint, DOCX, HTML, or Markdown renderer decides how that heading should physically appear.
+
+#### Transform, summarize, and generate are separate operations
+
+Artifact requests distinguish three different content operations:
+
+```text
+TRANSFORM
+existing content -> preserve content -> change presentation/format
+
+SUMMARIZE
+existing content -> intentionally reduce content -> new artifact
+
+GENERATE
+instructions/sources -> author new artifact
+```
+
+For transformation requests such as "clean up this DOCX", "format this professionally", or "export this document as PDF", formatting changes presentation rather than granting permission to silently condense the source. Summarization or rewriting should be explicit when content reduction is intended.
+
+#### Multi-format artifact rendering
+
+The shared artifact pipeline supports format-specific rendering for:
+
+- **PDF** — paginated document rendering with structured typography and layout.
+- **PowerPoint (`.pptx`)** — 16:9 presentation rendering with section boundaries, content splitting, continuation slides, and table slides.
+- **Word (`.docx`)** — structured Word output with heading, paragraph, list, and table styling.
+- **HTML** — semantic HTML with theme-driven presentation.
+- **Markdown** — structured Markdown export from the same document model.
+
+This allows one parsed source to drive multiple outputs:
+
+```text
+                     -> PDF
+                     -> PPTX
+source -> Document IR -> DOCX
+                     -> HTML
+                     -> Markdown
+```
+
+#### Theme system
+
+Artifact styling is centralized rather than hard-coded into every transformation path. The included theme set provides:
+
+- `professional`
+- `minimal`
+- `academic`
+- `report`
+- `fantasy_codex`
+
+Themes control presentation concerns such as typography, heading hierarchy, spacing, page geometry, table treatment, headers/footers, and other renderer-supported style choices while leaving the semantic source content unchanged.
+
+#### PDF layout improvements
+
+PDF generation is no longer limited to line-by-line canvas text placement for document transformations. The structured PDF renderer supports document-aware pagination and layout, including:
+
+- wrapped paragraphs;
+- heading hierarchy;
+- automatic page flow;
+- tables and table splitting;
+- repeated table headers where supported;
+- lists and callouts;
+- page breaks;
+- headers, footers, and page numbers;
+- heading/content cohesion such as keeping a heading with following content where possible.
+
+The existing PDF file tools remain available for direct PDF operations, while structured document transformation uses the higher-level rendering path.
+
+#### PowerPoint layout improvements
+
+PowerPoint rendering treats a presentation as a presentation rather than as paginated prose. The renderer can use document structure to:
+
+- create section-oriented slides from heading boundaries;
+- use 16:9 slide geometry;
+- control text density;
+- split oversized content across continuation slides;
+- place tables on dedicated slides when appropriate;
+- preserve source information across multiple slides for transformation requests instead of silently discarding overflow.
+
+#### Artifact validation
+
+Generated transformations can be checked against the parsed source before delivery. The validation layer is designed to detect content-loss and structural problems such as:
+
+- missing source content;
+- missing headings;
+- missing structural material;
+- suspiciously incomplete transformations;
+- renderer-level issues exposed by supported validation checks.
+
+This makes artifact completion a render-and-validate workflow rather than treating successful file creation alone as proof of a correct transformation.
+
+#### High-level document transformation tool
+
+The artifact subsystem exposes a high-level document transformation path so the agent can request an output format and theme without manually constructing low-level PDF or slide coordinates.
+
+Conceptually:
+
+```python
+transform_document(
+    source_path="WorldBible.docx",
+    output_path="WorldBible.pdf",
+    theme="fantasy_codex",
+    preserve_content=True,
+)
+```
+
+The parser, Document IR, renderer, and validator remain implementation details behind the tool boundary.
+
 
 ### Git/VCS project history
 
@@ -314,6 +456,31 @@ Approval
 
 Normal project implementation requests should use this base runtime behavior; a custom Agent is not required merely to enforce workspace/review safety.
 
+
+## Artifact transformation architecture
+
+The v9.5.3 artifact subsystem is implemented under `ragapp/documents/` and is intentionally separate from cognition ingestion. Cognition compilation is optimized for understanding, retrieval, and durable project knowledge; artifact transformation is optimized for source fidelity, presentation, and output rendering.
+
+Core components:
+
+```text
+ragapp/documents/
+    model.py              shared Document IR
+    parser.py             source -> Document IR
+    themes.py             reusable presentation themes
+    pdf_renderer.py       PDF output
+    pptx_renderer.py      PowerPoint output
+    docx_renderer.py      Word output
+    html_renderer.py      HTML output
+    markdown_renderer.py  Markdown output
+    validator.py          transformation/content checks
+```
+
+The high-level tool boundary lives in `ragapp/tools/document_tools.py`. Agent routing and prompt/context policy distinguish transformation from summarization and generation so that output-format requests do not automatically become content-reduction requests.
+
+This subsystem is designed to be extensible: additional themes can reuse the existing renderers, and additional output formats can consume the same Document IR without requiring every renderer to independently reinterpret the source document.
+
+
 ## Cognition compilation and recompilation
 
 Cognition can be compiled from supported project artifacts. The source recompilation capability uses the same compilation pipeline as the application and can compile all source files or a selected subset.
@@ -324,7 +491,7 @@ Compilation may invoke the configured LLM per document segment and can therefore
 
 ## Retrieval architecture
 
-The v9.5.2 read path is designed around local candidate selection followed by bounded hydration:
+The v9.5.3 read path is designed around local candidate selection followed by bounded hydration:
 
 ```text
 user request
@@ -336,6 +503,23 @@ user request
 ```
 
 Semantic similarity is candidate generation, not the canonical knowledge store itself. Once cognition IDs are selected, structural references can expand connected cognition before context is hydrated.
+
+
+## Artifact-generation checks
+
+For artifact work, validate both file creation and source fidelity. Transformation tests should cover at least:
+
+- a long multi-section document;
+- nested headings;
+- long paragraphs;
+- multi-page tables;
+- lists and callouts;
+- output to PDF, PPTX, DOCX, HTML, and Markdown;
+- explicit summarization requests, where content reduction is allowed;
+- transformation requests, where unintended content loss should fail validation.
+
+Presentation and document renderers should be tested independently because the same Document IR intentionally produces different layouts for page-oriented and slide-oriented outputs.
+
 
 ## Development checks
 
@@ -399,7 +583,7 @@ If the dependency is required by the application, declare it in `pyproject.toml`
 uv run python --version
 ```
 
-CPA v9.5.2 targets Python 3.12.x.
+CPA v9.5.3 targets Python 3.12.x.
 
 ### Stale environment
 
@@ -425,12 +609,12 @@ Check `.env` or configure the provider through project Settings. Never commit th
 
 CPA should use **one authoritative application version** and derive every displayed/runtime version from it. Do not manually maintain independent application version strings in `pyproject.toml`, `ragapp/__init__.py`, `api.py`, and the README.
 
-For v9.5.2, the recommended source of truth is:
+For v9.5.3, the recommended source of truth is:
 
 ```toml
 # pyproject.toml
 [project]
-version = "9.5.2"
+version = "9.5.3"
 ```
 
 Runtime code should read the installed package metadata:
@@ -460,14 +644,14 @@ For release automation, use a small release script (or a tool such as `bump-my-v
 A simple release sequence is:
 
 ```powershell
-uv run python scripts/set_version.py 9.5.2
+uv run python scripts/set_version.py 9.5.3
 uv lock
 uv sync
 uv run python -m compileall ragapp api.py main.py
 uv run pytest
 git add pyproject.toml uv.lock README.md
-git commit -m "Release v9.5.2"
-git tag -a v9.5.2 -m "v9.5.2"
+git commit -m "Release v9.5.3"
+git tag -a v9.5.3 -m "v9.5.3"
 git push origin HEAD --tags
 ```
 
@@ -476,7 +660,7 @@ Important: schema versions such as `SCHEMA_VERSION`, `TEMPORAL_MODEL_VERSION`, a
 This repository snapshot is:
 
 ```text
-v9.5.2
+v9.5.3
 ```
 
 ## Repository hygiene
