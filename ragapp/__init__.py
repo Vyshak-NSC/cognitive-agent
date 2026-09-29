@@ -1,2 +1,7 @@
 """Cognitive Persistence Agent package."""
-__version__ = "9.5.1"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("cognitive-persistence-agent")
+except PackageNotFoundError:
+    __version__ = "0.0.0+dev"

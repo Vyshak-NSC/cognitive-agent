@@ -46,6 +46,10 @@ INTENT_RECORDS = {
 }
 
 PROMPT_MODULES = {
+    "knowledge_lifecycle": {
+        "description": "Investigation, debugging, research, requirements analysis, architecture choices, implementation work, or any task that can create durable evidence, hypotheses, decisions, changes, dependencies, or unresolved questions.",
+        "text": "Maintain the durable project knowledge lifecycle when it materially applies. Record concrete observations as evidence; testable explanations as hypotheses; confirmed durable conclusions as facts; explicit choices as decisions; material dependencies as dependencies; unresolved material unknowns as open questions; and implementation outcomes as changes. Update existing records when their status changes instead of creating duplicates. Do not manufacture records for casual conversation or unsupported guesses.",
+    },
     "cognition": {
         "description": "Questions requiring persistent project knowledge, entities, relationships, events, state, chronology, provenance or derived cognition.",
         "text": "Use canonical cognition as project state. Prefer retrieved cognition over old transcript claims. Retrieve more cognition only when the supplied evidence is insufficient.",

@@ -71,7 +71,7 @@ _COGNITION_TOOLS = {
     "search_cognition_metadata", "get_cognition_index", "request_cognition_context",
     "get_entity_metadata", "get_state_map", "get_ledger", "load_entities",
     "record_fact", "record_evidence", "record_hypothesis", "record_decision",
-    "record_dependency", "record_change", "get_contradictions", "analyze_impact",
+    "record_dependency", "record_change", "record_open_question", "get_contradictions", "analyze_impact",
     "validate_cognition", "get_world_model", "distill_session",
 }
 _VCS_TOOLS = {"list_file_history", "show_file_revision", "diff_file_revisions", "restore_file_revision", "create_vcs_checkpoint"}
