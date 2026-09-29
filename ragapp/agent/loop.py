@@ -179,7 +179,7 @@ def _asserts_known_entity_state(query, cognition):
         return False
     # Remove an operational compile clause; the remaining declarative clause may be
     # an authoritative correction (e.g. "Ash is 22. recompile").
-    semantic_text = re.sub(r"(?i)\b(recompile|re-compile|compile|rebuild|reingest|re-ingest)\b.*$", "", q).strip(" .;,:")
+    semantic_text = re.sub(_COMPILE_TAIL, "", q).strip(" .;,:")
     if not semantic_text or not re.search(r"(?i)\b(is|are|has|have|became|becomes|was|were)\b", semantic_text):
         return False
     try:
@@ -196,9 +196,35 @@ def _asserts_known_entity_state(query, cognition):
     return False
 
 
+_COMPILE_TAIL = r"(?i)[\s,;.]*(?:\b(?:and|then|also|&)\b\s+)?\b(?:re-?compil(?:e|ed|es|ing)|compil(?:e|ed|es|ing)|rebuil[dt]|re-?ingest(?:ed)?)\b.*$"
+_EDIT_VERB = re.compile(r"(?i)\b(change|set|update|make|correct|edit|modify|rename|revise|fix|swap|increase|decrease|make)\b")
+
+
+def _edits_known_entity(query, cognition):
+    """Imperative edit that names an entity already in cognition ("change age of Ash to 20").
+
+    Structural only. The semantic mutation engine decides what else must change.
+    Code/UI edits ("change the button") are left to the project-mutation path.
+    """
+    q = str(query or "").strip()
+    if not q or "?" in q or cognition is None or not cognition.exists():
+        return False
+    text = re.sub(_COMPILE_TAIL, "", q).strip(" .;,:")
+    if not _EDIT_VERB.search(text):
+        return False
+    from ragapp.agent.context_selector import _looks_like_project_mutation
+    if _looks_like_project_mutation(text):
+        return False
+    try:
+        from ragapp.cognition.merge import _named_entity_seeds
+        return bool(_named_entity_seeds(cognition, text))
+    except Exception:
+        return False
+
+
 def _semantic_change_text(query):
     """Remove compile-only wording before sending a compound command to mutation planning."""
-    text = re.sub(r"(?i)\b(recompile|re-compile|compile|rebuild|reingest|re-ingest)\b.*$", "", str(query or "")).strip(" .;,:")
+    text = re.sub(_COMPILE_TAIL, "", str(query or "")).strip(" .;,:")
     return text or str(query or "").strip()
 
 
@@ -271,6 +297,20 @@ def _record_tool_call(
             "result": _json_safe(result),
         }
     )
+def _split_state_deltas(deltas):
+    """Split deltas into (plain-language cascading changes, deltas safe to merge directly)."""
+    cascade, plain = [], []
+    additive = {"create_entity", "create_relationship", "create_event", "create_knowledge"}
+    for d in deltas or []:
+        if (isinstance(d, dict) and d.get("permanence", "transient") == "permanent"
+                and d.get("operation") not in additive and d.get("entity") and d.get("field")):
+            reason = str(d.get("reason") or "").strip()
+            cascade.append(f"Set {d['field']} of {d['entity']} to {d.get('new')!r}." + (f" {reason}" if reason else ""))
+        else:
+            plain.append(d)
+    return cascade, plain
+
+
 def _persist_state_updates(
     state_blocks,
     cognition,
@@ -331,14 +371,23 @@ def _persist_state_updates(
                     raise ValueError(
                         "STATE_UPDATE.deltas must be an array."
                     )
-                result = merge_deltas(
-                    cognition,
-                    deltas,
-                    source_label=(
-                        f"agent:{project_id}"
-                    ),
-                    events=events,
-                )
+                # A durable attribute change can falsify connected relationships
+                # and descriptions, so it goes through the cascading semantic
+                # transaction instead of a bare attribute append.
+                cascade, plain = _split_state_deltas(deltas)
+                result = None
+                if plain or events:
+                    result = merge_deltas(
+                        cognition,
+                        plain,
+                        source_label=f"agent:{project_id}",
+                        events=events,
+                    )
+                if cascade:
+                    from ragapp.cognition.merge import apply_semantic_mutation
+                    result = apply_semantic_mutation(
+                        cognition, cascade, source_label=f"agent:{project_id}",
+                    )
             _record_tool_call(
                 calls,
                 "cognition.merge_state_deltas",
@@ -577,6 +626,7 @@ def run_agent(context: AgentRunContext):
     explicit_cognition_mutation = (
         _looks_like_cognition_mutation(query)
         or _asserts_known_entity_state(query, cognition)
+        or _edits_known_entity(query, cognition)
     )
     explicit_recompile = _requests_recompile(query)
     cognition_mutation_result = None
@@ -611,8 +661,13 @@ def run_agent(context: AgentRunContext):
             recompile_result = {"status": "error", "error": str(exc)}
         _record_tool_call(calls, "recompile_source", {}, recompile_result)
     elif explicit_recompile and explicit_cognition_mutation:
+        # "change X and compile it" means: apply the change to cognition. The
+        # mutation is surgical and already updated the connected objects; it does
+        # not re-extract the unchanged source documents.
         if isinstance(cognition_mutation_result, dict):
-            recompile_result = _json_safe(cognition_mutation_result.get("recompilation"))
+            recompile_result = {"status": cognition_mutation_result.get("status") == "applied" and "compiled" or "error",
+                                "mode": "surgical_cognition_mutation",
+                                "error": cognition_mutation_result.get("error")}
 
     # Selection/prefetch was computed before the mutation. Refresh it after a
     # successful mutation so the model cannot be shown stale pre-mutation state.

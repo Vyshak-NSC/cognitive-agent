@@ -1,7 +1,7 @@
-"""Explorer-style project file manager for Workspace and Source."""
+"""Compact project file manager for Workspace and Source."""
 from pathlib import Path
-import base64, html, io, mimetypes, re, zipfile
-import pandas as pd
+import base64, html, io, mimetypes, re, shutil, zipfile
+from io import BytesIO
 import streamlit as st
 from ragapp.core.project_files import ProjectFileService
 
@@ -25,11 +25,7 @@ def _folders(root):
 
 def _entries(root,folder):
     root=Path(root).resolve(); cur=_safe(root,'' if folder=='/' else folder)
-    out=[]
-    for p in cur.iterdir():
-        is_dir=p.is_dir()
-        out.append({'name':p.name,'path':p.relative_to(root).as_posix(),'kind':'Folder' if is_dir else 'File','size':'' if is_dir else _size(p.stat().st_size),'modified':p.stat().st_mtime})
-    return sorted(out,key=lambda x:(x['kind']!='Folder',x['name'].lower()))
+    return sorted([{'name':p.name,'path':p.relative_to(root).as_posix(),'type':'Folder' if p.is_dir() else 'File','size':None if p.is_dir() else _size(p.stat().st_size)} for p in cur.iterdir()],key=lambda x:(x['type']!='Folder',x['name'].lower()))
 
 def _clean_name(name):
     clean=Path(name).name
@@ -68,129 +64,177 @@ def _extract_zip_into(data,root,folder,overwrite=False):
             target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(zf.read(info)); out['written'].append(name)
     return out
 
+def _transfer(store,src_area,rel,dst_area,dst_folder,move):
+    service=ProjectFileService(store)
+    src=service.path(src_area,rel)
+    dst_rel=(Path(dst_folder)/src.name).as_posix() if dst_folder!='/' else src.name
+    if move: return service.move(src_area,rel,dst_area,dst_rel)
+    return service.copy(src_area,rel,dst_area,dst_rel)
+
+def _preview_docx(path):
+    """Render Word document text and tables without treating DOCX as raw binary."""
+    try:
+        from docx import Document
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+    except ImportError:
+        st.error('DOCX preview requires python-docx. Install it with: pip install python-docx')
+        return
+
+    try:
+        document = Document(BytesIO(path.read_bytes()))
+        rendered_any = False
+        blocks = document.iter_inner_content() if hasattr(document, 'iter_inner_content') else [*document.paragraphs, *document.tables]
+
+        for block in blocks:
+            if isinstance(block, Paragraph):
+                text = block.text.strip()
+                if not text:
+                    continue
+                rendered_any = True
+                style_name = (block.style.name or '') if block.style else ''
+                if style_name.startswith('Heading'):
+                    try:
+                        level = int(style_name.split()[-1])
+                    except (TypeError, ValueError):
+                        level = 3
+                    st.markdown(f"{'#' * max(1, min(level, 6))} {text}")
+                elif style_name in {'Title', 'Subtitle'}:
+                    st.markdown(f'## {text}')
+                else:
+                    st.write(text)
+            elif isinstance(block, Table):
+                rows = [[cell.text for cell in row.cells] for row in block.rows]
+                if rows:
+                    rendered_any = True
+                    st.table(rows)
+
+        if not rendered_any:
+            st.info('This Word document contains no previewable text or tables.')
+    except Exception as exc:
+        st.error(f'Could not preview Word document `{path.name}`: {exc}')
+
+
 def _preview(path,root):
+    suffix = path.suffix.lower()
     if _is_text(path):
-        if path.suffix.lower() in {'.html','.htm'}: st.components.v1.html(_prepare_html_preview(path,root),height=650,scrolling=True)
-        elif path.suffix.lower()=='.md': st.markdown(path.read_text(encoding='utf-8',errors='replace'))
+        if suffix in {'.html','.htm'}: st.components.v1.html(_prepare_html_preview(path,root),height=650,scrolling=True)
+        elif suffix == '.md': st.markdown(path.read_text(encoding='utf-8',errors='replace'))
         else: st.code(path.read_text(encoding='utf-8',errors='replace'),language=path.suffix.lstrip('.') or 'text')
-    elif path.suffix.lower() in {'.png','.jpg','.jpeg','.gif','.webp'}: st.image(path.read_bytes())
-    elif path.suffix.lower()=='.pdf': st.components.v1.html(f'<iframe src="{_asset_data_uri(path)}" width="100%" height="700"></iframe>',height=710)
-    else: st.info(f'Binary file · {_size(path.stat().st_size)}')
-
-def _selection_rows(event):
-    try: return list(event.selection.rows)
-    except Exception: return []
-
-def _zip_selection(root,entries):
-    bio=io.BytesIO()
-    with zipfile.ZipFile(bio,'w',zipfile.ZIP_DEFLATED) as zf:
-        for e in entries:
-            p=_safe(root,e['path'])
-            if p.is_dir():
-                for child in p.rglob('*'):
-                    if child.is_file(): zf.write(child,child.relative_to(root).as_posix())
-            else: zf.write(p,p.relative_to(root).as_posix())
-    return bio.getvalue()
+    elif suffix in {'.png','.jpg','.jpeg','.gif','.webp'}: st.image(path.read_bytes())
+    elif suffix=='.pdf': st.components.v1.html(f'<iframe src="{_asset_data_uri(path)}" width="100%" height="700"></iframe>',height=710)
+    elif suffix=='.docx': _preview_docx(path)
+    else: st.info(f'Binary file · {_size(path.stat().st_size)}. Use Download or Replace.')
 
 def render_file_manager(store):
     st.subheader('Files')
+    st.caption('Workspace and Source are managed from one compact browser. Select an item, then choose an action.')
     files=ProjectFileService(store)
-
-    h1,h2,h3=st.columns([1.2,2.8,1])
-    with h1:
+    top1,top2=st.columns([1,2])
+    with top1:
         area=st.segmented_control('Area',['workspace','source'],format_func=lambda x:AREAS[x][0],default=st.session_state.get('fm_area','workspace'),key='fm_area') or 'workspace'
     root=_root(store,area); folders=_folders(root)
     fk=f'fm_folder_{area}'; pending=st.session_state.pop(f'fm_pending_folder_{area}',None)
     if pending in folders: st.session_state[fk]=pending
     current=st.session_state.get(fk,'/'); current=current if current in folders else '/'
-    with h2: folder=st.selectbox('Folder',folders,index=folders.index(current),key=fk,label_visibility='collapsed')
-    with h3:
-        if folder!='/' and st.button('↑ Up',use_container_width=True):
-            parent=Path(folder).parent.as_posix(); st.session_state[f'fm_pending_folder_{area}']='/' if parent=='.' else parent; st.rerun()
+    with top2: folder=st.selectbox('Folder',folders,index=folders.index(current),key=fk)
 
-    with st.popover('＋ Add / import'):
-        tab1,tab2=st.tabs(['Create','Upload'])
+    with st.popover('＋ Add / import',use_container_width=False):
+        tab1,tab2,tab3=st.tabs(['Create','Upload','From other area'])
         with tab1:
             kind=st.radio('Create',['File','Folder'],horizontal=True,key=f'new_kind_{area}'); name=st.text_input('Name',key=f'new_name_{area}')
-            content=st.text_area('Initial content',height=120,key=f'new_content_{area}') if kind=='File' else ''
+            content=st.text_area('Initial text / content',height=140,key=f'new_content_{area}') if kind=='File' else ''
             if st.button('Create',type='primary',key=f'create_{area}'):
                 try:
-                    rel=(Path(folder)/_clean_name(name)).as_posix() if folder!='/' else _clean_name(name)
-                    files.create_folder(area,rel) if kind=='Folder' else files.write_text(area,rel,content)
+                    target=_safe(root,str(Path(folder)/_clean_name(name)) if folder!='/' else _clean_name(name))
+                    if target.exists(): raise FileExistsError('Destination already exists.')
+                    rel=target.relative_to(root).as_posix()
+                    if kind=='Folder': files.create_folder(area,rel)
+                    else: files.write_text(area,rel,content)
                     st.rerun()
                 except Exception as e: st.error(str(e))
         with tab2:
             ups=st.file_uploader('Files',accept_multiple_files=True,key=f'ups_{area}')
             if ups and st.button('Upload',type='primary',key=f'upload_{area}'):
                 try:
-                    batch=[(((Path(folder)/Path(up.name).name).as_posix() if folder!='/' else Path(up.name).name),up.getvalue()) for up in ups]
-                    files.write_many(area,batch,description=f'Upload {len(batch)} file(s) to {area}'); st.rerun()
+                    batch=[]
+                    for up in ups:
+                        rel=(Path(folder)/Path(up.name).name).as_posix() if folder!='/' else Path(up.name).name
+                        batch.append((rel,up.getvalue()))
+                    files.write_many(area,batch,description=f'Upload {len(batch)} file(s) to {area}')
+                    st.rerun()
                 except Exception as e: st.error(str(e))
-            z=st.file_uploader('Extract ZIP',type=['zip'],key=f'zip_{area}'); overwrite=st.checkbox('Overwrite existing',key=f'ow_{area}')
-            if z and st.button('Extract',key=f'extract_{area}'):
+            z=st.file_uploader('Or extract a ZIP',type=['zip'],key=f'zip_{area}'); overwrite=st.checkbox('Overwrite existing',key=f'ow_{area}')
+            if z and st.button('Extract ZIP',key=f'extract_{area}'):
                 try:
-                    files.vcs.checkpoint(f'Pre-change: extract ZIP into {area}/{folder}'); _extract_zip_into(z.getvalue(),root,folder,overwrite); files.vcs.commit(f'Extract ZIP into {area}/{folder}',bind_timeline=False); st.rerun()
+                    files.vcs.checkpoint(f'Pre-change: extract ZIP into {area}/{folder}')
+                    _extract_zip_into(z.getvalue(),root,folder,overwrite)
+                    files.vcs.commit(f'Extract ZIP into {area}/{folder}',bind_timeline=False)
+                    st.rerun()
                 except Exception as e: st.error(str(e))
+        with tab3:
+            other='source' if area=='workspace' else 'workspace'; oroot=_root(store,other)
+            opts=[p.relative_to(oroot).as_posix() for p in oroot.rglob('*')]
+            if opts:
+                rel=st.selectbox(f'From {AREAS[other][0]}',opts,key=f'import_{area}')
+                mode=st.radio('Operation',['Copy','Move'],horizontal=True,key=f'import_mode_{area}')
+                if st.button(f'{mode} here',type='primary',key=f'import_go_{area}'):
+                    try: _transfer(store,other,rel,area,folder,mode=='Move'); st.rerun()
+                    except Exception as e: st.error(str(e))
+            else: st.info(f'{AREAS[other][0]} is empty.')
 
     entries=_entries(root,folder)
     if not entries: st.info('This folder is empty.'); return
-    table=pd.DataFrame([{'Name':('📁 ' if e['kind']=='Folder' else '📄 ')+e['name'],'Type':e['kind'],'Size':e['size']} for e in entries])
-    event=st.dataframe(table,hide_index=True,use_container_width=True,on_select='rerun',selection_mode='multi-row',key=f'fm_grid_{area}_{folder}',column_config={'Name':st.column_config.TextColumn(width='large'),'Type':st.column_config.TextColumn(width='small'),'Size':st.column_config.TextColumn(width='small')})
-    rows=_selection_rows(event); selected=[entries[i] for i in rows if 0<=i<len(entries)]
-    st.caption(f'{len(selected)} selected' if selected else 'Select one or more files/folders. Select one file to preview it immediately.')
+    labels=[f"{'📁' if e['type']=='Folder' else '📄'} {e['name']}" for e in entries]
+    selected=st.selectbox('Item',range(len(entries)),format_func=lambda i:labels[i],key=f'fm_item_{area}_{folder}')
+    e=entries[selected]; p=_safe(root,e['path'])
+    if e['type']=='Folder':
+        c1,c2=st.columns([4,1]); c1.caption(f"Folder · {e['path']}")
+        if c2.button('Open',use_container_width=True,key=f'open_{area}_{e["path"]}'):
+            st.session_state[f'fm_pending_folder_{area}']=e['path']; st.rerun()
+    else: st.caption(f"{e['path']} · {e['size']}")
 
-    if selected:
-        t1,t2,t3,t4,t5,t6=st.columns(6)
-        one=selected[0] if len(selected)==1 else None
-        if t1.button('Open',disabled=not(one and one['kind']=='Folder'),use_container_width=True):
-            st.session_state[f'fm_pending_folder_{area}']=one['path']; st.rerun()
-        if t2.button('Copy',use_container_width=True): st.session_state[f'fm_bulk_{area}']='copy'
-        if t3.button('Move',use_container_width=True): st.session_state[f'fm_bulk_{area}']='move'
-        if t4.button('Rename',disabled=one is None,use_container_width=True): st.session_state[f'fm_bulk_{area}']='rename'
-        zip_data=_zip_selection(root,selected)
-        t5.download_button('Download',zip_data,file_name=f'{area}-selection.zip',mime='application/zip',use_container_width=True)
-        if t6.button('Delete',type='primary',use_container_width=True): st.session_state[f'fm_bulk_{area}']='delete'
-
-        op=st.session_state.get(f'fm_bulk_{area}')
-        if op in {'copy','move'}:
-            with st.container(border=True):
-                st.markdown(f'**{op.title()} {len(selected)} selected item(s)**')
-                dest_area=st.segmented_control('Destination area',['workspace','source'],default=area,key=f'bulk_dest_area_{area}_{op}') or area
-                dests=_folders(_root(store,dest_area)); dest=st.selectbox('Destination folder',dests,key=f'bulk_dest_{area}_{op}')
-                c1,c2=st.columns(2)
-                if c1.button(op.title(),type='primary',key=f'bulk_go_{area}_{op}'):
-                    try:
-                        rels=[e['path'] for e in selected]
-                        (files.copy_many if op=='copy' else files.move_many)(area,rels,dest_area,'' if dest=='/' else dest)
-                        st.session_state.pop(f'fm_bulk_{area}',None); st.rerun()
-                    except Exception as ex: st.error(str(ex))
-                if c2.button('Cancel',key=f'bulk_cancel_{area}_{op}'): st.session_state.pop(f'fm_bulk_{area}',None); st.rerun()
-        elif op=='delete':
-            with st.container(border=True):
-                st.warning(f'Delete {len(selected)} selected item(s)? Folders and their contents will be removed.')
-                c1,c2=st.columns(2)
-                if c1.button('Delete selected',type='primary',key=f'bulk_del_go_{area}'):
-                    try: files.delete_many(area,[e['path'] for e in selected]); st.session_state.pop(f'fm_bulk_{area}',None); st.rerun()
-                    except Exception as ex: st.error(str(ex))
-                if c2.button('Cancel',key=f'bulk_del_cancel_{area}'): st.session_state.pop(f'fm_bulk_{area}',None); st.rerun()
-        elif op=='rename' and one:
-            with st.container(border=True):
-                new_name=st.text_input('New name',value=one['name'],key=f'fm_rename_{area}_{one["path"]}')
-                c1,c2=st.columns(2)
-                if c1.button('Rename',type='primary',key=f'fm_rename_go_{area}'):
-                    try:
-                        parent=Path(one['path']).parent; target=(parent/_clean_name(new_name)).as_posix(); files.move(area,one['path'],area,target); st.session_state.pop(f'fm_bulk_{area}',None); st.rerun()
-                    except Exception as ex: st.error(str(ex))
-                if c2.button('Cancel',key=f'fm_rename_cancel_{area}'): st.session_state.pop(f'fm_bulk_{area}',None); st.rerun()
-
-    if len(selected)==1 and selected[0]['kind']=='File':
-        e=selected[0]; p=_safe(root,e['path'])
-        st.divider(); st.markdown(f"**{e['name']}**  ·  `{e['path']}`  ·  {e['size']}")
-        if _is_text(p):
-            edit=st.toggle('Edit',key=f'fm_edit_toggle_{area}_{e["path"]}')
-            if edit:
-                content=st.text_area('Contents',p.read_text(encoding='utf-8',errors='replace'),height=500,key=f'fm_edit_{area}_{e["path"]}',label_visibility='collapsed')
-                if st.button('Save changes',type='primary',key=f'fm_save_{area}_{e["path"]}'):
-                    files.write_text(area,e['path'],content,overwrite=True,description=f'Edit {area}/{e["path"]}'); st.success('Saved.')
-            else: _preview(p,root)
+    action=st.selectbox('Action',['View','Edit / replace','Rename / move','Copy','Move to other area','Copy to other area','Download','Delete'],key=f'action_{area}_{e["path"]}')
+    if action=='View':
+        if e['type']=='Folder': st.info('Open the folder to view its contents.')
         else: _preview(p,root)
+    elif action=='Edit / replace':
+        if e['type']=='Folder': st.info('Folders cannot be edited; rename/move them or edit their contents.')
+        elif _is_text(p):
+            text=st.text_area('Contents',p.read_text(encoding='utf-8',errors='replace'),height=430,key=f'edit_{area}_{e["path"]}')
+            if st.button('Save changes',type='primary',key=f'save_{area}_{e["path"]}'):
+                files.write_text(area,e['path'],text,overwrite=True,description=f'Edit {area}/{e["path"]}')
+                st.success('Saved.')
+        else:
+            replacement=st.file_uploader('Replace binary file',key=f'replace_{area}_{e["path"]}')
+            if replacement and st.button('Replace',type='primary',key=f'replace_go_{area}_{e["path"]}'):
+                files.write_bytes(area,e['path'],replacement.getvalue(),overwrite=True,description=f'Replace {area}/{e["path"]}')
+                st.rerun()
+    elif action=='Rename / move':
+        name=st.text_input('Name',value=p.name,key=f'rname_{area}_{e["path"]}'); dest=st.selectbox('Folder',folders,key=f'rdest_{area}_{e["path"]}')
+        if st.button('Apply',type='primary',key=f'rgo_{area}_{e["path"]}'):
+            try:
+                target=_safe(root,str(Path(dest)/_clean_name(name)) if dest!='/' else _clean_name(name))
+                if target!=p and target.exists(): raise FileExistsError('Destination already exists.')
+                files.move(area,e['path'],area,target.relative_to(root).as_posix()); st.rerun()
+            except Exception as ex: st.error(str(ex))
+    elif action=='Copy':
+        dest=st.selectbox('Destination folder',folders,key=f'cdest_{area}_{e["path"]}')
+        if st.button('Copy',type='primary',key=f'cgo_{area}_{e["path"]}'):
+            try:
+                target=_safe(root,str(Path(dest)/p.name) if dest!='/' else p.name)
+                if target.exists(): raise FileExistsError('Destination already exists.')
+                files.copy(area,e['path'],area,target.relative_to(root).as_posix()); st.rerun()
+            except Exception as ex: st.error(str(ex))
+    elif action in {'Move to other area','Copy to other area'}:
+        other='source' if area=='workspace' else 'workspace'; dests=_folders(_root(store,other)); dest=st.selectbox(f'{AREAS[other][0]} folder',dests,key=f'xarea_{area}_{e["path"]}')
+        if st.button(action,type='primary',key=f'xgo_{area}_{e["path"]}'):
+            try: _transfer(store,area,e['path'],other,dest,action.startswith('Move')); st.rerun()
+            except Exception as ex: st.error(str(ex))
+    elif action=='Download':
+        if e['type']=='Folder': st.info('Folder download is not enabled here; use individual files.')
+        else: st.download_button('Download file',p.read_bytes(),file_name=p.name,use_container_width=True)
+    elif action=='Delete':
+        st.warning(f"Delete {e['type'].lower()} '{e['name']}' permanently?")
+        if st.button('Delete permanently',type='primary',key=f'del_{area}_{e["path"]}'):
+            files.delete(area,e['path']); st.rerun()

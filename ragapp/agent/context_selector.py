@@ -164,7 +164,7 @@ def _looks_like_cognition_mutation(query: str) -> bool:
 
 def _requests_recompile(query: str) -> bool:
     q = str(query or "").strip().lower()
-    return bool(re.search(r"\b(recompile|re-compile|compile|rebuild|reingest|re-ingest)\b", q))
+    return bool(re.search(r"\b(re-?compil(?:e|ed|es|ing)|compil(?:e|ed|es|ing)|rebuil[dt]|re-?ingest(?:ed)?)\b", q))
 
 
 class ContextSelector:

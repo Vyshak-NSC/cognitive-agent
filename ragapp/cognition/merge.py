@@ -14,12 +14,32 @@ def _semantic_generator(store):
     return generator
 
 
+def _named_entity_seeds(store, request):
+    """Entities whose id/name literally appears in the request (structural, no LLM).
+
+    Lexical/semantic search alone can miss short names, so the entities the user
+    actually named are always seeded first and therefore always have their
+    relationship neighbourhood loaded.
+    """
+    import re
+    text = str(request or "").lower()
+    seeds = []
+    for eid, meta in (store.master_metadata().get("entities") or {}).items():
+        for name in {str(eid), str((meta or {}).get("name") or "")}:
+            name = name.strip().lower()
+            if len(name) >= 2 and re.search(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", text):
+                seeds.append(("entity", str(eid), 0))
+                break
+    return seeds
+
+
 def _semantic_context(store, request, max_chars=10000):
     """Load a bounded two-hop connected subgraph; semantic judgment remains with the LLM."""
     from ragapp.core.retrieval import RetrievalStore
     retrieval = RetrievalStore(store)
     candidates = retrieval.search_metadata_candidates(str(request or ""), limit=10).get("candidates", [])
-    queue = [(str(c.get("kind") or ""), str(c.get("id") or ""), 0) for c in candidates]
+    queue = _named_entity_seeds(store, request)
+    queue += [(str(c.get("kind") or ""), str(c.get("id") or ""), 0) for c in candidates]
     seen, ordered = set(), []
     while queue and len(ordered) < 32:
         kind, ident, depth = queue.pop(0)
@@ -335,19 +355,26 @@ def _recompile_authoritative_sources(store, changes, request, files=None):
     return DocumentCognitionCompiler(store).compile_files(files, authoritative_changes=changes)
 
 
-def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent", max_context_chars=10000):
-    """Apply arbitrary approved cognition changes as one semantic transaction."""
+def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent", max_context_chars=10000, recompile_source=False):
+    """Apply arbitrary approved cognition changes as one semantic transaction.
+
+    Order: (1) Git commit of the current state, (2) load the connected subgraph,
+    (3) plan minimal operations, (4) apply them, (5) verify/repair closure,
+    (6) commit. Only the affected canonical objects are edited; source documents
+    are NOT re-extracted unless ``recompile_source=True``.
+    """
     import shutil, tempfile
     from pathlib import Path
     from ragapp.core.metadata_sync import sync_store
     request = "\n".join(f"- {str(x)}" for x in changes if str(x).strip()) if isinstance(changes, (list, tuple)) else str(changes or "").strip()
     if not request: raise ValueError("semantic cognition mutation requires requested changes")
+    # (1) VCS checkpoint FIRST, before anything is loaded or planned.
+    pre_commit = store.commit_authoritative_change("Pre-state backup before semantic cognition mutation")
     context = _semantic_context(store, request, max_chars=max_context_chars)
-    source_files = _source_files_for_semantic_request(store, request)
+    source_files = _source_files_for_semantic_request(store, request) if recompile_source else []
     plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, context, source_recompile=bool(source_files))))
     if not isinstance(plan, dict) or not isinstance(plan.get("operations"), list):
         raise ValueError("semantic cognition mutation returned an invalid operation plan")
-    pre_commit = store.commit_authoritative_change("Pre-state backup before semantic cognition mutation")
     with tempfile.TemporaryDirectory(prefix="cognition-mutation-") as tmp:
         backup = Path(tmp) / "cognition"; shutil.copytree(store.cognition, backup)
         try:
@@ -357,25 +384,29 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
             # Source-derived cognition is rebuilt under the approved override instead
             # of relying on surgical JSON edits alone. The source remains unchanged;
             # the explicit current-state mutation outranks conflicting old source facts.
-            recompilation = _recompile_authoritative_sources(
-                store,
-                [str(x) for x in changes] if isinstance(changes, (list, tuple)) else [request],
-                request,
-                files=source_files,
-            )
+            recompilation = None
+            if source_files:
+                recompilation = _recompile_authoritative_sources(
+                    store,
+                    [str(x) for x in changes] if isinstance(changes, (list, tuple)) else [request],
+                    request,
+                    files=source_files,
+                )
 
             # Re-plan once against the post-recompile graph, then enforce a
             # generic semantic-closure invariant. The transaction is not allowed
             # to commit while any connected current claim remains inconsistent
             # with the authoritative mutation and unchanged connected state.
-            post_context = _semantic_context(store, request, max_chars=max_context_chars)
-            post_plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, post_context, source_recompile=False)))
-            if not isinstance(post_plan, dict) or not isinstance(post_plan.get("operations"), list):
-                raise ValueError("post-recompile semantic reconciliation returned an invalid operation plan")
-            post_applied, post_rejected = _apply_semantic_operations(store, post_plan.get("operations"), source_label, pre_commit)
-            if post_rejected:
-                raise RuntimeError("post-recompile semantic reconciliation contained rejected operations: " + json.dumps(post_rejected, ensure_ascii=False))
-            applied.extend(post_applied)
+            post_plan, post_applied = {}, []
+            if source_files:  # re-plan only when a recompile could have re-introduced stale facts
+                post_context = _semantic_context(store, request, max_chars=max_context_chars)
+                post_plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, post_context, source_recompile=False)))
+                if not isinstance(post_plan, dict) or not isinstance(post_plan.get("operations"), list):
+                    raise ValueError("post-recompile semantic reconciliation returned an invalid operation plan")
+                post_applied, post_rejected = _apply_semantic_operations(store, post_plan.get("operations"), source_label, pre_commit)
+                if post_rejected:
+                    raise RuntimeError("post-recompile semantic reconciliation contained rejected operations: " + json.dumps(post_rejected, ensure_ascii=False))
+                applied.extend(post_applied)
 
             verification_applied, verification_reports = _verify_and_repair_semantic_closure(
                 store, request, source_label, pre_commit, max_context_chars
