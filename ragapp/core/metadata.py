@@ -237,6 +237,23 @@ class MetadataDB:
             c.execute("""INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?,?)""",
             (ident,self._json(e.get("description",e.get("event",""))),self._json(e.get("entities",[])),self._json(e.get("timeline")),e.get("source_artifact"),self._json(e.get("source_locator")),e.get("created_at",now())))
         return ident
+    def rebuild_relation_index(self, store):
+        """Rebuild the derived SQLite relation index from canonical relationship JSON files."""
+        with self.conn() as c:
+            c.execute("DELETE FROM relations")
+        for rid, rel in store.relationships().items():
+            prov = next((p.get("artifact_id") for p in (rel.get("provenance") or []) if isinstance(p, dict) and p.get("artifact_id")), None)
+            self.add_relation({
+                "id": rid,
+                "from_id": rel.get("source"),
+                "to_id": rel.get("target"),
+                "relation_type": rel.get("type", "related_to"),
+                "description": rel.get("description", ""),
+                "timeline": rel.get("timeline"),
+                "source_artifact": prov,
+                "created_at": rel.get("created_at"),
+            })
+
     def rebuild_event_index(self, store):
         """Rebuild the derived SQLite event index from canonical event JSON files."""
         with self.conn() as c:

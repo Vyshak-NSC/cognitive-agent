@@ -17,6 +17,7 @@ class VCSManager:
     VERSIONED_AREAS = ("source", "workspace", "cognition", "log")
 
     def __init__(self, store):
+        self.store = store
         self.root = Path(store.root)
 
     def _run(self, *args):
@@ -98,20 +99,45 @@ class VCSManager:
         if not commit:
             return {"commit": self.head(), "restored_from": None}
         self.init()
+        # Step 1: commit the CURRENT state so the branch being left is never lost.
         self.checkpoint("Pre conversation-branch switch")
-        # Remove current tracked versioned content so files absent in the target
-        # revision are removed too, then restore the target tree.
-        import shutil
-        for area in self.VERSIONED_AREAS:
-            target=self.root/area
-            if target.exists(): shutil.rmtree(target)
-            target.mkdir(parents=True,exist_ok=True)
-        tree_paths=set(self._run("ls-tree", "-d", "--name-only", str(commit)).splitlines())
-        for area in self.VERSIONED_AREAS:
-            if area in tree_paths:
-                subprocess.run(["git","checkout",str(commit),"--",area],cwd=self.root,check=True,capture_output=True,text=True)
-        new_commit=self.commit(message or f"Activate conversation state {str(commit)[:12]}",bind_timeline=False)
-        return {"commit":new_commit,"restored_from":str(commit)}
+        target = self._run("rev-parse", "--verify", f"{commit}^{{commit}}")
+        areas = list(self.VERSIONED_AREAS)
+
+        # Nothing changed since that state (e.g. the old turn was plain Q&A): no-op.
+        same = subprocess.run(["git", "diff", "--quiet", target, "HEAD", "--", *areas], cwd=self.root).returncode == 0
+        if same:
+            return {"commit": self.head(), "restored_from": target, "unchanged": True}
+
+        # Step 2: make index + working tree match the target state using Git itself.
+        # No directory is ever deleted by Python, so Windows file locks can't leave a
+        # half-emptied cognition/ folder. `git restore --source` also removes files
+        # that do not exist in the target, so the old edits cannot leak into the fork.
+        in_target = {a for a in areas if self._run("ls-tree", "--name-only", target, "--", a)}
+        in_head = {a for a in areas if self._run("ls-tree", "--name-only", "HEAD", "--", a)}
+        for area in sorted(in_target):
+            subprocess.run(["git", "restore", f"--source={target}", "--staged", "--worktree", "--", area],
+                           cwd=self.root, check=True, capture_output=True, text=True)
+        for area in sorted(in_head - in_target):
+            subprocess.run(["git", "rm", "-r", "-q", "-f", "--", area],
+                           cwd=self.root, check=True, capture_output=True, text=True)
+        for area in areas:
+            (self.root / area).mkdir(parents=True, exist_ok=True)
+
+        new_commit = self.commit(message or f"Activate conversation state {str(commit)[:12]}", bind_timeline=False)
+        self._rebuild_derived_indexes()
+        return {"commit": new_commit, "restored_from": target}
+
+    def _rebuild_derived_indexes(self):
+        """SQLite (.system/metadata.db) is not versioned; rebuild it from the restored JSON."""
+        try:
+            from ragapp.core.metadata_sync import sync_store
+            db = sync_store(self.store)
+            db.rebuild_relation_index(self.store)
+            db.rebuild_event_index(self.store)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Derived index rebuild after state restore failed")
 
     # Backwards-compatible name used by approval code.
     def backup_authoritative_state(self, message="Pre-state backup"):
