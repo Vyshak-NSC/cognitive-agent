@@ -68,7 +68,7 @@ PROMPT_MODULES = {
     },
     "documents": {
         "description": "Read or manipulate PDF DOCX PPTX XLSX XML and other structured document formats.",
-        "text": "Use the format-specific tool selected for the task and preserve document structure unless the user requests conversion.",
+        "text": "Distinguish TRANSFORM from SUMMARIZE and GENERATE. When the user asks to format, restyle, typeset, clean up, beautify, convert or export an existing document, treat it as a lossless TRANSFORM by default: preserve all source sections, paragraphs, lists, tables, notes, ordering and meaning. Formatting changes presentation, not content. Use transform_document for DOCX-to-PDF transformation when available. Never summarize, condense, omit or rewrite source content unless the user explicitly requests that content operation.",
     },
     "mermaid": {
         "description": "Create Mermaid diagrams, flowcharts, relationship diagrams, architecture diagrams or visual graphs.",

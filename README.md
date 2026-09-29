@@ -199,7 +199,7 @@ The project is intentionally constrained to Python 3.12. `pyproject.toml` declar
 Clone the repository and enter it:
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/Vyshak-NSC/cognitive-agent.git
 cd cognitive-agent
 ```
 
