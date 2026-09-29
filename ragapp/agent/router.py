@@ -36,7 +36,7 @@ def route_request(query: str) -> RequestRoute:
     temporal = _has(q, r"\b(current|latest|previous|histor(?:y|ical)|timeline|before|after|chapter|session|turn|flashback|era|as of)\b")
     mermaid = _has(q, r"\bmermaid\b", r"\b(flowchart|sequence diagram|class diagram)\b")
     vcs = _has(q, r"\b(git|commit|revision|version history|restore|rollback|diff|checkpoint)\b")
-    compile_task = _has(q, r"\b(recompile|compile|compilation|ingest|reingest)\b")
+    compile_task = _has(q, r"\b(re-?compil(?:e|ed|es|ing)|compil(?:e|ed|es|ing)|compilation|ingest(?:ed)?|reingest(?:ed)?)\b")
     source_mutation = _has(q, r"\b(edit|change|modify|update|replace|append|delete|remove|create|write|rename|move)\b.*\b(source|file|code|\.py|\.js|\.ts|\.json|\.ya?ml|\.toml)\b",
                            r"\b(source|file|code|\.py|\.js|\.ts|\.json|\.ya?ml|\.toml)\b.*\b(edit|change|modify|update|replace|append|delete|remove|create|write|rename|move)\b")
     files = _has(q, r"\b(file|folder|workspace|source|document|docx|pdf|xml|pptx|xlsx|excel|powerpoint|binary|csv|markdown|\.md|\.txt|\.py)\b")
