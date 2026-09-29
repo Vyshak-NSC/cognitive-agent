@@ -145,6 +145,32 @@ def _looks_like_project_mutation(query: str) -> bool:
     return bool(target)
 
 
+def _looks_like_project_inspection(query: str) -> bool:
+    """Deterministic backstop for questions that require reading project source.
+
+    Semantic routing is still useful for capability selection, but source-backed
+    questions must not be downgraded to ordinary conversation just because the
+    query is terse (for example, "get full schema of invoice").
+    """
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+
+    inspection = re.search(
+        r"\b(inspect|read|show|find|locate|explain|review|analy[sz]e|check|trace|list|get|"
+        r"extract|derive|determine|schema|structure|fields?|columns?|models?|classes?|"
+        r"methods?|functions?|implementation|source)\b",
+        q,
+    )
+    project_target = re.search(
+        r"\b(project|source|code|codebase|repo|repository|file|files|folder|package|"
+        r"models?|classes?|schema|table|tables|implementation|config|configuration|"
+        r"api|route|endpoint|database|invoice|accruals?)\b",
+        q,
+    )
+    return bool(inspection and project_target)
+
+
 def _looks_like_cognition_mutation(query: str) -> bool:
     """Deterministic backstop for explicit canonical/cognition state changes."""
     q = str(query or "").strip().lower()
@@ -228,7 +254,11 @@ class ContextSelector:
                 intent = "cognition_mutation"
                 intent_score = 1.0
             elif _looks_like_project_mutation(query):
+                # Mutation wins over inspection when both kinds of words appear.
                 intent = "project_mutation"
+                intent_score = 1.0
+            elif _looks_like_project_inspection(query):
+                intent = "project_inspection"
                 intent_score = 1.0
             elif intent in {"project_mutation", "cognition_mutation"}:
                 # Mutation contracts are never activated by nearest-neighbour similarity alone.

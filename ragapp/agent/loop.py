@@ -527,9 +527,13 @@ def _persist_drafts(
             draft,
         )
     return drafts, skipped
-_BASE_PROJECT_MUTATION_TOOLS = (
+_BASE_PROJECT_INSPECTION_TOOLS = (
     "list_project_files",
     "read_project_text",
+)
+
+_BASE_PROJECT_MUTATION_TOOLS = (
+    *_BASE_PROJECT_INSPECTION_TOOLS,
     "create_project_file",
     "edit_project_text",
     "propose_source_file",
@@ -549,7 +553,7 @@ def _successful_project_mutation(calls):
     """Return True only for an actual successful workspace/source proposal mutation."""
     mutation_tools = {
         "create_project_file", "edit_project_text", "create_project_folder",
-        "copy_project_item", "move_project_item", "delete_project_item",
+        "copy_project_item", "copy_to_workspace", "move_project_item", "delete_project_item",
         "propose_source_file", "propose_source_edit",
     }
     for call in calls:
@@ -561,14 +565,57 @@ def _successful_project_mutation(calls):
     return False
 
 
-def _prime_project_mutation_context(registry, calls):
-    """Inspect the authoritative source tree before the first mutation model turn.
+def _successful_project_read(calls, area=None):
+    """True after a real project file has been read successfully.
 
-    This is runtime orchestration, not LLM discretion. A user asking to change an
-    existing project should never have to tell the model to look at the project.
+    ``area`` may be ``source`` or ``workspace``.  When omitted, either area
+    counts.  Directory listings, cognition and semantic prefetch do not count.
     """
-    result = _json_safe(registry.call("list_project_files", {"area": "source", "relative_path": ""}))
-    _record_tool_call(calls, "list_project_files", {"area": "source", "relative_path": ""}, result)
+    for call in calls:
+        tool = call.get("tool")
+        if tool not in {"read_project_text", "read_pdf"}:
+            continue
+        args = call.get("args") or {}
+        result = call.get("result")
+        call_area = args.get("area", "workspace" if tool == "read_pdf" else None)
+        if area is not None and call_area != area:
+            continue
+        if call_area not in {"source", "workspace"}:
+            continue
+        if not isinstance(result, dict):
+            continue
+        if result.get("error") or result.get("status") == "error":
+            continue
+        if tool == "read_project_text" and "content" in result:
+            return True
+        if tool == "read_pdf" and "pages" in result:
+            return True
+    return False
+
+
+def _inspection_areas(query):
+    """Return the project areas that must be inspected for this request.
+
+    Workspace is mandatory when the user names it.  Source is mandatory for
+    source/model/schema/code requests.  If neither is explicit, source remains
+    the conservative default for project inspection.
+    """
+    q = str(query or "").lower()
+    areas = []
+    if re.search(r"\b(workspace|draft|staged|data\.xml)\b", q):
+        areas.append("workspace")
+    if re.search(r"\b(source|models?|schema|tables?|classes?|code|implementation|invoice|accruals?)\b", q):
+        areas.append("source")
+    if not areas:
+        areas.append("source")
+    return tuple(dict.fromkeys(areas))
+
+
+def _prime_project_area_context(registry, calls, area):
+    """List one real project area before source/workspace-backed model work."""
+    args = {"area": area, "relative_path": ""}
+    result = _json_safe(registry.call("list_project_files", args))
+    _record_tool_call(calls, "list_project_files", args, result)
     return result
 
 
@@ -676,8 +723,25 @@ def run_agent(context: AgentRunContext):
 
     selected_modules = list(selection.get("modules") or [])
     selected_modules.extend(context.agent_guidance())
-    execution_intent = selection.get("intent") == "project_mutation"
-    if execution_intent:
+    intent = selection.get("intent")
+    project_mutation_intent = intent == "project_mutation"
+    project_inspection_intent = intent == "project_inspection"
+    required_inspection_areas = _inspection_areas(query) if project_inspection_intent else ()
+    # Backwards-compatible alias for the existing mutation execution path.
+    execution_intent = project_mutation_intent
+
+    if project_inspection_intent:
+        selected_modules.append(
+            "This turn requires inspection of actual project files. "
+            f"Required project areas for this request: {', '.join(required_inspection_areas)}. "
+            "Use list_project_files and read_project_text in every required area; for an exact PDF page/range, use read_pdf with the matching area and page range. "
+            "Do not answer from cognition, semantic retrieval, filenames, symbol metadata, or assumptions "
+            "when the requested information can be obtained from project files. Read the relevant files "
+            "before producing the final answer. For requests that combine workspace input data with source "
+            "models/schema, inspect BOTH areas and use the real contents from each."
+        )
+
+    if project_mutation_intent:
         selected_modules.append(
             "This turn is an explicit project mutation request. Inspect the existing project with project tools, "
             "make the requested change in /workspace, and create the normal pending source review proposal. "
@@ -707,19 +771,56 @@ def run_agent(context: AgentRunContext):
             + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
         )
     allowed_tool_names = list(selection.get("tool_names") or [])
-    if execution_intent:
+    # Deterministic copy path: a copy/duplicate/clone request always gets the
+    # one-shot folder-capable tool, regardless of semantic top-k ranking.
+    if re.search(r"\b(copy|duplicate|clone)\b", str(query or ""), re.I):
+        _ensure_available_tools(allowed_tool_names, registry, ("list_project_files", "copy_to_workspace"))
+    # Whole-project undo: always expose the one-shot restore tool (never per-file loops).
+    if re.search(r"\b(undo|revert|roll\s?back|rollback|restore|go back)\b", str(query or ""), re.I):
+        _ensure_available_tools(allowed_tool_names, registry, ("restore_project_state", "list_project_states"))
+    if project_inspection_intent:
+        _ensure_available_tools(allowed_tool_names, registry, _BASE_PROJECT_INSPECTION_TOOLS)
+    if project_mutation_intent:
         _ensure_available_tools(allowed_tool_names, registry, _BASE_PROJECT_MUTATION_TOOLS)
-        # Project inspection is a base-runtime responsibility. Prime the model
-        # with the real source tree instead of hoping it chooses discovery first.
-        source_tree = _prime_project_mutation_context(registry, calls)
+
+    # Project discovery is runtime responsibility, not model discretion.
+    # Inspection may require /workspace, /source, or both.
+    if project_inspection_intent:
+        project_trees = {}
+        for area in required_inspection_areas:
+            try:
+                project_trees[area] = _prime_project_area_context(registry, calls, area)
+            except Exception as exc:
+                LOGGER.exception("Could not inspect project area=%s project=%s", area, project_id)
+                project_trees[area] = {"error": str(exc)}
+
+        system_instruction += (
+            "\n\nCURRENT PROJECT TREES (runtime-inspected before this turn):\n"
+            + json.dumps(project_trees, ensure_ascii=False)
+            + "\n\nPROJECT INSPECTION CONTRACT:\n"
+            + "- Required areas: " + ", ".join(required_inspection_areas) + ".\n"
+            + "- You MUST read relevant files in EVERY required area before answering. Use read_project_text generally; for an exact PDF page/range, use read_pdf with area=source/workspace and start_page/end_page.\n"
+            + "- If workspace contains an input file (for example data.xml), read that actual workspace file.\n"
+            + "- If source contains models/schema needed to interpret that input, read those actual source files too.\n"
+            + "- Cognition, semantic retrieval, filenames and symbol metadata are navigation aids only.\n"
+            + "- Do not ask the user to paste a file that exists in a listed project area.\n"
+        )
+
+    if project_mutation_intent:
+        try:
+            source_tree = _prime_project_area_context(registry, calls, "source")
+        except Exception as exc:
+            LOGGER.exception("Could not inspect authoritative source tree project=%s", project_id)
+            source_tree = {"error": str(exc)}
         if isinstance(source_tree, dict) and not source_tree.get("error"):
             system_instruction += (
                 "\n\nCURRENT AUTHORITATIVE SOURCE TREE (runtime-inspected before this turn):\n"
                 + json.dumps(source_tree, ensure_ascii=False)
-                + "\nUse read_project_text on the relevant existing files before editing. "
+                + "\nUse read_project_text on relevant existing files before editing. "
                   "Stage the completed source change with propose_source_edit/propose_source_file; "
                   "that tool creates the pending Review item."
             )
+
     def _discover_tools(requirement, limit=6):
         try:
             hits = selector.index.search("tools", requirement, limit=max(1, min(int(limit or 6), 12)), min_score=0.15)
@@ -779,6 +880,37 @@ def run_agent(context: AgentRunContext):
             if explicit_recompile and (not isinstance(recompile_result, dict) or recompile_result.get("status") not in {"compiled", "ok", "success"}):
                 error = (recompile_result or {}).get("error") if isinstance(recompile_result, dict) else "unknown error"
                 return (f"I could not recompile the project cognition: {error}", calls, [])
+            # A project inspection must consume real authoritative source before
+            # the model may finish. This prevents partial cognition/metadata from
+            # being presented as if it were the complete project schema/content.
+            if project_inspection_intent:
+                missing_areas = [
+                    area for area in required_inspection_areas
+                    if not _successful_project_read(calls, area)
+                ]
+                if missing_areas:
+                    if execution_gate_retries < 3:
+                        execution_gate_retries += 1
+                        system_instruction += (
+                            "\n\nPROJECT INSPECTION GATE: You attempted to finish before reading all required "
+                            "project areas. Missing successful file reads for: "
+                            + ", ".join(missing_areas)
+                            + ". Read the relevant files in those areas now. If an input file such as data.xml "
+                              "is in workspace, read it from area='workspace'. If models/schema are in source, "
+                              "read them from area='source'. Then complete the user's original request directly."
+                        )
+                        LOGGER.warning(
+                            "Blocked incomplete project inspection project=%s step=%d retry=%d missing=%s",
+                            project_id, step_number + 1, execution_gate_retries, missing_areas,
+                        )
+                        continue
+                    return (
+                        "I could not read all project areas required for this request: "
+                        + ", ".join(missing_areas),
+                        calls,
+                        [],
+                    )
+
             # A project mutation request is executable work. The base runtime does
             # not allow the first model turn to downgrade it into advice, a plan,
             # or a request for files that the project tools can inspect directly.
@@ -906,6 +1038,13 @@ def run_agent(context: AgentRunContext):
                     "error": call["args_error"],
                     "tool": tool_name,
                 }
+            elif tool_name == "restore_file_revision" and sum(1 for c in calls if c.get("tool") == "restore_file_revision") >= 3:
+                # Loop breaker: the model is undoing file-by-file. Point it at the single-call tool.
+                result = {
+                    "error": "Too many single-file restores in one run. Stop. Use restore_project_state ONCE "
+                             "(target='last_compile' or a commit id) to restore the whole project.",
+                    "tool": tool_name,
+                }
             else:
                 try:
                     result = registry.call(
@@ -939,6 +1078,22 @@ def run_agent(context: AgentRunContext):
                 tool_args,
                 safe_result,
             )
+            if (
+                tool_name == "restore_project_state"
+                and isinstance(safe_result, dict)
+                and not safe_result.get("error")
+                and safe_result.get("status") in {"restored", "unchanged"}
+            ):
+                # Terminal tool: report deterministically and STOP. No further model turns.
+                if safe_result["status"] == "unchanged":
+                    final = (f"The project already matches {safe_result['restored_to'][:10]} "
+                             f"({safe_result['restored_to_message']}); nothing to undo.")
+                else:
+                    final = (f"Restored the whole project to {safe_result['restored_to'][:10]} "
+                             f"({safe_result['restored_to_message']}). {safe_result['files_affected']} file(s) affected. "
+                             f"{safe_result['undo_hint']}")
+                LOGGER.info("Agent completed via terminal restore project=%s", project_id)
+                return (final, calls, [])
             model_result = safe_result
             # A page/range requested for display is rendered directly from
             # the local PDF. The page text never enters the model context.

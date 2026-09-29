@@ -128,6 +128,86 @@ class VCSManager:
         self._rebuild_derived_indexes()
         return {"commit": new_commit, "restored_from": target}
 
+    # ------------------------------------------------------------------
+    # Whole-project state helpers (deterministic; the LLM only names a target)
+    # ------------------------------------------------------------------
+    _NOISE_PREFIXES = ("Bind timeline to", "Pre-state backup", "Pre-change:", "Pre-restore", "Pre conversation-branch")
+
+    def list_states(self, limit=15, kind="all"):
+        """Project-wide restore points, newest first. kind='compile' -> compile points only."""
+        if not self._has_head():
+            return []
+        limit = min(max(int(limit or 15), 1), 100)
+        fmt = "%H%x1f%aI%x1f%s%x1e"
+        args = ["log", "--first-parent", f"--format={fmt}"]
+        if kind == "compile":
+            args += ["--grep=^Compile canonical cognition$", f"-{limit}"]
+        else:
+            args += ["-400"]
+        out = self._run(*args)
+        rows = []
+        for rec in out.split("\x1e"):
+            rec = rec.strip()
+            if not rec:
+                continue
+            h, ts, subject = (rec.split("\x1f") + ["", ""])[:3]
+            if kind != "compile" and subject.startswith(self._NOISE_PREFIXES):
+                continue
+            rows.append({"commit": h, "short": h[:10], "timestamp": ts, "message": subject})
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def resolve_state(self, target="last_compile"):
+        """Resolve a keyword or commit-ish to one commit id.
+
+        'last_compile' -> the newest 'Compile canonical cognition' commit, advanced to
+        the 'Bind timeline to ...' commit that immediately follows it (the finished,
+        timeline-bound post-compile state). Anything else is treated as a commit-ish.
+        """
+        t = str(target or "last_compile").strip()
+        if t.lower() in {"last_compile", "post_compile", "compile", "last_compiled", "compiled"}:
+            compile_commit = self._run("log", "--first-parent", "-1", "--format=%H", "--grep=^Compile canonical cognition$")
+            if not compile_commit:
+                raise ValueError("No compile point exists in this project's history.")
+            chosen = compile_commit
+            following = self._run("rev-list", "--reverse", "--first-parent", f"{compile_commit}..HEAD").splitlines()
+            if following:
+                subject = self._run("log", "-1", "--format=%s", following[0])
+                if subject.startswith("Bind timeline to"):
+                    chosen = following[0]
+            return chosen
+        return self._run("rev-parse", "--verify", f"{t}^{{commit}}")
+
+    def restore_project_state(self, target="last_compile"):
+        """Restore ALL versioned areas to a state in ONE operation (forward-moving, recoverable)."""
+        self.init()
+        commit = self.resolve_state(target)
+        areas = list(self.VERSIONED_AREAS)
+        head_before = self.head()
+        changed = [x for x in self._run("diff", "--name-only", commit, "--", *areas).splitlines() if x]
+        untracked = [x for x in self._run("ls-files", "--others", "--exclude-standard", "--", *areas).splitlines() if x]
+        subject = self._run("log", "-1", "--format=%s", commit)
+        result = self.materialize_state(commit, message=f"Restore project state to {commit[:10]}: {subject}"[:200])
+        # Converge: removing a tracked .gitignore (absent in the target) can expose previously
+        # ignored files (e.g. __pycache__) to the restore commit. Re-apply until the tree
+        # matches the target exactly, so the result is exact and a repeat call is a no-op.
+        for _ in range(2):
+            if not self._run("diff", "--name-only", commit, "HEAD", "--", *areas).strip():
+                break
+            result = self.materialize_state(commit, message=f"Converge project state to {commit[:10]}")
+            result["unchanged"] = False
+        converged = not self._run("diff", "--name-only", commit, "HEAD", "--", *areas).strip()
+        return {
+            "converged": converged,
+            "status": "unchanged" if (result.get("unchanged") and not changed and not untracked) else "restored",
+            "restored_to": commit, "restored_to_message": subject,
+            "previous_head": head_before, "new_head": self.head(),
+            "files_affected": len(set(changed) | set(untracked)),
+            "sample_paths": sorted(set(changed) | set(untracked))[:15],
+            "undo_hint": f"The pre-restore state is preserved in git as {str(head_before)[:10]}; restore_project_state(target='{str(head_before)[:10]}') reverses this.",
+        }
+
     def _rebuild_derived_indexes(self):
         """SQLite (.system/metadata.db) is not versioned; rebuild it from the restored JSON."""
         try:
