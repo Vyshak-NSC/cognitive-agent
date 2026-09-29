@@ -40,6 +40,7 @@ def route_request(query: str) -> RequestRoute:
     source_mutation = _has(q, r"\b(edit|change|modify|update|replace|append|delete|remove|create|write|rename|move)\b.*\b(source|file|code|\.py|\.js|\.ts|\.json|\.ya?ml|\.toml)\b",
                            r"\b(source|file|code|\.py|\.js|\.ts|\.json|\.ya?ml|\.toml)\b.*\b(edit|change|modify|update|replace|append|delete|remove|create|write|rename|move)\b")
     files = _has(q, r"\b(file|folder|workspace|source|document|docx|pdf|xml|pptx|xlsx|excel|powerpoint|binary|csv|markdown|\.md|\.txt|\.py)\b")
+    document_transform = _has(q, r"\b(format|restyle|typeset|clean up|beautify|professionally format|convert|export|render)\b.*\b(document|docx|pdf|file)\b", r"\b(document|docx|file)\b.*\b(to|as|into)\s+(?:a\s+)?pdf\b")
     agent_creation = _has(q, r"\b(create|build|define|configure|edit|update|delete|list|show)\b.*\bagent\b", r"\bagent\s+(creator|creation|manager|definition)\b")
     workflow = _has(q, r"\bworkflow\b", r"\b(deterministic|inference)\s+step\b")
 
@@ -49,6 +50,7 @@ def route_request(query: str) -> RequestRoute:
     if vcs: caps.update({"vcs", "files"})
     if compile_task: caps.update({"compilation", "cognition"})
     if files: caps.add("files")
+    if document_transform: caps.update({"files", "document_transform"})
     if source_mutation: caps.update({"files", "source_mutation", "vcs"})
     if agent_creation: caps.add("agent_creation")
     if workflow: caps.add("workflow")
@@ -91,6 +93,8 @@ def allowed_tool_names(route: RequestRoute, available_names) -> set[str]:
         allowed |= _PROJECT_READ
         # Format-specific reads are useful for explicit file work.
         allowed |= {n for n in names if n.startswith("read_")}
+    if route.has("document_transform"):
+        allowed |= {"transform_document", "read_docx", "read_pdf"}
     if route.has("source_mutation"):
         allowed |= _PROJECT_WRITE
         allowed |= {n for n in names if n.startswith(("write_", "edit_", "delete_")) or n == "copy_pdf_pages"}

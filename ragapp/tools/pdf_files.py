@@ -2,6 +2,9 @@
 import io
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import letter
 from ragapp.tools.definitions import Tool
 from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
@@ -23,15 +26,23 @@ def read_pdf(username, relative_path, start_page=None, end_page=None, area="work
     return {"path": relative_path, "area": area, "page_count": total, "pages": [{"page": i, "text": reader.pages[i-1].extract_text() or ""} for i in range(start, end+1)]}
 
 def write_pdf(username, relative_path, pages):
+    """Create a readable generated PDF with automatic wrapping/pagination.
+
+    For lossless formatting/conversion of an existing DOCX, use transform_document instead.
+    """
     path = _path(username, relative_path); path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists(): raise FileExistsError(f"File already exists: {relative_path}")
-    writer = PdfWriter()
-    for spec in pages:
-        buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(float(spec.get("width",612)), float(spec.get("height",792))))
-        for line in spec.get("text", "").splitlines():
-            c.drawString(float(spec.get("x",54)), float(spec.get("y",738)), line); spec["y"] = float(spec.get("y",738)) - float(spec.get("line_height",14))
-        c.showPage(); c.save(); buf.seek(0); writer.add_page(PdfReader(buf).pages[0])
-    with path.open("wb") as f: writer.write(f)
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(str(path), pagesize=letter, leftMargin=54, rightMargin=54, topMargin=54, bottomMargin=54)
+    story = []
+    for page_index, spec in enumerate(pages):
+        for raw in str(spec.get("text", "")).splitlines():
+            if raw.strip():
+                story.append(Paragraph(raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), styles["BodyText"]))
+                story.append(Spacer(1, 4))
+        if page_index < len(pages) - 1:
+            story.append(PageBreak())
+    doc.build(story)
     return {"path": relative_path, "status": "created"}
 
 def copy_pdf_pages(username, source_relative_path, destination_relative_path, start_page, end_page):
@@ -74,7 +85,7 @@ def build_pdf_tools(username):
         Tool("read_pdf", "Read PDF text and page structure from workspace or authoritative source. Set area='source' for /source. Use start_page/end_page for specific pages.", {"type":"object","properties":{"relative_path":{"type":"string"},"area":{"type":"string","enum":["workspace","source"]},"start_page":{"type":"integer"},"end_page":{"type":"integer"}},"required":["relative_path"]}, lambda relative_path, area="workspace", start_page=None, end_page=None: read_pdf(username, relative_path, start_page, end_page, area)),
         Tool(
             "write_pdf",
-            "Create a real PDF from page specifications. Use when creating a new PDF.",
+            "Create a new text PDF with automatic wrapping and pagination. For formatting/converting an existing DOCX, use transform_document instead.",
             {
                 "type": "object",
                 "properties": {

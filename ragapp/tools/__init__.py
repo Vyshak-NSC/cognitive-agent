@@ -3,6 +3,7 @@ from ragapp.tools.workspace_files import build_workspace_file_tools
 from ragapp.tools.regular_files import build_regular_file_tools
 from ragapp.tools.docx_files import build_docx_tools
 from ragapp.tools.pdf_files import build_pdf_tools
+from ragapp.tools.document_tools import build_document_tools
 from ragapp.tools.xml_files import build_xml_tools
 from ragapp.tools.pptx_files import build_pptx_tools
 from ragapp.tools.xlsx_files import build_xlsx_tools
@@ -32,6 +33,7 @@ def build_default_tools(username, store, include_cognition=True, session_id=None
     tools.extend(build_regular_file_tools(username))
     tools.extend(build_docx_tools(username))
     tools.extend(build_pdf_tools(username))
+    tools.extend(build_document_tools(username))
     tools.extend(build_xml_tools(username))
     tools.extend(build_pptx_tools(username))
     tools.extend(build_xlsx_tools(username))
