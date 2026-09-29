@@ -173,6 +173,7 @@ class ApprovalEngine:
         d["pre_state_git_commit"] = pre_commit
         d["commit"] = self.vcs.commit(desc)
         self.drafts.save(d)
+        self._record_approved_change(d, desc, "cognition", relative)
         return d
 
     def _approve_source(self, d, m, target_path, relative):
@@ -222,7 +223,26 @@ class ApprovalEngine:
         d["pre_state_git_commit"] = pre_commit
         d["commit"] = self.vcs.commit(desc)
         self.drafts.save(d)
+        self._record_approved_change(d, desc, "source", relative)
         return d
+
+    def _record_approved_change(self, draft, description, area, relative):
+        """Mirror a successful human-approved mutation into durable world knowledge."""
+        try:
+            from ragapp.tools.cognition_tools import _record_knowledge
+            metadata = draft.get("metadata") or {}
+            _record_knowledge(self.store, "change", {
+                "id": f"change:draft:{draft.get('id')}",
+                "description": description,
+                "status": "applied",
+                "affected": [f"{area}/{relative}"],
+                "caused_by": str(metadata.get("caused_by") or draft.get("id") or "approved draft"),
+                "validation": str((draft.get("reingest") or {}).get("status") or "approved and committed"),
+                "source": f"draft:{draft.get('id')}",
+            })
+        except Exception:
+            # Knowledge bookkeeping must not roll back an already successful source approval.
+            pass
 
     def _write_log(self, d, desc, area, relative):
         self.store.log.mkdir(parents=True, exist_ok=True)

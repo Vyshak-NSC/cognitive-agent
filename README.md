@@ -3,11 +3,11 @@
 **Author:** Vyshak
 
 
-**Version 9.2.2**
+**Version 9.5.2**
 
 Cognitive Persistence Agent (CPA) is a local, project-scoped agent runtime that combines persistent canonical cognition, semantic/structural retrieval, tool-using chat, an isolated workspace, review-gated source changes, Git-backed project history, document/code ingestion, reusable agents/workflows, and multiple LLM providers.
 
-Version 9.2.2 is the current v9.x snapshot represented by this repository.
+Version 9.5.2 is the current v9.x snapshot represented by this repository.
 
 ## What CPA does
 
@@ -15,7 +15,7 @@ CPA maintains a durable project state outside the chat transcript. Source files 
 
 For project modifications, normal chat can inspect authoritative `/source`, work through `/workspace`, and create review proposals. Agent tools do not directly overwrite authoritative source files; source edits are staged and require approval through the Review workflow.
 
-## Version 9.2.2 feature set
+## Version 9.5.2 feature set
 
 ### Persistent canonical cognition
 
@@ -27,6 +27,41 @@ For project modifications, normal chat can inspect authoritative `/source`, work
 - Semantic mutation/reconciliation support for existing cognition.
 - Cognition validation, contradiction inspection, impact analysis, state maps, ledgers, world-model snapshots, and session distillation.
 - Git-backed pre-compilation/state history support through the project VCS layer.
+
+
+### Knowledge lifecycle: evidence, hypotheses, decisions, changes, and open questions
+
+Version 9.5.2 turns the project knowledge lifecycle into an active runtime capability rather than leaving these record types as passive storage primitives.
+
+- **Evidence** records concrete observations and their provenance.
+- **Hypotheses** represent explanations that are still uncertain and can accumulate supporting or disconfirming evidence.
+- **Facts** capture conclusions established strongly enough to be treated as project knowledge.
+- **Decisions** preserve a selected approach, its rationale, alternatives, and consequences.
+- **Changes** record implemented/approved project changes and connect implementation history back to project reasoning.
+- **Open questions** preserve unresolved issues instead of allowing them to disappear when a conversation ends.
+- Hypotheses and open questions can be updated/resolved as new information becomes available.
+- Substantive investigation and implementation turns expose the lifecycle capabilities so the model can use them during normal work.
+- Approved source mutations can create durable change records automatically.
+
+A typical investigation can therefore persist:
+
+```text
+evidence
+    -> hypothesis
+    -> supporting/disconfirming evidence
+    -> fact
+    -> decision
+    -> implementation
+    -> review/approval
+    -> change record
+
+unresolved branch
+    -> open question
+    -> later evidence
+    -> resolution
+```
+
+This makes the reasoning behind a project change retrievable in later sessions instead of preserving only the final code.
 
 ### Semantic + structural retrieval
 
@@ -289,7 +324,7 @@ Compilation may invoke the configured LLM per document segment and can therefore
 
 ## Retrieval architecture
 
-The v9.2.2 read path is designed around local candidate selection followed by bounded hydration:
+The v9.5.2 read path is designed around local candidate selection followed by bounded hydration:
 
 ```text
 user request
@@ -364,7 +399,7 @@ If the dependency is required by the application, declare it in `pyproject.toml`
 uv run python --version
 ```
 
-CPA v9.2.2 targets Python 3.12.x.
+CPA v9.5.2 targets Python 3.12.x.
 
 ### Stale environment
 
@@ -388,26 +423,61 @@ Check `.env` or configure the provider through project Settings. Never commit th
 
 ## Versioning
 
-The current development line is:
+CPA should use **one authoritative application version** and derive every displayed/runtime version from it. Do not manually maintain independent application version strings in `pyproject.toml`, `ragapp/__init__.py`, `api.py`, and the README.
 
-```text
-v9.x
+For v9.5.2, the recommended source of truth is:
+
+```toml
+# pyproject.toml
+[project]
+version = "9.5.2"
 ```
+
+Runtime code should read the installed package metadata:
+
+```python
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("cognitive-persistence-agent")
+except PackageNotFoundError:
+    __version__ = "0.0.0+dev"
+```
+
+Then API/UI code should import that value instead of containing another literal:
+
+```python
+from ragapp import __version__
+
+app = FastAPI(
+    title="Agentic State Layer API",
+    version=__version__,
+)
+```
+
+For release automation, use a small release script (or a tool such as `bump-my-version`) that changes the single `pyproject.toml` version, updates the README release label if you want the README to contain a literal version, refreshes the lock file, runs tests, and creates the Git tag.
+
+A simple release sequence is:
+
+```powershell
+uv run python scripts/set_version.py 9.5.2
+uv lock
+uv sync
+uv run python -m compileall ragapp api.py main.py
+uv run pytest
+git add pyproject.toml uv.lock README.md
+git commit -m "Release v9.5.2"
+git tag -a v9.5.2 -m "v9.5.2"
+git push origin HEAD --tags
+```
+
+Important: schema versions such as `SCHEMA_VERSION`, `TEMPORAL_MODEL_VERSION`, and `TIMELINE_SCHEMA_VERSION` are **not application versions**. They should only change when their respective stored-data schemas change.
 
 This repository snapshot is:
 
 ```text
-v9.2.2
+v9.5.2
 ```
-
-Create the release tag after the code and metadata are committed:
-
-```powershell
-git tag -a v9.2.2 -m "v9.2.2"
-git push origin v9.2.2
-```
-
-Historical releases remain available through Git history/tags.
 
 ## Repository hygiene
 

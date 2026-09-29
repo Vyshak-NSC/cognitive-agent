@@ -767,6 +767,20 @@ def run_agent(context: AgentRunContext):
             + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
         )
     allowed_tool_names = list(selection.get("tool_names") or [])
+    # Durable knowledge lifecycle tools are available on every substantive turn.
+    # The system prompt constrains when they are appropriate; exposing them here
+    # prevents semantic top-k routing from making evidence/hypothesis/decision/etc.
+    # effectively unreachable during the exact investigations that should use them.
+    if not _is_simple_chat(transcript):
+        _ensure_available_tools(
+            allowed_tool_names,
+            registry,
+            (
+                "record_fact", "record_evidence", "record_hypothesis",
+                "record_decision", "record_dependency", "record_change",
+                "record_open_question", "get_world_model",
+            ),
+        )
     # Deterministic copy path: a copy/duplicate/clone request always gets the
     # one-shot folder-capable tool, regardless of semantic top-k ranking.
     if re.search(r"\b(copy|duplicate|clone)\b", str(query or ""), re.I):
