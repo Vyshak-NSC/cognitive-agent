@@ -17,7 +17,7 @@ from ragapp.chat_sessions import ChatSessionStore
 import uuid
 from ragapp.tools.cognition_tools import _world_model_snapshot, _validate, _impact
 
-app=FastAPI(title='Agentic State Layer API',version='0.1.0')
+app=FastAPI(title='Agentic State Layer API',version='9.5.1')
 initialize_database()
 class Query(BaseModel): username:str; project_id:str; messages:list[dict]; session_id:str|None=None; agent_id:str|None=None
 class Project(BaseModel): username:str; project_id:str
