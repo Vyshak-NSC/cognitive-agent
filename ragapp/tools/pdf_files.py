@@ -3,18 +3,25 @@ import io
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 
 def _path(username, p): return resolve_workspace_path(username, p)
 
-def read_pdf(username, relative_path, start_page=None, end_page=None):
-    path = _path(username, relative_path)
+def _read_path(username, area, p):
+    if area == "workspace":
+        return resolve_workspace_path(username, p)
+    if area == "source":
+        return resolve_source_path(username, p)
+    raise ValueError("area must be 'source' or 'workspace'")
+
+def read_pdf(username, relative_path, start_page=None, end_page=None, area="workspace"):
+    path = _read_path(username, area, relative_path)
     if not path.is_file(): raise FileNotFoundError(f"File not found: {relative_path}")
     reader = PdfReader(str(path)); total = len(reader.pages)
     start = 1 if start_page is None else start_page; end = total if end_page is None else min(end_page, total)
     if start < 1 or end < start or start > total: raise ValueError("Invalid PDF page range")
-    return {"path": relative_path, "page_count": total, "pages": [{"page": i, "text": reader.pages[i-1].extract_text() or ""} for i in range(start, end+1)]}
+    return {"area": area, "path": relative_path, "page_count": total, "pages": [{"page": i, "text": reader.pages[i-1].extract_text() or ""} for i in range(start, end+1)]}
 
 def write_pdf(username, relative_path, pages):
     path = _path(username, relative_path); path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +72,7 @@ def delete_pdf(username, relative_path):
 
 def build_pdf_tools(username):
     return [
-        Tool("read_pdf", "Read PDF text and page structure. Use start_page/end_page for specific pages.", {"type":"object","properties":{"relative_path":{"type":"string"},"start_page":{"type":"integer"},"end_page":{"type":"integer"}},"required":["relative_path"]}, lambda relative_path, start_page=None, end_page=None: read_pdf(username, relative_path, start_page, end_page)),
+        Tool("read_pdf", "Read PDF text and page structure from source or workspace. Use start_page/end_page for exact physical PDF pages.", {"type":"object","properties":{"area":{"type":"string","enum":["source","workspace"],"description":"Project area containing the PDF. Defaults to workspace for backwards compatibility."},"relative_path":{"type":"string"},"start_page":{"type":"integer","minimum":1},"end_page":{"type":"integer","minimum":1}},"required":["relative_path"]}, lambda relative_path, start_page=None, end_page=None, area="workspace": read_pdf(username, relative_path, start_page, end_page, area)),
         Tool(
             "write_pdf",
             "Create a real PDF from page specifications. Use when creating a new PDF.",

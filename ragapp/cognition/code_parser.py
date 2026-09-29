@@ -644,7 +644,34 @@ class CodeParser:
         }
 
         # --------------------------------------------------------------
-        # Direct child
+        # Grammar-declared name (authoritative)
+        #
+        # Scanning children for the first identifier-like node is wrong
+        # whenever a type precedes the name, e.g. Java
+        #     @Id private Long id;      -> "Long" instead of "id"
+        #     public Long getId() {}    -> "Long" instead of "getId"
+        # Tree-sitter exposes the real name via the "name" field, and for
+        # field/variable declarations via declarator -> variable_declarator.
+        # --------------------------------------------------------------
+
+        named = node.child_by_field_name("name")
+        if named is not None:
+            text = self._node_text(named, source).strip()
+            if text:
+                return text
+
+        declarator = node.child_by_field_name("declarator")
+        if declarator is not None:
+            inner = declarator.child_by_field_name("name")
+            if inner is None and declarator.type in identifier_types:
+                inner = declarator
+            if inner is not None:
+                text = self._node_text(inner, source).strip()
+                if text:
+                    return text
+
+        # --------------------------------------------------------------
+        # Direct child (fallback for grammars without a name field)
         # --------------------------------------------------------------
 
         for child in node.children:

@@ -30,9 +30,21 @@ def build_vcs_tools(store):
         ),
         Tool(
             "restore_file_revision",
-            "Restore a project file from a known Git revision. This preserves later history and creates a new forward-moving commit.",
+            "Restore ONE project file from a known Git revision (forward-moving commit). Do NOT loop this over many files; to undo/revert everything or return the whole project to an earlier state use restore_project_state once.",
             {"type": "object", "properties": {"area": area, "relative_path": {"type": "string"}, "commit": {"type": "string"}, "message": {"type": "string"}}, "required": ["area", "relative_path", "commit"]},
             lambda area, relative_path, commit, message=None: service.restore(area, relative_path, commit, message),
+        ),
+        Tool(
+            "list_project_states",
+            "List project-wide restore points (whole-project git states), newest first, with noise commits hidden. Use kind='compile' to see only compile points. Use only if you need a specific commit; 'last_compile' needs no lookup.",
+            {"type": "object", "properties": {"limit": {"type": "integer"}, "kind": {"type": "string", "enum": ["all", "compile"]}}, "required": []},
+            lambda limit=15, kind="all": {"states": vcs.list_states(limit, kind)},
+        ),
+        Tool(
+            "restore_project_state",
+            "UNDO / REVERT / ROLL BACK THE WHOLE PROJECT in ONE deterministic call (source, workspace, cognition, log). target='last_compile' returns to the state right after the most recent compile; or pass a commit id from list_project_states. Forward-moving and recoverable. Call it ONCE, then report its result; never restore files one by one.",
+            {"type": "object", "properties": {"target": {"type": "string", "description": "'last_compile' (default) or a commit id."}}, "required": []},
+            lambda target="last_compile": vcs.restore_project_state(target),
         ),
         Tool(
             "create_vcs_checkpoint",
