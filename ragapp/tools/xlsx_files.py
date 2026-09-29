@@ -1,20 +1,22 @@
 """Excel tools using openpyxl; cell edits preserve existing workbook formatting."""
 from openpyxl import Workbook, load_workbook
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 def _path(u,p): return resolve_workspace_path(u,p)
-def read_xlsx(username,relative_path, sheet=None, max_rows=100, max_cols=30):
-    path=_path(username,relative_path)
+def read_xlsx(username,relative_path, sheet=None, max_rows=100, max_cols=30, area="workspace", min_row=1, min_col=1):
+    area=(area or "workspace").strip().lower()
+    path=_path(username,relative_path) if area=="workspace" else resolve_source_path(username,relative_path) if area=="source" else None
+    if path is None: raise ValueError("area must be 'workspace' or 'source'")
     if not path.is_file(): raise FileNotFoundError(f"File not found: {relative_path}")
     wb=load_workbook(path, data_only=False); names=wb.sheetnames if sheet is None else [sheet]
     out=[]
     for name in names:
         ws=wb[name]; rows=[]
-        for row in ws.iter_rows(min_row=1,max_row=min(ws.max_row,max_rows),min_col=1,max_col=min(ws.max_column,max_cols)):
+        for row in ws.iter_rows(min_row=max(1,int(min_row)),max_row=min(ws.max_row,max(1,int(min_row))+max_rows-1),min_col=max(1,int(min_col)),max_col=min(ws.max_column,max(1,int(min_col))+max_cols-1)):
             rows.append([c.value for c in row])
         out.append({"name":name,"rows":rows})
-    return {"path":relative_path,"sheets":out}
+    return {"path":relative_path,"area":area,"sheets":out}
 def write_xlsx(username,relative_path,sheets):
     path=_path(username,relative_path); path.parent.mkdir(parents=True,exist_ok=True)
     if path.exists(): raise FileExistsError(f"File already exists: {relative_path}")
@@ -38,7 +40,7 @@ def delete_xlsx(username,relative_path):
     path.unlink(); return {"path":relative_path,"status":"deleted"}
 def build_xlsx_tools(username):
     return [
-      Tool("read_xlsx","Read workbook sheets and cell values without flattening the workbook to plain text.",{"type":"object","properties":{"relative_path":{"type":"string"},"sheet":{"type":"string"},"max_rows":{"type":"integer"},"max_cols":{"type":"integer"}},"required":["relative_path"]},lambda relative_path,sheet=None,max_rows=100,max_cols=30:read_xlsx(username,relative_path,sheet,max_rows,max_cols)),
+      Tool("read_xlsx","Read workbook cells from workspace or authoritative source. Set area='source' for /source; select a sheet and use min_row/min_col plus max_rows/max_cols for a precise region.",{"type":"object","properties":{"relative_path":{"type":"string"},"area":{"type":"string","enum":["workspace","source"]},"sheet":{"type":"string"},"min_row":{"type":"integer","minimum":1},"min_col":{"type":"integer","minimum":1},"max_rows":{"type":"integer"},"max_cols":{"type":"integer"}},"required":["relative_path"]},lambda relative_path,sheet=None,max_rows=100,max_cols=30,area="workspace",min_row=1,min_col=1:read_xlsx(username,relative_path,sheet,max_rows,max_cols,area,min_row,min_col)),
       Tool(
           "write_xlsx",
           "Create a real .xlsx workbook from sheet/row specifications.",

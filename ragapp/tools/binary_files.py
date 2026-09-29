@@ -1,15 +1,16 @@
 """Last-resort byte-level tools for file types without a semantic format handler."""
 import base64
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 def _path(u,p): return resolve_workspace_path(u,p)
-def read_binary_file(username,relative_path,max_bytes=65536):
-    path=_path(username,relative_path)
+def read_binary_file(username,relative_path,max_bytes=65536,area="workspace"):
+    area=(area or "workspace").strip().lower(); path=_path(username,relative_path) if area=="workspace" else resolve_source_path(username,relative_path) if area=="source" else None
+    if path is None: raise ValueError("area must be 'workspace' or 'source'")
     if not path.is_file(): raise FileNotFoundError(f"File not found: {relative_path}")
     data=path.read_bytes()
     if len(data)>max_bytes: raise ValueError(f"File is {len(data)} bytes; max_bytes is {max_bytes}. Use a format-specific tool when available.")
-    return {"path":relative_path,"size":len(data),"base64":base64.b64encode(data).decode("ascii")}
+    return {"path":relative_path,"area":area,"size":len(data),"base64":base64.b64encode(data).decode("ascii")}
 def write_binary_file(username,relative_path,base64_content):
     path=_path(username,relative_path); path.parent.mkdir(parents=True,exist_ok=True)
     if path.exists(): raise FileExistsError(f"File already exists: {relative_path}")
@@ -30,7 +31,7 @@ def delete_binary_file(username,relative_path):
     path.unlink(); return {"path":relative_path,"status":"deleted"}
 def build_binary_file_tools(username):
     return [
-      Tool("read_binary_file","Read an unsupported binary file as base64. Use a format-specific tool instead whenever one exists.",{"type":"object","properties":{"relative_path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["relative_path"]},lambda relative_path,max_bytes=65536:read_binary_file(username,relative_path,max_bytes)),
+      Tool("read_binary_file","Read an unsupported binary file from workspace or authoritative source as base64. Use a format-specific tool whenever one exists.",{"type":"object","properties":{"relative_path":{"type":"string"},"area":{"type":"string","enum":["workspace","source"]},"max_bytes":{"type":"integer"}},"required":["relative_path"]},lambda relative_path,max_bytes=65536,area="workspace":read_binary_file(username,relative_path,max_bytes,area)),
       Tool("write_binary_file","Create an arbitrary binary file from base64 bytes when no semantic format-specific writer exists.",{"type":"object","properties":{"relative_path":{"type":"string"},"base64_content":{"type":"string"}},"required":["relative_path","base64_content"]},lambda relative_path,base64_content:write_binary_file(username,relative_path,base64_content)),
       Tool("edit_binary_file","Perform a precise byte-range edit on an unsupported binary file. Use only when no semantic format tool exists.",{"type":"object","properties":{"relative_path":{"type":"string"},"offset":{"type":"integer"},"delete_bytes":{"type":"integer"},"insert_base64":{"type":"string"}},"required":["relative_path","offset"]},lambda relative_path,offset,delete_bytes=0,insert_base64="":edit_binary_file(username,relative_path,offset,delete_bytes,insert_base64)),
       Tool("delete_binary_file","Delete an arbitrary unsupported binary file from the AI workspace.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:delete_binary_file(username,relative_path)),

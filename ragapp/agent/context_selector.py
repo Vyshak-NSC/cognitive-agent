@@ -68,7 +68,7 @@ PROMPT_MODULES = {
     },
     "mermaid": {
         "description": "Create Mermaid diagrams, flowcharts, relationship diagrams, architecture diagrams or visual graphs.",
-        "text": "For Mermaid, return one syntactically complete Mermaid fenced block. Prefer simple flowchart syntax and balanced subgraphs.",
+        "text": "For Mermaid, return one syntactically complete Mermaid fenced block. Prefer simple flowchart syntax and balanced subgraphs. Always quote node labels, for example A[\"Invoice Header\"]. Never put \\n in a Mermaid label; use <br/> for a line break, for example A[\"HeaderRowData<br/>(header)\"].",
     },
 }
 

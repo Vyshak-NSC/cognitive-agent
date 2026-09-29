@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".py", ".js", ".jsx", ".ts", ".tsx",
@@ -18,7 +18,7 @@ def _path(username, relative_path):
     return resolve_workspace_path(username, relative_path)
 
 
-def read_regular_file(username, relative_path, encoding="utf-8"):
+def read_regular_file(username, relative_path, encoding="utf-8", area="workspace"):
     if relative_path.startswith("cognition/") or relative_path == "cognition":
         raise ValueError(
             "cognition/ is not reachable via read_regular_file (it only sees the AI workspace, "
@@ -81,9 +81,9 @@ def delete_regular_file(username, relative_path):
 
 def build_regular_file_tools(username):
     return [
-        Tool("read_regular_file", "Read a text/code/config file without changing its formatting or bytes beyond decoding as text.", {
-            "type": "object", "properties": {"relative_path": {"type": "string"}}, "required": ["relative_path"]
-        }, lambda relative_path: read_regular_file(username, relative_path)),
+        Tool("read_regular_file", "Read a text/code/config file from workspace or authoritative source without changing its formatting beyond decoding as text. Set area='source' for /source.", {
+            "type": "object", "properties": {"relative_path": {"type": "string"}, "area": {"type": "string", "enum": ["workspace", "source"]}}, "required": ["relative_path"]
+        }, lambda relative_path, area="workspace": read_regular_file(username, relative_path, area=area)),
         Tool("write_regular_file", "Create a new text/code/config file. Use the exact requested extension and content.", {
             "type": "object", "properties": {"relative_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["relative_path", "content"]
         }, lambda relative_path, content: write_regular_file(username, relative_path, content)),

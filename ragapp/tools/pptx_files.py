@@ -1,21 +1,27 @@
 """PowerPoint tools using python-pptx; edits target existing shapes instead of rebuilding slides."""
 from pptx import Presentation
 from ragapp.tools.definitions import Tool
-from ragapp.workspace.manager import resolve_workspace_path
+from ragapp.workspace.manager import resolve_workspace_path, resolve_source_path
 
 def _path(u,p): return resolve_workspace_path(u,p)
-def read_pptx(username,relative_path):
-    path=_path(username,relative_path)
+def read_pptx(username,relative_path,area="workspace",start_slide=None,end_slide=None):
+    area=(area or "workspace").strip().lower()
+    path=_path(username,relative_path) if area=="workspace" else resolve_source_path(username,relative_path) if area=="source" else None
+    if path is None: raise ValueError("area must be 'workspace' or 'source'")
     if not path.is_file(): raise FileNotFoundError(f"File not found: {relative_path}")
     prs=Presentation(str(path)); slides=[]
-    for si,slide in enumerate(prs.slides):
+    total=len(prs.slides)
+    start=1 if start_slide is None else int(start_slide); end=total if end_slide is None else int(end_slide)
+    if start < 1 or end < start or start > total or end > total: raise ValueError(f"Invalid slide range {start}-{end}; presentation has {total} slides")
+    for si in range(start-1,end):
+        slide=prs.slides[si]
         shapes=[]
         for shi,s in enumerate(slide.shapes):
             item={"index":shi,"type":str(s.shape_type),"left":s.left/914400,"top":s.top/914400,"width":s.width/914400,"height":s.height/914400}
             if getattr(s,"has_text_frame",False): item["text"]=s.text; item["paragraphs"]= [{"text":p.text,"runs":[{"text":r.text,"bold":r.font.bold,"italic":r.font.italic,"size":r.font.size.pt if r.font.size else None} for r in p.runs]} for p in s.text_frame.paragraphs]
             shapes.append(item)
         slides.append({"index":si,"shapes":shapes})
-    return {"path":relative_path,"slide_count":len(prs.slides),"slides":slides}
+    return {"path":relative_path,"area":area,"slide_count":total,"start_slide":start,"end_slide":end,"slides":slides}
 def write_pptx(username,relative_path,slides):
     path=_path(username,relative_path); path.parent.mkdir(parents=True,exist_ok=True)
     if path.exists(): raise FileExistsError(f"File already exists: {relative_path}")
@@ -55,7 +61,7 @@ def delete_pptx(username,relative_path):
     path.unlink(); return {"path":relative_path,"status":"deleted"}
 def build_pptx_tools(username):
     return [
-      Tool("read_pptx","Read a PowerPoint as slides and shapes, including text and positions.",{"type":"object","properties":{"relative_path":{"type":"string"}},"required":["relative_path"]},lambda relative_path:read_pptx(username,relative_path)),
+      Tool("read_pptx","Read a PowerPoint from workspace or authoritative source. Set area='source' for /source; use start_slide/end_slide for exact physical slides.",{"type":"object","properties":{"relative_path":{"type":"string"},"area":{"type":"string","enum":["workspace","source"]},"start_slide":{"type":"integer","minimum":1},"end_slide":{"type":"integer","minimum":1}},"required":["relative_path"]},lambda relative_path,area="workspace",start_slide=None,end_slide=None:read_pptx(username,relative_path,area,start_slide,end_slide)),
       Tool(
           "write_pptx",
           "Create a real .pptx from slide/shape specifications.",
