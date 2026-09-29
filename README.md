@@ -1,5 +1,8 @@
 # Cognitive Persistence Agent
 
+**Author:** Vyshak
+
+
 **Version 9.2.2**
 
 Cognitive Persistence Agent (CPA) is a local, project-scoped agent runtime that combines persistent canonical cognition, semantic/structural retrieval, tool-using chat, an isolated workspace, review-gated source changes, Git-backed project history, document/code ingestion, reusable agents/workflows, and multiple LLM providers.

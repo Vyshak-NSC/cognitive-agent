@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cognitive-persistence-agent
-Version: 9.2.2
+Version: 9.5.1
 Summary: Persistent agent runtime with canonical cognition, semantic retrieval, review-gated project mutation, and Git-backed state
 Requires-Python: <3.13,>=3.12
 Description-Content-Type: text/markdown
@@ -32,6 +32,9 @@ Requires-Dist: tree-sitter-languages==1.10.2
 Requires-Dist: uvicorn[standard]==0.52.4
 
 # Cognitive Persistence Agent
+
+**Author:** Vyshak
+
 
 **Version 9.2.2**
 
