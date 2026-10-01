@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cognitive-persistence-agent
-Version: 9.5.3
+Version: 9.5.5
 Summary: Persistent agent runtime with canonical cognition, semantic retrieval, review-gated project mutation, and Git-backed state
 Requires-Python: <3.13,>=3.12
 Description-Content-Type: text/markdown
