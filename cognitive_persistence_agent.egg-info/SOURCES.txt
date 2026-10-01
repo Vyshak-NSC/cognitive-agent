@@ -53,6 +53,16 @@ ragapp/core/review.py
 ragapp/core/semantic_index.py
 ragapp/core/vcs.py
 ragapp/core/workflows.py
+ragapp/documents/__init__.py
+ragapp/documents/docx_renderer.py
+ragapp/documents/html_renderer.py
+ragapp/documents/markdown_renderer.py
+ragapp/documents/model.py
+ragapp/documents/parser.py
+ragapp/documents/pdf_renderer.py
+ragapp/documents/pptx_renderer.py
+ragapp/documents/themes.py
+ragapp/documents/validator.py
 ragapp/execution/project.py
 ragapp/extractors/base.py
 ragapp/extractors/code_extractor.py
@@ -80,6 +90,7 @@ ragapp/tools/binary_files.py
 ragapp/tools/cognition_tools.py
 ragapp/tools/compile_tools.py
 ragapp/tools/definitions.py
+ragapp/tools/document_tools.py
 ragapp/tools/docx_files.py
 ragapp/tools/extractors.py
 ragapp/tools/pdf_files.py

@@ -27,8 +27,9 @@ from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
-from ragapp.agent.context_selector import ContextSelector, _looks_like_cognition_mutation, _requests_recompile
+from ragapp.agent.context_selector import ContextSelector, _looks_like_cognition_mutation, _requests_recompile, _looks_like_document_transform
 from ragapp.agent.run_context import AgentRunContext
+from ragapp.agent.trace import trace_event, trace_scope
 from ragapp.tools.definitions import Tool
 from ragapp.logging_config import configure_logging
 
@@ -135,29 +136,6 @@ def _read_workspace_snapshot(cognition, target_file):
             "utf-8",
             errors="replace",
         )
-_SIMPLE_CHAT = {
-    "hi",
-    "hello",
-    "hey",
-    "hiya",
-    "yo",
-    "sup",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "thanks",
-    "thank you",
-    "ok",
-    "okay",
-}
-def _is_simple_chat(transcript):
-    if not transcript:
-        return False
-    text = str(
-        transcript[-1].get("content", "")
-    ).strip().lower()
-    return text in _SIMPLE_CHAT
-
 def _latest_user_query(transcript):
     for message in reversed(transcript or []):
         if str(message.get("role", "")).lower() == "user":
@@ -228,25 +206,6 @@ def _semantic_change_text(query):
     return text or str(query or "").strip()
 
 
-def _prefetch_cognition(cognition, transcript, max_chars=8000, limit=8):
-    """Deterministic lexical/canonical prefetch; no LLM inference is used here.
-
-    CognitionStore.search_cognition_metadata performs the local candidate
-    search.  The LLM receives a bounded compact projection and may use tools to
-    refine it.  This guarantees consultation of current canonical state without
-    dumping the entire cognition store into the prompt.
-    """
-    if cognition is None or not cognition.exists() or _is_simple_chat(transcript):
-        return None
-    query = _latest_user_query(transcript)
-    if not query:
-        return None
-    try:
-        retrieval = RetrievalStore(cognition)
-        return retrieval.retrieve_for_query(query, max_chars=max_chars, limit=limit, detail="compact")
-    except Exception:
-        LOGGER.exception("Canonical prefetch failed")
-        return None
 def _load_persistent_instructions(cognition):
     """Load active persistent instructions locally."""
     if cognition is None or not cognition.exists():
@@ -290,12 +249,20 @@ def _record_tool_call(
     result,
 ):
     """Record the actual tool call for the UI/API."""
+    safe_args = _json_safe(args)
+    safe_result = _json_safe(result)
     calls.append(
         {
             "tool": str(name),
-            "args": _json_safe(args),
-            "result": _json_safe(result),
+            "args": safe_args,
+            "result": safe_result,
         }
+    )
+    trace_event(
+        "tool_finished",
+        tool=str(name),
+        arguments=safe_args,
+        result=safe_result,
     )
 def _split_state_deltas(deltas):
     """Split deltas into (plain-language cascading changes, deltas safe to merge directly)."""
@@ -616,6 +583,36 @@ def _prime_project_area_context(registry, calls, area):
 
 
 def run_agent(context: AgentRunContext):
+    """Public agent entry point with optional pluggable execution tracing."""
+    trace = context.trace
+    with trace_scope(trace):
+        if trace is not None:
+            trace_event(
+                "turn_started",
+                project_id=context.project_id,
+                session_id=context.session_id,
+                turn_id=context.turn_id,
+                transcript_messages=len(context.transcript),
+                tool_count=len(context.tools),
+            )
+        try:
+            result = _run_agent_impl(context)
+        except Exception as exc:
+            trace_event("error", stage="agent", error=str(exc), error_type=exc.__class__.__name__)
+            trace_event("turn_finished", status="error")
+            raise
+        answer, calls, drafts = result
+        trace_event(
+            "turn_finished",
+            status="completed",
+            answer_chars=len(str(answer or "")),
+            tool_calls=len(calls or []),
+            drafts=len(drafts or []),
+        )
+        return result
+
+
+def _run_agent_impl(context: AgentRunContext):
     """Run the cognitive agent loop.
     Durable fiction/lore changes are represented by STATE_UPDATE and are
     merged directly into cognition. Source-backed implementation changes
@@ -656,11 +653,27 @@ def run_agent(context: AgentRunContext):
     # --------------------------------------------------------------
     calls = []
     query = _latest_user_query(transcript)
+    trace_event(
+        "input_received",
+        query=query,
+        query_chars=len(query),
+        transcript_messages=len(transcript),
+    )
     selector = ContextSelector(cognition, tools)
-    if _is_simple_chat(transcript):
-        selection = {"tool_names": [], "modules": [], "instructions": [], "prefetched": None, "intent": "conversation", "intent_score": 0.0, "mode": "simple_chat"}
-    else:
-        selection = selector.select(query)
+    trace_event("context_selection_started", query=query)
+    # Never classify casual chat with a growing phrase dictionary. The model call
+    # remains independent; the hybrid cognition retriever decides whether project
+    # knowledge is relevant enough to prefetch.
+    selection = selector.select(query)
+    trace_event(
+        "context_selection_finished",
+        mode=selection.get("mode"),
+        intent=selection.get("intent"),
+        intent_score=selection.get("intent_score"),
+        selected_tools=selection.get("tool_names") or [],
+        cognition_candidates=len(selection.get("candidates") or []),
+        prefetched_requests=len((selection.get("prefetched") or {}).get("requests") or []),
+    )
 
     # Cognition mutation and explicit recompilation are execution contracts, not
     # optional model behaviours. Apply them before the conversational model turn.
@@ -767,19 +780,20 @@ def run_agent(context: AgentRunContext):
             + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
         )
     allowed_tool_names = list(selection.get("tool_names") or [])
-    # Durable knowledge lifecycle tools are available on every substantive turn.
-    # The system prompt constrains when they are appropriate; exposing them here
-    # prevents semantic top-k routing from making evidence/hypothesis/decision/etc.
-    # effectively unreachable during the exact investigations that should use them.
-    if not _is_simple_chat(transcript):
-        _ensure_available_tools(
-            allowed_tool_names,
-            registry,
-            (
-                "record_fact", "record_evidence", "record_hypothesis",
-                "record_decision", "record_dependency", "record_change",
-                "record_open_question", "get_world_model",
-            ),
+    # Existing-document artifact transformations are an execution contract.
+    # Do not expose generic write_pptx/write_pdf tools for these requests: those
+    # tools allow the model to invent a condensed artifact. Force the high-level
+    # source-preserving transformation tool instead.
+    if _looks_like_document_transform(query):
+        generic_artifact_writers = {
+            "write_pptx", "create_pptx", "write_pdf", "create_pdf",
+            "write_docx", "create_docx", "write_html", "create_html",
+            "write_markdown", "create_markdown",
+        }
+        allowed_tool_names[:] = [n for n in allowed_tool_names if n not in generic_artifact_writers]
+        _ensure_available_tools(allowed_tool_names, registry, ("transform_document", "read_docx"))
+        system_instruction += (
+            "\n\nDOCUMENT TRANSFORM: use transform_document; preserve_content=true unless the user explicitly requests summarization/condensation.\n"
         )
     # Deterministic copy path: a copy/duplicate/clone request always gets the
     # one-shot folder-capable tool, regardless of semantic top-k ranking.
@@ -843,9 +857,16 @@ def run_agent(context: AgentRunContext):
         {"type": "object", "properties": {"requirement": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["requirement"]},
         _discover_tools,
     ))
-    if not _is_simple_chat(transcript):
-        allowed_tool_names.append("discover_tools")
+    allowed_tool_names.append("discover_tools")
     function_declarations = registry.as_function_declarations(allowed_tool_names)
+    trace_event(
+        "model_context_ready",
+        message_count=len(contents),
+        system_chars=len(system_instruction or ""),
+        tool_count=len(function_declarations or []),
+        tools=[d.get("name") for d in (function_declarations or []) if isinstance(d, dict)],
+        context_chars=sum(len(str(m.get("content", ""))) for m in contents if isinstance(m, dict)),
+    )
     LOGGER.info(
         "Context selection project=%s mode=%s tools=%d cognition=%d modules=%d instructions=%d",
         project_id,
@@ -861,6 +882,13 @@ def run_agent(context: AgentRunContext):
     execution_gate_retries = 0
     for step_number in range(max_steps):
         LOGGER.info("Agent model step=%d/%d project=%s", step_number + 1, max_steps, project_id)
+        trace_event(
+            "model_step_started",
+            step=step_number + 1,
+            max_steps=max_steps,
+            message_count=len(contents),
+            tool_count=len(function_declarations or []),
+        )
         try:
             step = generate_step(
                 contents,
@@ -878,6 +906,14 @@ def run_agent(context: AgentRunContext):
         except Exception:
             LOGGER.exception("Agent model request failed project=%s step=%d", project_id, step_number + 1)
             raise
+        trace_event(
+            "model_step_finished",
+            step=step_number + 1,
+            function_calls=len(step.get("function_calls") or []),
+            response_chars=len(str(step.get("text") or "")),
+            model=step.get("model"),
+            usage=step.get("usage"),
+        )
         # ----------------------------------------------------------
         # Model finished
         # ----------------------------------------------------------
@@ -1041,6 +1077,12 @@ def run_agent(context: AgentRunContext):
                 {},
             )
             LOGGER.info("Tool call project=%s step=%d tool=%s arg_keys=%s", project_id, step_number + 1, tool_name, sorted(tool_args.keys()) if isinstance(tool_args, dict) else [])
+            trace_event(
+                "tool_started",
+                step=step_number + 1,
+                tool=tool_name,
+                arguments=_json_safe(tool_args),
+            )
             if call.get("args_error"):
                 # The model sent malformed arguments; report it back instead
                 # of executing the tool with empty/default arguments.

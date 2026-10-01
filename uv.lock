@@ -165,7 +165,7 @@ wheels = [
 
 [[package]]
 name = "cognitive-persistence-agent"
-version = "9.5.1"
+version = "9.5.3"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

@@ -1,9 +1,9 @@
-"""Azure OpenAI (GPT deployments on Azure AI Foundry)."""
+"""Azure Anthropic (Claude deployments on Azure AI Foundry)."""
 from __future__ import annotations
 
-from openai import OpenAI
+from anthropic import AnthropicFoundry
 
-from ragapp.llm.tool_calling import azure_foundry, openai_wire
+from ragapp.llm.tool_calling import anthropic_wire, azure_foundry
 from ragapp.llm.tool_calling.common import (  # noqa: F401  (adapter API)
     EmptyResponseError,
     build_function_response_content,
@@ -12,7 +12,7 @@ from ragapp.llm.tool_calling.common import (  # noqa: F401  (adapter API)
     to_provider_contents,
 )
 
-PROVIDER = "azure_openai"
+PROVIDER = "azure_anthropic"
 
 
 def model_name(store):
@@ -21,20 +21,21 @@ def model_name(store):
 
 def _connection(store):
     pcfg, model, key, origin = azure_foundry.connection(store, PROVIDER)
-    base_url = f"{origin}/openai/v1"
+    base_url = f"{origin}/anthropic"
     client = cached_client(
-        (PROVIDER, base_url, key), lambda: OpenAI(api_key=key, base_url=base_url)
+        (PROVIDER, base_url, key),
+        lambda: AnthropicFoundry(api_key=key, base_url=base_url),
     )
     return pcfg, model, client
 
 
 def generate_step(contents, function_declarations, system_instruction=None, store=None):
     pcfg, model, client = _connection(store)
-    return openai_wire.generate_step(
+    return anthropic_wire.generate_step(
         client, model, pcfg, contents, function_declarations, system_instruction, PROVIDER
     )
 
 
 def generate_json(store, prompt, model=None):
-    _, configured, client = _connection(store)
-    return openai_wire.generate_json(client, model or configured, prompt, PROVIDER)
+    pcfg, configured, client = _connection(store)
+    return anthropic_wire.generate_json(client, model or configured, prompt, pcfg, PROVIDER)

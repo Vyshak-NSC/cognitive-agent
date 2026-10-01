@@ -6,6 +6,7 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 from ragapp.core.project_files import ProjectFileService
+from ragapp.interfaces.streamlit_app.previews import render_document_preview, DOCUMENT_SUFFIXES
 
 TEXT_EXTENSIONS={'.txt','.md','.py','.js','.mjs','.ts','.tsx','.jsx','.json','.yaml','.yml','.csv','.xml','.html','.htm','.css','.sql','.toml','.ini','.cfg','.env','.java','.kt','.go','.rs','.c','.cpp','.h','.hpp','.sh','.bat','.ps1','.r','.tex'}
 AREAS={'workspace':('Workspace','Working files and generated artifacts.'),'source':('Source','Source material used by cognition.')}
@@ -121,8 +122,7 @@ def _preview(path,root):
         elif suffix == '.md': st.markdown(path.read_text(encoding='utf-8',errors='replace'))
         else: st.code(path.read_text(encoding='utf-8',errors='replace'),language=path.suffix.lstrip('.') or 'text')
     elif suffix in {'.png','.jpg','.jpeg','.gif','.webp'}: st.image(path.read_bytes())
-    elif suffix=='.pdf': st.components.v1.html(f'<iframe src="{_asset_data_uri(path)}" width="100%" height="700"></iframe>',height=710)
-    elif suffix=='.docx': _preview_docx(path)
+    elif suffix in DOCUMENT_SUFFIXES: render_document_preview(path, key='fm')
     else: st.info(f'Binary file · {_size(path.stat().st_size)}. Use Download or Replace.')
 
 # ---------------------------------------------------------------------------

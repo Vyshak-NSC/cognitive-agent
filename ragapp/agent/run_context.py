@@ -24,6 +24,7 @@ class AgentRunContext:
     active_turn_ids: list[str] = field(default_factory=list)
     agent_id: str | None = None
     on_section: Callable[[dict], None] | None = None
+    trace: Any = None
     max_steps: int | None = None
     agent: dict | None = field(init=False, default=None)
 

@@ -24,8 +24,9 @@ from openrouter import OpenRouter
 from openrouter.utils import BackoffStrategy, RetryConfig
 
 from ragapp.config import get_api_keys, load_project_config
+from ragapp.llm.registry import PROVIDER_SPECS
 
-DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+DEFAULT_OPENROUTER_MODEL = PROVIDER_SPECS["openrouter"]["default_model"]
 DEFAULT_TIMEOUT_S = 120
 DEFAULT_RETRY_BUDGET_S = 45
 
@@ -186,6 +187,10 @@ def _routing(pcfg, needs_params):
         prefs["require_parameters"] = True
     prefs.update(pcfg.get("routing") or {})
     return {"provider": prefs} if prefs else {}
+
+
+def model_name(store):
+    return _settings(store)[1]
 
 
 # ------------------------------------------------------- tool-call helpers

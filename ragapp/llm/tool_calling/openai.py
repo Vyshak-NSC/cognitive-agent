@@ -1,18 +1,20 @@
-"""Azure OpenAI (GPT deployments on Azure AI Foundry)."""
+"""OpenAI (GPT) through the OpenAI API."""
 from __future__ import annotations
 
 from openai import OpenAI
 
-from ragapp.llm.tool_calling import azure_foundry, openai_wire
+from ragapp.config import load_project_config
+from ragapp.llm.tool_calling import openai_wire
 from ragapp.llm.tool_calling.common import (  # noqa: F401  (adapter API)
     EmptyResponseError,
     build_function_response_content,
     cached_client,
     configured_model,
+    credential,
     to_provider_contents,
 )
 
-PROVIDER = "azure_openai"
+PROVIDER = "openai"
 
 
 def model_name(store):
@@ -20,12 +22,14 @@ def model_name(store):
 
 
 def _connection(store):
-    pcfg, model, key, origin = azure_foundry.connection(store, PROVIDER)
-    base_url = f"{origin}/openai/v1"
-    client = cached_client(
-        (PROVIDER, base_url, key), lambda: OpenAI(api_key=key, base_url=base_url)
-    )
-    return pcfg, model, client
+    if store is None:
+        raise RuntimeError(f"{PROVIDER} requires a project store.")
+    key = credential(store, PROVIDER)
+    if not key:
+        raise RuntimeError(f"No API key configured for {PROVIDER}. Add it in Project Settings or set its environment variable.")
+    pcfg = load_project_config(store).get("provider", {})
+    client = cached_client((PROVIDER, key), lambda: OpenAI(api_key=key))
+    return pcfg, model_name(store), client
 
 
 def generate_step(contents, function_declarations, system_instruction=None, store=None):

@@ -40,7 +40,13 @@ def route_request(query: str) -> RequestRoute:
     source_mutation = _has(q, r"\b(edit|change|modify|update|replace|append|delete|remove|create|write|rename|move)\b.*\b(source|file|code|\.py|\.js|\.ts|\.json|\.ya?ml|\.toml)\b",
                            r"\b(source|file|code|\.py|\.js|\.ts|\.json|\.ya?ml|\.toml)\b.*\b(edit|change|modify|update|replace|append|delete|remove|create|write|rename|move)\b")
     files = _has(q, r"\b(file|folder|workspace|source|document|docx|pdf|xml|pptx|xlsx|excel|powerpoint|binary|csv|markdown|\.md|\.txt|\.py)\b")
-    document_transform = _has(q, r"\b(format|restyle|typeset|clean up|beautify|professionally format|convert|export|render)\b.*\b(document|docx|pdf|file)\b", r"\b(document|docx|file)\b.*\b(to|as|into)\s+(?:a\s+)?pdf\b")
+    document_transform = _has(q,
+        r"\b(format|restyle|typeset|clean up|beautify|professionally format|convert|export|render)\b.*\b(document|docx|pdf|file|pptx?|powerpoint|presentation|slides?)\b",
+        r"\b(document|docx|file)\b.*\b(to|as|into)\s+(?:a\s+)?(?:pdf|pptx?|powerpoint|presentation|slides?)\b",
+        r"\b(make|create|turn|transform|build|generate)\b.*\b(?:a\s+)?(?:pptx?|powerpoint|presentation|slides?)\b",
+        r"\b(?:pptx?|powerpoint|presentation|slides?)\b.*\b(?:from|using|out of)\b.*\b(?:this|the|document|docx|file)\b",
+        r"\b(?:make|create|convert|export|render)\b.*\b(?:pdf|pptx?|powerpoint|presentation|slides?)\b.*\b(?:and|plus)\b.*\b(?:pdf|pptx?|powerpoint|presentation|slides?)\b",
+    )
     agent_creation = _has(q, r"\b(create|build|define|configure|edit|update|delete|list|show)\b.*\bagent\b", r"\bagent\s+(creator|creation|manager|definition)\b")
     workflow = _has(q, r"\bworkflow\b", r"\b(deterministic|inference)\s+step\b")
 

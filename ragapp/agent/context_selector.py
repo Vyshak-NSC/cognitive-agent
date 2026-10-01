@@ -12,6 +12,7 @@ import re
 from ragapp.core.semantic_index import SemanticIndex
 from ragapp.core.retrieval import RetrievalStore, cognition_index_records
 from ragapp.core.instructions import InstructionStore
+from ragapp.agent.trace import trace_event
 
 LOGGER = logging.getLogger("ragapp.agent.context_selector")
 
@@ -43,6 +44,13 @@ INTENT_RECORDS = {
             "does not require changing project files."
         ),
     },
+    "document_transform": {
+        "description": (
+            "The user is transforming an existing document into PDF, PPTX/PowerPoint, DOCX, HTML, "
+            "or Markdown while preserving source content unless explicit summarization or condensation "
+            "is requested."
+        ),
+    },
 }
 
 PROMPT_MODULES = {
@@ -67,8 +75,8 @@ PROMPT_MODULES = {
         "text": "VCS operations apply to the project repository. Restoration creates a new revision; do not rewrite history.",
     },
     "documents": {
-        "description": "Read or manipulate PDF DOCX PPTX XLSX XML and other structured document formats.",
-        "text": "Distinguish TRANSFORM from SUMMARIZE and GENERATE. When the user asks to format, restyle, typeset, clean up, beautify, convert or export an existing document, treat it as a lossless TRANSFORM by default: preserve all source sections, paragraphs, lists, tables, notes, ordering and meaning. Formatting changes presentation, not content. Use transform_document for DOCX-to-PDF transformation when available. Never summarize, condense, omit or rewrite source content unless the user explicitly requests that content operation.",
+        "description": "Read, transform, or generate PDF DOCX PPTX PowerPoint presentations and other structured documents.",
+        "text": "Existing document -> PDF/PPTX/PowerPoint/presentation is TRANSFORM unless the user asks to summarize or condense. Use transform_document with preserve_content=true. Do not substitute a generic authoring tool or a summary.",
     },
     "mermaid": {
         "description": "Create Mermaid diagrams, flowcharts, relationship diagrams, architecture diagrams or visual graphs.",
@@ -197,6 +205,45 @@ def _requests_recompile(query: str) -> bool:
     return bool(re.search(r"\b(re-?compil(?:e|ed|es|ing)|compil(?:e|ed|es|ing)|rebuil[dt]|re-?ingest(?:ed)?)\b", q))
 
 
+_GENERIC_ARTIFACT_WRITERS = {
+    "write_pptx", "create_pptx", "write_pdf", "create_pdf",
+    "write_docx", "create_docx", "write_html", "create_html",
+    "write_markdown", "create_markdown",
+}
+
+
+def _looks_like_document_transform(query: str) -> bool:
+    """Deterministic backstop for existing-document artifact transformations.
+
+    A request to make a PDF/PPT/PPTX/presentation from an existing document is
+    a transformation unless the user explicitly asks for a summary/condensation.
+    This must not depend on semantic top-k tool selection because generic
+    write_pptx can otherwise win and cause the model to author a short summary.
+    """
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    explicit_summary = re.search(
+        r"\b(summar(?:y|ize|ise|ized|ised)|condens(?:e|ed|ing)|shorten|executive summary|high[- ]level|abridg(?:e|ed)|\b\d+\s+slides?\s+summary)\b",
+        q,
+    )
+    target = re.search(
+        r"\b(pdf|pptx?|powerpoint|presentation|slides?|docx|word|html|markdown)\b",
+        q,
+    )
+    transform_verb = re.search(
+        r"\b(format|restyle|typeset|clean up|clean-up|beautify|professionally format|convert|export|render|turn|make|create|transform|produce|generate|build)\b",
+        q,
+    )
+    source_hint = re.search(
+        r"\b(this|the|attached|uploaded|source|document|docx|file|world bible|manuscript|report)\b",
+        q,
+    )
+    if explicit_summary:
+        return False
+    return bool(target and transform_verb and source_hint)
+
+
 class ContextSelector:
     def __init__(self, store, tools):
         self.store = store
@@ -206,15 +253,15 @@ class ContextSelector:
     def select(self, query, tool_limit=6, cognition_limit=4, instruction_limit=3, module_limit=2):
         """Return a bounded candidate bundle. Falls back safely if local embedding is unavailable."""
         query = str(query or "").strip()
+        trace_event("retrieval_selection_started", query=query)
         try:
             instructions = InstructionStore(self.store).applicable() if self.store and self.store.exists() else []
             self.index.sync("tools", _tool_records(self.tools))
             self.index.sync("prompt_modules", _module_records())
             self.index.sync("runtime_intents", _intent_records())
             self.index.sync("instructions", _instruction_records(instructions))
-            if self.store and self.store.exists():
-                self.index.sync("cognition", _cognition_records(self.store))
-
+            # Cognition indexing is owned by RetrievalStore's hybrid path. Do not
+            # eagerly embed/sync the entire cognition graph for every chat turn.
             query_vector = self.index.embed_query(query)
             tool_hits = self.index.search("tools", limit=tool_limit, min_score=0.20, query_vector=query_vector)
             selected_tools = [x["id"] for x in tool_hits]
@@ -242,6 +289,17 @@ class ContextSelector:
                     break
             tool_hits = expanded_hits
 
+            document_transform_intent = _looks_like_document_transform(query)
+            if document_transform_intent:
+                # Do not let semantic similarity choose a generic PPT/PDF writer.
+                # Those tools invite the LLM to author a summary instead of
+                # transforming the complete source document.
+                selected_tools = [n for n in selected_tools if n not in _GENERIC_ARTIFACT_WRITERS]
+                for required in ("transform_document", "read_docx"):
+                    if any(t.name == required for t in self.tools) and required not in selected_tools:
+                        selected_tools.append(required)
+                tool_hits = [h for h in tool_hits if h["id"] not in _GENERIC_ARTIFACT_WRITERS]
+
             intent_hits = self.index.search("runtime_intents", limit=3, min_score=0.0, query_vector=query_vector)
             intent = intent_hits[0]["id"] if intent_hits else "conversation"
             intent_score = float(intent_hits[0]["score"]) if intent_hits else 0.0
@@ -254,7 +312,10 @@ class ContextSelector:
             # (for example, "how do beasts evolve"). The deterministic predicate
             # requires both a mutation verb and a project/code/UI target. Semantic
             # intent remains useful for non-mutating routing and prompt selection.
-            if _looks_like_cognition_mutation(query):
+            if document_transform_intent:
+                intent = "document_transform"
+                intent_score = 1.0
+            elif _looks_like_cognition_mutation(query):
                 intent = "cognition_mutation"
                 intent_score = 1.0
             elif _looks_like_project_mutation(query):
@@ -277,29 +338,62 @@ class ContextSelector:
             # System-scoped instructions are true invariants and remain unconditional.
             selected_instructions.extend(x for x in instructions if x.get("scope") == "system")
 
-            cognition_hits = self.index.search("cognition", limit=cognition_limit, min_score=0.25, query_vector=query_vector) if self.store and self.store.exists() else []
-            candidates = []
-            seen = set()
-            for x in cognition_hits:
-                kind = x["metadata"].get("kind")
-                ident = x["metadata"].get("object_id")
-                key = (str(kind or ""), str(ident or ""))
-                if not all(key) or key in seen:
-                    continue
-                seen.add(key)
-                candidates.append({"kind": kind, "id": ident, "score": x["score"]})
-            # Embeddings locate likely cognition objects; canonical graph edges then
-            # expand those entry points. Semantic top-k is never treated as the full
-            # answer set.
+            # Cognition retrieval is hybrid: cheap lexical/entity evidence first,
+            # semantic similarity only as a supplement when the query contains enough
+            # information to search meaningfully. This prevents arbitrary nearest
+            # neighbours from being injected for low-information turns.
             retrieval = RetrievalStore(self.store) if self.store and self.store.exists() else None
-            if retrieval and candidates:
-                candidates = retrieval.expand_candidates(candidates, max_depth=2, max_items=24)
-            budget = min(12000, 4000 + 500 * max(0, len(candidates) - cognition_limit))
-            prefetched = retrieval.retrieve_candidates(candidates, detail="compact", max_chars=budget) if retrieval and candidates else None
-            if prefetched is not None:
-                prefetched["query"] = query
-                prefetched["candidates"] = candidates
-                prefetched["retrieval"] = "local_semantic"
+            candidates = []
+            prefetched = None
+            if retrieval:
+                hybrid = retrieval.search_metadata_candidates(query, limit=cognition_limit)
+                trace_event(
+                    "retrieval_candidates",
+                    query=query,
+                    retrieval=hybrid.get("retrieval"),
+                    semantic_attempted=hybrid.get("semantic_attempted"),
+                    lexical_candidates=hybrid.get("lexical_count"),
+                    candidate_count=len(hybrid.get("candidates") or []),
+                    candidates=[
+                        {
+                            "kind": item.get("kind"),
+                            "id": item.get("id"),
+                            "match": item.get("match"),
+                            "lexical_score": item.get("lexical_score"),
+                            "semantic_score": item.get("semantic_score"),
+                        }
+                        for item in (hybrid.get("candidates") or [])
+                    ],
+                )
+                for item in hybrid.get("candidates", []):
+                    candidates.append({
+                        "kind": item.get("kind"),
+                        "id": item.get("id"),
+                        "score": item.get("semantic_score"),
+                        "lexical_score": item.get("lexical_score"),
+                        "match": item.get("match"),
+                    })
+                if candidates:
+                    candidates = retrieval.expand_candidates(candidates, max_depth=2, max_items=24)
+                    budget = min(12000, 4000 + 500 * max(0, len(candidates) - cognition_limit))
+                    prefetched = retrieval.retrieve_candidates(candidates, detail="compact", max_chars=budget)
+                    prefetched["query"] = query
+                    prefetched["candidates"] = candidates
+                    prefetched["retrieval"] = "hybrid"
+                    trace_event(
+                        "retrieval_hydrated",
+                        query=query,
+                        request_count=len(prefetched.get("requests") or []),
+                        chars=prefetched.get("used_chars"),
+                        truncated=prefetched.get("truncated"),
+                        next_requests=len(prefetched.get("next_requests") or []),
+                    )
+                else:
+                    trace_event(
+                        "retrieval_hydration_skipped",
+                        query=query,
+                        reason="no_candidates",
+                    )
 
             return {
                 "tool_names": selected_tools,
@@ -313,12 +407,14 @@ class ContextSelector:
             }
         except Exception as exc:
             LOGGER.warning("Local semantic selection unavailable; using bounded compatibility fallback: %s", exc)
+            trace_event(
+                "retrieval_selection_error",
+                query=query,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+                cognition_retrieval="skipped",
+            )
             prefetched = None
-            if self.store and self.store.exists():
-                try:
-                    prefetched = RetrievalStore(self.store).retrieve_for_query(query, max_chars=8000, limit=cognition_limit, detail="compact")
-                except Exception:
-                    LOGGER.exception("Fallback cognition retrieval failed")
             return {
                 "tool_names": [t.name for t in self.tools],
                 "tool_hits": [],

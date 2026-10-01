@@ -1,28 +1,28 @@
-"""Provider-neutral tool-calling dispatch."""
-from ragapp.config import load_project_config
+"""Provider-neutral tool-calling dispatch.
 
-def _module(store):
-    name = load_project_config(store).get("provider", {}).get("name", "gemini").lower()
-    if name == "openrouter":
-        from ragapp.llm.tool_calling import openrouter
-        return openrouter
-    if name == "gemini":
-        from ragapp.llm.tool_calling import gemini
-        return gemini
-    if name in {"azure", "azure_openai"}:
-        from ragapp.llm.tool_calling import azure_openai
-        return azure_openai
-    raise RuntimeError(
-        f"Provider '{name}' is configured but no tool-calling adapter is enabled."
-    )
+The active adapter is the module named by the project's configured provider;
+the provider list lives in ``ragapp.llm.provider.PROVIDER_SPECS``. Every adapter
+exposes the same functions: ``to_provider_contents``, ``generate_step``,
+``build_function_response_content``, ``generate_json`` and ``model_name``.
+"""
+
+
+def _adapter(store):
+    from ragapp.llm.provider import adapter_for
+
+    return adapter_for(store)
+
 
 def to_provider_contents(transcript, store=None):
-    return _module(store).to_provider_contents(transcript, store=store) if store else _module(store).to_provider_contents(transcript)
+    return _adapter(store).to_provider_contents(transcript, store=store)
+
 
 def generate_step(contents, function_declarations, system_instruction=None, store=None):
-    return _module(store).generate_step(contents, function_declarations, system_instruction, store)
+    return _adapter(store).generate_step(contents, function_declarations, system_instruction, store)
+
 
 def build_function_response_content(name, result, call_id=None, store=None):
-    return _module(store).build_function_response_content(name, result, call_id)
+    return _adapter(store).build_function_response_content(name, result, call_id)
+
 
 __all__ = ["to_provider_contents", "generate_step", "build_function_response_content"]

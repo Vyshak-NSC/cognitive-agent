@@ -7,6 +7,7 @@ continuations; it does not create another persisted knowledge store.
 from __future__ import annotations
 
 import json
+from ragapp.agent.trace import trace_event
 import re
 
 from ragapp.core.semantic_index import SemanticIndex
@@ -133,48 +134,170 @@ class RetrievalStore:
                 break
         return out
 
+    @staticmethod
+    def _query_tokens(query):
+        return RetrievalStore._norm_words(query)
+
+    @classmethod
+    def _lexical_match_score(cls, query_tokens, record):
+        """Cheap lexical relevance used before semantic retrieval.
+
+        This is deliberately generic: it does not contain a list of greetings or
+        special phrases. Exact names/tags and ordinary token overlap are the first
+        retrieval signal; semantic similarity only supplements that signal.
+        """
+        if not query_tokens:
+            return 0.0
+        fields = []
+        for key in ("name", "title", "tags", "summary", "description", "type"):
+            value = record.get(key)
+            if isinstance(value, list):
+                fields.extend(str(x) for x in value)
+            elif value not in (None, ""):
+                fields.append(str(value))
+        record_tokens = set(cls._norm_words(" ".join(fields)))
+        if not record_tokens:
+            return 0.0
+        overlap = len(set(query_tokens) & record_tokens)
+        return overlap / max(1, len(set(query_tokens)))
+
+    def _lexical_candidates(self, query, limit=8):
+        tokens = self._query_tokens(query)
+        if not tokens:
+            return []
+        records = []
+        for kind in CANONICAL_KINDS:
+            for rec in self.store._all_kind_records(kind):
+                score = self._lexical_match_score(tokens, rec)
+                if score <= 0:
+                    continue
+                ident = str(rec.get("id") or "").strip()
+                if not ident:
+                    continue
+                records.append({
+                    "id": ident,
+                    "kind": kind,
+                    "type": rec.get("type"),
+                    "name": rec.get("name") or rec.get("title") or ident,
+                    "summary": (rec.get("summary") or rec.get("description") or "")[:1000],
+                    "provenance": rec.get("provenance", [])[:3] if isinstance(rec.get("provenance"), list) else [],
+                    "semantic_score": None,
+                    "lexical_score": score,
+                    "match": "lexical",
+                })
+        records.sort(key=lambda x: (-float(x.get("lexical_score") or 0), str(x.get("kind")), str(x.get("id"))))
+        # Named/tagged groups are stronger than generic token overlap.
+        grouped = self.group_candidates(query, limit=max(limit, 25))
+        by_key = {(x["kind"], x["id"]): x for x in records}
+        ordered = []
+        for item in grouped + records:
+            key = (item.get("kind"), item.get("id"))
+            if key in by_key or item in grouped:
+                if key not in {(x.get("kind"), x.get("id")) for x in ordered}:
+                    ordered.append(item)
+        return ordered[:limit]
+
+    def _semantic_retrieval_allowed(self, query, lexical_candidates):
+        """Return whether semantic retrieval has enough signal to be useful.
+
+        A one-token query with no lexical hit is intentionally not embedded against
+        the whole cognition graph. This prevents arbitrary nearest neighbours for
+        acknowledgements, noise, and other low-information turns without requiring
+        a growing hard-coded phrase list.
+        """
+        tokens = self._query_tokens(query)
+        if lexical_candidates:
+            return True
+        return len(tokens) >= 2
+
     def search_metadata_candidates(self, query, limit=8):
-        """Semantic canonical candidate search with lexical compatibility fallback."""
+        """Hybrid canonical candidate search: lexical first, semantic second.
+
+        Semantic retrieval supplements real lexical evidence instead of being an
+        unconditional nearest-neighbour lookup. Low-information queries therefore
+        return no cognition candidates rather than unrelated canonical records.
+        """
         limit = max(1, min(int(limit or 8), 50))
-        candidates = []
-        try:
-            index = SemanticIndex(self.store)
-            records = cognition_index_records(self.store)
-            index.sync("cognition", records)
-            hits = index.search("cognition", query, limit=limit, min_score=0.20)
-            for hit in hits:
-                kind = hit["metadata"].get("kind")
-                ident = hit["metadata"].get("object_id")
-                rec = self._read_kind(kind, ident) if kind and ident else {}
-                if rec:
-                    candidates.append({
+        query = str(query or "").strip()
+        lexical = self._lexical_candidates(query, limit=limit)
+        candidates = list(lexical)
+        semantic_allowed = self._semantic_retrieval_allowed(query, lexical)
+        trace_event(
+            "retrieval_query",
+            query=query,
+            lexical_count=len(lexical),
+            lexical_candidates=[
+                {"kind": c.get("kind"), "id": c.get("id"), "name": c.get("name"), "score": c.get("lexical_score")}
+                for c in lexical
+            ],
+            semantic_allowed=semantic_allowed,
+            semantic_reason=(
+                "lexical_hits" if lexical else
+                "enough_query_tokens" if len(self._query_tokens(query)) >= 2 else
+                "insufficient_query_signal"
+            ),
+        )
+
+        if semantic_allowed:
+            try:
+                index = SemanticIndex(self.store)
+                records = cognition_index_records(self.store)
+                index.sync("cognition", records)
+                hits = index.search("cognition", query, limit=max(limit * 2, 8), min_score=0.30)
+                trace_event(
+                    "semantic_retrieval",
+                    query=query,
+                    hits=[
+                        {
+                            "id": h.get("metadata", {}).get("object_id"),
+                            "kind": h.get("metadata", {}).get("kind"),
+                            "score": h.get("score"),
+                        }
+                        for h in hits
+                    ],
+                )
+                existing = {(str(c.get("kind")), str(c.get("id"))) for c in candidates}
+                for hit in hits:
+                    kind = hit["metadata"].get("kind")
+                    ident = hit["metadata"].get("object_id")
+                    rec = self._read_kind(kind, ident) if kind and ident else {}
+                    if not rec:
+                        continue
+                    key = (str(kind), str(ident))
+                    item = {
                         "id": str(ident), "kind": str(kind), "type": rec.get("type"),
                         "name": rec.get("name") or rec.get("title") or str(ident),
                         "summary": (rec.get("summary") or rec.get("description") or "")[:1000],
                         "provenance": rec.get("provenance", [])[:3] if isinstance(rec.get("provenance"), list) else [],
                         "semantic_score": hit["score"],
-                    })
-        except Exception:
-            result = self.store.search_cognition_metadata(query, limit=limit)
-            candidates = list(result.get("candidates", [])) if isinstance(result, dict) else []
-        candidates = candidates[:limit]
-        # Semantic top-k cannot enumerate a group ("list the God Beasts") because
-        # several members compete for the same few slots. Add every entity whose
-        # tag/name is named in the query, on top of the semantic hits.
-        try:
-            have = {(str(c.get("kind")), str(c.get("id"))) for c in candidates}
-            for extra in self.group_candidates(query):
-                key = (extra["kind"], extra["id"])
-                if key not in have:
-                    have.add(key)
-                    candidates.append(extra)
-        except Exception:
-            pass
+                        "lexical_score": self._lexical_match_score(self._query_tokens(query), rec),
+                        "match": "semantic",
+                    }
+                    if key not in existing:
+                        existing.add(key)
+                        candidates.append(item)
+                    if len(candidates) >= limit:
+                        break
+            except Exception:
+                # Lexical retrieval is the safe fallback. Do not resurrect the old
+                # broad semantic-store fallback here; that was the source of
+                # unrelated context being injected after semantic failures.
+                LOGGER = __import__("logging").getLogger("ragapp.core.retrieval")
+                LOGGER.warning("Semantic cognition retrieval unavailable; using lexical candidates only", exc_info=True)
+                trace_event(
+                    "semantic_retrieval_error",
+                    query=query,
+                    error="semantic retrieval unavailable; lexical candidates retained",
+                )
+
         return {
-            "query": str(query or ""),
-            "candidates": candidates[:50],
+            "query": query,
+            "candidates": candidates[:limit],
             "content_loaded": False,
             "instruction": "Hydrate only the canonical candidates needed for the answer.",
+            "retrieval": "hybrid",
+            "semantic_attempted": semantic_allowed,
+            "lexical_count": len(lexical),
         }
 
     def _resolve_entity_ids(self, req):

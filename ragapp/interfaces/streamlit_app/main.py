@@ -22,17 +22,20 @@ from ragapp.execution.project import (
 from ragapp.workspace.manager import set_current_project
 from ragapp.agent.loop import run_agent
 from ragapp.agent.run_context import AgentRunContext
+from ragapp.agent.trace import ExecutionTrace
 from ragapp.tools import build_default_tools
 from ragapp.chat_sessions import ChatSessionStore
 from ragapp.interfaces.streamlit_app.file_manager import (
     render_file_manager,
     _prepare_html_preview,
 )
+from ragapp.interfaces.streamlit_app.previews import render_document_preview, DOCUMENT_SUFFIXES
 from ragapp.core.drafts import DraftManager
 from ragapp.core.agents import AgentStore
 from ragapp.core.approval import ApprovalEngine
 from ragapp.core.instructions import InstructionStore
 from ragapp.core.vcs import VCSManager
+from ragapp.llm.registry import PROVIDER_SPECS, limit
 from ragapp.config import (
     load_project_config,
     save_project_config,
@@ -162,21 +165,11 @@ def _terminate_streamlit_process_after_response(delay: float = 0.8) -> None:
 # Project helpers
 # ===========================================================================
 
-PROVIDERS = [
-    "gemini",
-    "openrouter",
-    "openai",
-    "anthropic",
-    "azure",
-]
+PROVIDERS = list(PROVIDER_SPECS)
 
-DEFAULT_MODELS = {
-    "gemini": "gemini-3.5-flash-lite",
-    "openrouter": "liquid/lfm-2.5-2.6b:free",
-    "openai": "gpt-5.6-luna",
-    "anthropic": "",
-    "azure": "gpt-5.6-luna",
-}
+
+def _provider_label(provider_id: str) -> str:
+    return PROVIDER_SPECS[provider_id]["label"]
 
 
 def _project_exists(
@@ -214,13 +207,12 @@ def _new_project_dialog():
         "LLM provider",
         PROVIDERS,
         index=0,
+        format_func=_provider_label,
         key="create_project_provider",
     )
 
-    default_model = DEFAULT_MODELS.get(
-        provider,
-        "",
-    )
+    spec = PROVIDER_SPECS[provider]
+    default_model = spec["default_model"]
 
     previous_provider = st.session_state.get(
         "create_project_previous_provider",
@@ -236,7 +228,7 @@ def _new_project_dialog():
         ] = provider
 
     model = st.text_input(
-        "Model",
+        spec["model_label"],
         value=st.session_state.get(
             "create_project_model",
             default_model,
@@ -248,8 +240,21 @@ def _new_project_dialog():
         key="create_project_model",
     )
 
+    endpoint = ""
+    if spec["endpoint_env"]:
+        endpoint = st.text_input(
+            "Azure Foundry endpoint",
+            value="",
+            placeholder="https://<resource>.services.ai.azure.com",
+            help=(
+                "Shared by both Azure providers. Optional if the "
+                f"{spec['endpoint_env']} environment variable is set."
+            ),
+            key="create_project_endpoint",
+        )
+
     api_key = st.text_input(
-        f"{provider.title()} API key",
+        spec["key_label"],
         value="",
         type="password",
         help=(
@@ -269,6 +274,7 @@ def _new_project_dialog():
         "Fallback providers",
         fallback_options,
         default=[],
+        format_func=_provider_label,
         help=(
             "Providers that may be used as fallbacks if the primary "
             "provider cannot complete a request."
@@ -301,6 +307,7 @@ def _new_project_dialog():
             "create_project_provider",
             "create_project_model",
             "create_project_api_key",
+            "create_project_endpoint",
             "create_project_fallbacks",
             "create_project_previous_provider",
         ):
@@ -373,11 +380,14 @@ def _new_project_dialog():
             fallback
         )
 
+        if endpoint.strip():
+            provider_cfg["endpoint"] = endpoint.strip()
+
         if api_key.strip():
             provider_cfg.setdefault(
                 "api_keys",
                 {},
-            )[provider] = api_key.strip()
+            )[spec["key_slot"]] = api_key.strip()
 
         cfg["provider"] = provider_cfg
 
@@ -410,6 +420,7 @@ def _new_project_dialog():
         "create_project_provider",
         "create_project_model",
         "create_project_api_key",
+        "create_project_endpoint",
         "create_project_fallbacks",
         "create_project_previous_provider",
     ):
@@ -1087,63 +1098,8 @@ def _render_selected_file(path: Path, root: Path) -> None:
         st.image(raw, use_container_width=True)
         return
 
-    if suffix == ".pdf":
-        encoded = base64.b64encode(raw).decode("ascii")
-        st.markdown(
-            f'<iframe src="data:application/pdf;base64,{encoded}" '
-            'width="100%" height="650" style="border:0;border-radius:6px;">'
-            '</iframe>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    if suffix == ".docx":
-        # DOCX is a ZIP package containing XML, so decoding the raw bytes as
-        # UTF-8 displays the PK header and compressed garbage. Parse the Word
-        # package and render its document content instead.
-        try:
-            from docx import Document
-            from docx.table import Table
-            from docx.text.paragraph import Paragraph
-
-            document = Document(BytesIO(raw))
-            rendered_any = False
-
-            # python-docx >= 1.1 exposes iter_inner_content(), which preserves
-            # paragraph/table order. Fall back gracefully for older versions.
-            if hasattr(document, "iter_inner_content"):
-                blocks = document.iter_inner_content()
-            else:
-                blocks = [*document.paragraphs, *document.tables]
-
-            for block in blocks:
-                if isinstance(block, Paragraph):
-                    text = block.text.strip()
-                    if not text:
-                        continue
-                    rendered_any = True
-                    style_name = (block.style.name or "") if block.style else ""
-                    if style_name.startswith("Heading"):
-                        try:
-                            level = int(style_name.split()[-1])
-                        except (TypeError, ValueError):
-                            level = 3
-                        level = max(1, min(level, 6))
-                        st.markdown(f"{'#' * level} {text}")
-                    elif style_name in {"Title", "Subtitle"}:
-                        st.markdown(f"## {text}")
-                    else:
-                        st.write(text)
-                elif isinstance(block, Table):
-                    rows = [[cell.text for cell in row.cells] for row in block.rows]
-                    if rows:
-                        rendered_any = True
-                        st.table(rows)
-
-            if not rendered_any:
-                st.info("This Word document contains no previewable text or tables.")
-        except Exception as exc:
-            st.error(f"Could not preview Word document `{path.name}`: {exc}")
+    if suffix in DOCUMENT_SUFFIXES:
+        render_document_preview(path, key="chat")
         return
 
     try:
@@ -1276,77 +1232,62 @@ div[data-testid="stDialog"] div[role="dialog"] > div {
 # ===========================================================================
 
 def _serialise_tool_calls(calls):
-    """
-    Convert the runtime execution trace into JSON/session-safe data.
-
-    The trace is stored inside the assistant message so it survives:
-      - Streamlit reruns
-      - session switching
-      - application refreshes
-      - loading an existing ChatSessionStore session
-    """
+    """Keep the legacy tool-call list for existing session/API compatibility."""
     result = []
-
     for call in calls or []:
         if not isinstance(call, dict):
             continue
-
-        result.append(
-            {
-                "tool": call.get("tool"),
-                "args": call.get("args"),
-                "result": call.get("result"),
-            }
-        )
-
+        result.append({
+            "tool": call.get("tool"),
+            "args": call.get("args"),
+            "result": call.get("result"),
+        })
     return result
 
 
-def _render_tool_calls(tool_calls):
+def _render_execution_trace(trace_data):
+    """Render the complete persisted agent execution trace.
+
+    The trace is deliberately independent of tool calls. API calls, retrieval,
+    context assembly, tools, errors and finalization are all first-class events.
     """
-    Render a persisted execution trace underneath the assistant response.
-    """
-    if not tool_calls:
+    if not trace_data:
+        return
+    events = trace_data.get("events") if isinstance(trace_data, dict) else trace_data
+    if not events:
         return
 
-    with st.expander(
-        f"Execution trace · {len(tool_calls)} tool calls",
-        expanded=False,
-    ):
+    with st.expander(f"Execution trace · {len(events)} events", expanded=False):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            seq = event.get("seq", "?")
+            event_type = str(event.get("type") or "event").replace("_", " ").title()
+            elapsed = event.get("elapsed_ms")
+            suffix = f" · {elapsed} ms" if elapsed is not None else ""
+            data = event.get("data") or {}
+            with st.expander(f"{seq}. {event_type}{suffix}", expanded=False):
+                if data:
+                    st.json(data)
+
+
+def _render_tool_calls(tool_calls):
+    """Render the old tool-only trace when loading legacy chat sessions."""
+    if not tool_calls:
+        return
+    with st.expander(f"Legacy tool trace · {len(tool_calls)} tool calls", expanded=False):
         for index, call in enumerate(tool_calls, start=1):
-            tool_name = call.get(
-                "tool",
-                "unknown",
-            )
-
-            st.markdown(
-                f"**Tool call {index}: `{tool_name}`**"
-            )
-
-            args = call.get(
-                "args",
-            )
-
-            if args is not None:
+            st.markdown(f"**Tool call {index}: `{call.get('tool', 'unknown')}`**")
+            if call.get("args") is not None:
                 st.markdown("**Arguments**")
-                st.json(args)
-
-            result = call.get(
-                "result",
-            )
-
-            if result is not None:
+                st.json(call.get("args"))
+            if call.get("result") is not None:
                 st.markdown("**Result**")
-
-                if isinstance(
-                    result,
-                    (dict, list),
-                ):
+                result = call.get("result")
+                if isinstance(result, (dict, list)):
                     st.json(result)
                 else:
-                    st.code(
-                        str(result)
-                    )
+                    st.code(str(result))
 
 
 # ===========================================================================
@@ -1357,6 +1298,12 @@ if nav_section == "chat":
     from ragapp.core.vcs import VCSManager
 
     preview_enabled = st.toggle("Show file preview", value=False, key="chat_preview_enabled", help="Show or hide the optional file preview panel.")
+    trace_enabled = st.toggle(
+        "Execution trace",
+        value=st.session_state.get("execution_trace_enabled", True),
+        key="execution_trace_enabled",
+        help="Development instrumentation. Shows retrieval, model/API, tool, and final-turn events. Disable for normal use.",
+    )
     chat_col = st.container()
 
     def _activate_turn(target_turn_id):
@@ -1397,6 +1344,7 @@ if nav_section == "chat":
         active_ids=sessions.lineage_ids_data(current,parent_id) if parent_id else []
         active_ids=active_ids+[turn_id]
         calls=[]; drafts=[]; answer=""; tool_calls=[]
+        execution_trace = ExecutionTrace(enabled=trace_enabled) if trace_enabled else None
         placeholder=st.empty()
         stream_state={"rendered":"","plan":None,"done":[]}
         def _render_plan():
@@ -1415,14 +1363,27 @@ if nav_section == "chat":
                     transcript=transcript, tools=tools, cognition=store, project_id=store.project_id,
                     session_id=st.session_state.chat_session_id, turn_id=turn_id, active_turn_ids=active_ids,
                     on_section=_on_section, agent_id=(st.session_state.get("active_agent_id") or None),
+                    trace=execution_trace,
                 ))
             answer=(answer or "").strip() or stream_state["rendered"] or "⚠️ The agent produced no response for this turn. Try again."
-            tool_calls=_serialise_tool_calls(calls); placeholder.markdown(answer); _render_tool_calls(tool_calls)
+            tool_calls=_serialise_tool_calls(calls)
+            placeholder.markdown(answer)
+            if execution_trace is not None:
+                _render_execution_trace(execution_trace.as_dict())
+            else:
+                _render_tool_calls(tool_calls)
         except Exception as exc:
             answer=(stream_state["rendered"]+"\n\n" if stream_state["rendered"] else "")+"The agent encountered an error while executing this request."
-            tool_calls=_serialise_tool_calls(calls)+[{"tool":"agent_error","args":{},"result":str(exc)}]; placeholder.markdown(answer); _render_tool_calls(tool_calls)
+            tool_calls=_serialise_tool_calls(calls)+[{"tool":"agent_error","args":{},"result":str(exc)}]
+            placeholder.markdown(answer)
+            if execution_trace is not None:
+                _render_execution_trace(execution_trace.as_dict())
+            else:
+                _render_tool_calls(tool_calls)
         state_after=vcs.checkpoint(f"After chat turn: {user_text[:48]}")
         assistant_message={"role":"assistant","content":answer,"tool_calls":tool_calls,"turn_id":turn_id}
+        if execution_trace is not None:
+            assistant_message["execution_trace"] = execution_trace.as_dict()
         effects={"draft_ids":[d.get("id") for d in drafts if isinstance(d,dict)],"tool_count":len(calls)}
         if replacing_turn_id:
             refreshed=sessions.fork_turn(
@@ -1455,7 +1416,7 @@ if nav_section == "chat":
         st.session_state.messages=refreshed.get("messages",[])
 
     with chat_col:
-        chat_box=st.container(height=350,border=False)
+        chat_box=st.container(height=300,border=False)
         current_session=sessions.load(st.session_state.chat_session_id) or session
         active_ids=current_session and sessions.lineage_ids_data(current_session) or []
         with chat_box:
@@ -1481,7 +1442,11 @@ if nav_section == "chat":
                         if ec2.button("Cancel",key=f"cancel_edit_{tid}"):
                             st.session_state[f"editing_{tid}"]=False; st.rerun()
                 with st.chat_message("assistant"):
-                    a=turn.get("assistant") or {}; st.markdown(a.get("content","")); _render_tool_calls(a.get("tool_calls",[]))
+                    a=turn.get("assistant") or {}; st.markdown(a.get("content",""))
+                    if a.get("execution_trace"):
+                        _render_execution_trace(a.get("execution_trace"))
+                    else:
+                        _render_tool_calls(a.get("tool_calls",[]))
                     # Switch among sibling branches without deleting either branch.
                     siblings=[x for x in (current_session.get("turns") or {}).values() if x.get("parent_id")==turn.get("parent_id")]
                     if len(siblings)>1:
@@ -1955,6 +1920,12 @@ if nav_section == "settings":
         "gemini",
     )
 
+    if old_provider not in PROVIDER_SPECS:
+        st.warning(
+            f"This project uses '{old_provider}', which is not a supported "
+            "provider. Choose one below and save."
+        )
+
     provider = st.selectbox(
         "LLM provider",
         PROVIDERS,
@@ -1965,26 +1936,18 @@ if nav_section == "settings":
             if old_provider in PROVIDERS
             else 0
         ),
+        format_func=_provider_label,
     )
 
+    spec = PROVIDER_SPECS[provider]
+
     if provider != old_provider:
-        if provider == "openrouter":
-            prov["model"] = (
-                "liquid/lfm-2.5-2.6b:free"
-            )
-
-        elif provider == "gemini":
-            prov["model"] = (
-                "gemini-3.5-flash-lite"
-            )
-
-        else:
-            prov["model"] = ""
+        prov["model"] = spec["default_model"]
 
     prov["name"] = provider
 
     prov["model"] = st.text_input(
-        "Model",
+        spec["model_label"],
         prov.get(
             "model",
             "",
@@ -1995,8 +1958,23 @@ if nav_section == "settings":
         ),
     )
 
+    if spec["endpoint_env"]:
+        prov["endpoint"] = st.text_input(
+            "Azure Foundry endpoint",
+            prov.get(
+                "endpoint",
+                "",
+            ),
+            placeholder="https://<resource>.services.ai.azure.com",
+            help=(
+                "Shared by both Azure providers. The "
+                f"{spec['endpoint_env']} environment variable "
+                "takes precedence."
+            ),
+        )
+
     key = st.text_input(
-        f"{provider.title()} API key",
+        spec["key_label"],
         value="",
         type="password",
         help=(
@@ -2008,15 +1986,16 @@ if nav_section == "settings":
 
     fallback = st.multiselect(
         "Fallback providers",
-        PROVIDERS,
+        [x for x in PROVIDERS if x != provider],
         default=[
             x
             for x in prov.get(
                 "fallback",
                 [],
             )
-            if x in PROVIDERS
+            if x in PROVIDERS and x != provider
         ],
+        format_func=_provider_label,
     )
 
     prov["fallback"] = fallback
@@ -2025,48 +2004,28 @@ if nav_section == "settings":
         "Max agent steps",
         1,
         100,
-        int(
-            limits.get(
-                "max_agent_steps",
-                12,
-            )
-        ),
+        int(limit(cfg, "max_agent_steps")),
     )
 
     limits["transcript_turns"] = st.number_input(
         "Transcript clearing turn threshold",
         5,
         1000,
-        int(
-            limits.get(
-                "transcript_turns",
-                40,
-            )
-        ),
+        int(limit(cfg, "transcript_turns")),
     )
 
     limits["transcript_chars"] = st.number_input(
         "Transcript clearing character threshold",
         1000,
         1000000,
-        int(
-            limits.get(
-                "transcript_chars",
-                80000,
-            )
-        ),
+        int(limit(cfg, "transcript_chars")),
     )
 
     limits["requests_per_minute"] = st.number_input(
         "Provider requests/minute",
         1,
         1000,
-        int(
-            limits.get(
-                "requests_per_minute",
-                15,
-            )
-        ),
+        int(limit(cfg, "requests_per_minute")),
     )
 
     features["semantic_propagation"] = st.checkbox(
@@ -2087,7 +2046,7 @@ if nav_section == "settings":
             prov.setdefault(
                 "api_keys",
                 {}
-            )[provider] = key
+            )[spec["key_slot"]] = key
 
         cfg["provider"] = prov
         cfg["limits"] = limits

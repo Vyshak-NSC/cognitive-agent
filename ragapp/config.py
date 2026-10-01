@@ -6,8 +6,8 @@ import yaml
 _ENV_KEYS = {
     "gemini": "GEMINI_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "azure": "AZURE_OPENAI_API_KEY",
+    "anthropic": "AZURE_API_KEY",
+    "azure": "AZURE_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
 _DEFAULT_MODELS = {
@@ -16,6 +16,7 @@ _DEFAULT_MODELS = {
     "openai": "gpt-5.6-luna",
     "anthropic": "",
     "azure": "gpt-5.6-luna",
+    "azure_anthropic": "claude-sonnet-5",
 }
 
 def project_config(store):

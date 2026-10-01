@@ -143,3 +143,6 @@ def build_function_response_content(name, result, call_id=None):
             response={"result": result}
         )]
     )
+
+def model_name(store):
+    return resolve_model(store, CHAT_MODEL, DEFAULT_CHAT_MODEL)
