@@ -143,6 +143,23 @@ def _latest_user_query(transcript):
     return ""
 
 
+def _is_chat_cognition_approval(query):
+    """True when the user is approving previously discussed chat knowledge.
+
+    These requests are intentionally handled by the normal model turn so the
+    full transcript remains available.  Running a semantic mutation directly
+    from the short approval phrase (for example, "apply that to cognition")
+    loses the antecedent and can also cause the same mutation to run twice.
+    """
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    approval = re.search(r"\b(apply|commit|save|persist|learn|remember|add|promote|store)\b", q)
+    target = re.search(r"\b(cognition|canon|canonical|knowledge|memory|state)\b", q)
+    reference = re.search(r"\b(that|this|these|those|above|discussed|conversation|chat|changes?|updates?|decisions?|facts?)\b", q)
+    return bool(approval and target and reference)
+
+
 def _asserts_known_entity_state(query, cognition):
     """Recognize a short declarative assertion about an entity already in cognition.
 
@@ -206,19 +223,6 @@ def _semantic_change_text(query):
     return text or str(query or "").strip()
 
 
-
-def _requests_chat_cognition(query):
-    """Detect an explicit request to learn/compile durable cognition from chat itself."""
-    q = str(query or "").strip().lower()
-    if not q:
-        return False
-    learn = re.search(r"\b(generate|compile|create|build|learn|import|distill|extract|save|store)\b", q)
-    cognition = re.search(r"\b(cognition|knowledge|memory|canon|canonical|lore|facts?|entities|relationships|events)\b", q)
-    chat = re.search(r"\b(this chat|the chat|chat|conversation|conversation history|these messages|our conversation)\b", q)
-    source_only = re.search(r"\b(from|using)\s+(the\s+)?(source|documents?|files?)\b", q)
-    return bool(learn and cognition and chat and not source_only)
-
-
 def _load_persistent_instructions(cognition):
     """Load active persistent instructions locally."""
     if cognition is None or not cognition.exists():
@@ -241,6 +245,7 @@ def _build_system_instruction(active_instructions, modules=None):
         "Do not manually enumerate guessed cascade edits as deltas; the cognition transaction runtime loads connected cognition, "
         "performs semantic cascade planning with the LLM, applies it atomically, cleans references, and commits the new state. "
         "Use ordinary deltas only for simple isolated entity attribute state observations where no semantic cascade is requested."
+        "\n\nWhen the user's latest message approves applying previously discussed changes to cognition (for example, \"apply that to cognition\", \"save these changes\", or \"learn this chat\"), treat the ENTIRE supplied transcript as the working discussion. Extract only durable claims, decisions, state changes, relationships, events, or other cognition that the USER established or explicitly approved. Assistant text is context, not authority. Emit exactly one <STATE_UPDATE> block with semantic_changes containing the consolidated user-approved changes in plain language. Do not require the user to restate the earlier discussion. Do not emit a separate tool call merely to restate the approval."
     )
     module_lines = [str(x).strip() for x in (modules or []) if str(x).strip()]
     if module_lines:
@@ -692,11 +697,21 @@ def _run_agent_impl(context: AgentRunContext):
     # optional model behaviours. Apply them before the conversational model turn.
     # This prevents current cognition from talking the model out of a user correction
     # and prevents fabricated/stale source paths from being passed to the compiler.
+    chat_cognition_approval = _is_chat_cognition_approval(query)
     explicit_cognition_mutation = (
-        _looks_like_cognition_mutation(query)
-        or _asserts_known_entity_state(query, cognition)
-        or _edits_known_entity(query, cognition)
+        not chat_cognition_approval
+        and (
+            _looks_like_cognition_mutation(query)
+            or _asserts_known_entity_state(query, cognition)
+            or _edits_known_entity(query, cognition)
+        )
     )
+    if chat_cognition_approval:
+        trace_event("chat_cognition_approval_detected", query=query, transcript_messages=len(transcript))
+        LOGGER.info(
+            "Chat cognition approval detected project=%s session=%s; deferring mutation to transcript-aware model turn",
+            project_id, session_id or "none",
+        )
     explicit_recompile = _requests_recompile(query)
     cognition_mutation_result = None
     recompile_result = None
@@ -737,29 +752,6 @@ def _run_agent_impl(context: AgentRunContext):
             recompile_result = {"status": cognition_mutation_result.get("status") == "applied" and "compiled" or "error",
                                 "mode": "surgical_cognition_mutation",
                                 "error": cognition_mutation_result.get("error")}
-
-    chat_cognition_result = None
-    if _requests_chat_cognition(query) and not explicit_cognition_mutation and not explicit_recompile:
-        if cognition is None or not cognition.exists():
-            chat_cognition_result = {"status": "error", "error": "cognition store does not exist"}
-        else:
-            try:
-                from ragapp.cognition.merge import import_chat_cognition
-                chat_cognition_result = import_chat_cognition(
-                    cognition,
-                    transcript,
-                    session_id=session_id,
-                    turn_id=turn_id,
-                )
-            except Exception as exc:
-                LOGGER.exception("Chat cognition import failed project=%s", project_id)
-                chat_cognition_result = {"status": "error", "error": str(exc)}
-        _record_tool_call(
-            calls,
-            "cognition.import_chat",
-            {"session_id": session_id, "turn_id": turn_id, "message_count": len(transcript)},
-            chat_cognition_result,
-        )
 
     # Selection/prefetch was computed before the mutation. Refresh it after a
     # successful mutation so the model cannot be shown stale pre-mutation state.
