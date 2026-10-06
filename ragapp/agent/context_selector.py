@@ -151,7 +151,8 @@ def _looks_like_project_mutation(query: str) -> bool:
         r"\b(project|source|code|file|app|page|screen|ui|interface|button|box|panel|"
         r"dropdown|menu|sidebar|header|footer|camera|control|scene|canvas|component|"
         r"function|class|method|api|route|endpoint|database|schema|config|setting|"
-        r"html|css|javascript|typescript|python|three\.?js|react|streamlit)\b",
+        r"html|css|javascript|typescript|python|three\.?js|react|streamlit|"
+        r"login|authentication|auth|bug|issue|error|feature|behavior)\b",
         q,
     )
     return bool(target)
@@ -171,15 +172,27 @@ def _looks_like_project_inspection(query: str) -> bool:
     inspection = re.search(
         r"\b(inspect|read|show|find|locate|explain|review|analy[sz]e|check|trace|list|get|"
         r"extract|derive|determine|schema|structure|fields?|columns?|models?|classes?|"
-        r"methods?|functions?|implementation|source)\b",
+        r"methods?|functions?|implementation|source|say|contain|contents?)\b",
         q,
     )
     project_target = re.search(
         r"\b(project|source|code|codebase|repo|repository|file|files|folder|package|"
         r"models?|classes?|schema|table|tables|implementation|config|configuration|"
-        r"api|route|endpoint|database|invoice|accruals?)\b",
+        r"api|route|endpoint|database|invoice|accruals?|readme|"
+        r"\.(md|txt|py|json|yaml|yml|toml|ini|cfg|csv|xml|html|css|js|ts)\b)",
         q,
     )
+    if inspection and re.search(
+        r"\b(what does|what is|what are|where is|where are|how does|how is|"
+        r"tell me about|according to|describe|summari[sz]e)\b",
+        q,
+        re.I,
+    ) and re.search(
+        r"\b(project|repo(?:sitory)?|codebase|source|code|application|app)\b",
+        q,
+        re.I,
+    ):
+        return True
     return bool(inspection and project_target)
 
 
@@ -244,6 +257,96 @@ def _looks_like_document_transform(query: str) -> bool:
     return bool(target and transform_verb and source_hint)
 
 
+_COGNITION_QUERY_HINTS = re.compile(
+    r"\b("
+    r"what did we (?:decide|discuss|learn)|what do we know|what is known|"
+    r"remember|previously|earlier|according to (?:the project|our|the source)|"
+    r"canon|canonical|world state|lore|timeline|entity|entities|fact|facts|"
+    r"evidence|hypothesis|decision|decisions|dependency|dependencies|"
+    r"open question|known issue|project knowledge"
+    r")\b",
+    re.I,
+)
+
+def _looks_like_cognition_query(query: str) -> bool:
+    """Detect requests that need durable project knowledge without embedding."""
+    q = str(query or "").strip()
+    return bool(q and _COGNITION_QUERY_HINTS.search(q))
+
+def _deterministic_intent(query: str) -> str:
+    """Return only intents with an explicit runtime contract."""
+    q = str(query or "").strip()
+    if not q:
+        return "conversation"
+    if _looks_like_document_transform(q):
+        return "document_transform"
+    if _requests_recompile(q):
+        return "recompile"
+    if _looks_like_cognition_mutation(q):
+        return "cognition_mutation"
+    if _looks_like_project_mutation(q):
+        return "project_mutation"
+    if _looks_like_project_inspection(q):
+        return "project_inspection"
+    if _looks_like_cognition_query(q):
+        return "cognition"
+    return "conversation"
+
+def _bound_tool_names_for_intent(intent: str, selected: list[str], tools) -> list[str]:
+    """Apply the runtime capability boundary after semantic selection."""
+    available = {str(getattr(t, "name", "")) for t in tools}
+
+    contracts = {
+        "conversation": (),
+        "project_inspection": ("list_project_files", "read_project_text"),
+        "project_mutation": (
+            "list_project_files", "read_project_text", "create_project_file",
+            "edit_project_text", "propose_source_file", "propose_source_edit",
+        ),
+        "document_transform": ("transform_document", "read_docx"),
+        "recompile": ("list_project_files", "read_project_text", "recompile_source"),
+        "cognition": (
+            "search_cognition_metadata", "request_cognition_context",
+            "get_entity_metadata", "load_entities",
+        ),
+        "cognition_mutation": (
+            "search_cognition_metadata", "request_cognition_context",
+            "get_entity_metadata",
+        ),
+    }
+    contract = contracts.get(intent)
+    if contract is None:
+        # For intents without a deterministic contract, keep semantic selection
+        # bounded. Never expose more than the top six candidates.
+        return [name for name in selected if name in available][:6]
+    return [name for name in contract if name in available]
+
+def _fallback_tool_names(query: str, tools) -> tuple[str, list[str]]:
+    """Bounded routing when semantic indexing is unavailable."""
+    intent = _deterministic_intent(query)
+    if intent == "conversation":
+        return intent, []
+
+    groups = {
+        "document_transform": ("transform_document", "read_docx"),
+        "recompile": ("list_project_files", "read_project_text", "recompile_source"),
+        "cognition_mutation": (
+            "search_cognition_metadata", "request_cognition_context", "get_entity_metadata",
+        ),
+        "cognition": (
+            "search_cognition_metadata", "request_cognition_context",
+            "get_entity_metadata", "load_entities",
+        ),
+        "project_inspection": ("list_project_files", "read_project_text"),
+        "project_mutation": (
+            "list_project_files", "read_project_text", "create_project_file",
+            "edit_project_text", "propose_source_file", "propose_source_edit",
+        ),
+    }
+    available = {str(getattr(t, "name", "")) for t in tools}
+    return intent, [n for n in groups.get(intent, ()) if n in available]
+
+
 class ContextSelector:
     def __init__(self, store, tools):
         self.store = store
@@ -254,6 +357,32 @@ class ContextSelector:
         """Return a bounded candidate bundle. Falls back safely if local embedding is unavailable."""
         query = str(query or "").strip()
         trace_event("retrieval_selection_started", query=query)
+
+        # Ordinary conversation is intentionally tool-free. Do not invoke the
+        # semantic index for a turn that has no project capability to discover.
+        deterministic_intent = _deterministic_intent(query)
+        if deterministic_intent == "conversation":
+            system_instructions = []
+            if self.store and self.store.exists():
+                try:
+                    system_instructions = [
+                        x for x in InstructionStore(self.store).applicable()
+                        if x.get("scope") == "system"
+                    ]
+                except Exception:
+                    system_instructions = []
+            return {
+                "tool_names": [],
+                "tool_hits": [],
+                "modules": [],
+                "instructions": system_instructions,
+                "prefetched": None,
+                "candidates": [],
+                "intent": "conversation",
+                "intent_score": 1.0,
+                "mode": "conversation",
+            }
+
         try:
             instructions = InstructionStore(self.store).applicable() if self.store and self.store.exists() else []
             self.index.sync("tools", _tool_records(self.tools))
@@ -301,7 +430,7 @@ class ContextSelector:
                 tool_hits = [h for h in tool_hits if h["id"] not in _GENERIC_ARTIFACT_WRITERS]
 
             intent_hits = self.index.search("runtime_intents", limit=3, min_score=0.0, query_vector=query_vector)
-            intent = intent_hits[0]["id"] if intent_hits else "conversation"
+            intent = intent_hits[0]["id"] if intent_hits else deterministic_intent
             intent_score = float(intent_hits[0]["score"]) if intent_hits else 0.0
 
             # Project mutation is an execution contract: selecting it causes the
@@ -330,6 +459,11 @@ class ContextSelector:
                 intent = "conversation"
                 intent_score = 0.0
 
+            # Explicit runtime signals outrank semantic nearest-neighbour routing.
+            if deterministic_intent != "conversation":
+                intent = deterministic_intent
+                intent_score = 1.0
+
             module_hits = self.index.search("prompt_modules", limit=module_limit, min_score=0.30, query_vector=query_vector)
             modules = [PROMPT_MODULES[x["id"]]["text"] for x in module_hits if x["id"] in PROMPT_MODULES]
 
@@ -337,6 +471,12 @@ class ContextSelector:
             selected_instructions = [x["metadata"] for x in instruction_hits]
             # System-scoped instructions are true invariants and remain unconditional.
             selected_instructions.extend(x for x in instructions if x.get("scope") == "system")
+
+            # Apply the runtime capability contract after semantic ranking. Semantic
+            # similarity may help choose context, but it must never widen the tool
+            # surface beyond what the detected intent requires.
+            selected_tools = _bound_tool_names_for_intent(intent, selected_tools, self.tools)
+            tool_hits = [h for h in tool_hits if h["id"] in set(selected_tools)]
 
             # Cognition retrieval is hybrid: cheap lexical/entity evidence first,
             # semantic similarity only as a supplement when the query contains enough
@@ -395,6 +535,14 @@ class ContextSelector:
                         reason="no_candidates",
                     )
 
+            if intent == "conversation":
+                selected_tools = []
+                tool_hits = []
+                modules = []
+                selected_instructions = [
+                    x for x in instructions if x.get("scope") == "system"
+                ]
+
             return {
                 "tool_names": selected_tools,
                 "tool_hits": tool_hits,
@@ -415,13 +563,24 @@ class ContextSelector:
                 cognition_retrieval="skipped",
             )
             prefetched = None
+            intent, fallback_tools = _fallback_tool_names(query, self.tools)
+            instructions = []
+            if self.store and self.store.exists():
+                try:
+                    instructions = [
+                        x for x in InstructionStore(self.store).applicable()
+                        if x.get("scope") == "system"
+                    ]
+                except Exception:
+                    instructions = []
             return {
-                "tool_names": [t.name for t in self.tools],
+                "tool_names": fallback_tools,
                 "tool_hits": [],
                 "modules": [],
-                "instructions": InstructionStore(self.store).applicable() if self.store and self.store.exists() else [],
+                "instructions": instructions,
                 "prefetched": prefetched,
-                "intent": "conversation",
-                "intent_score": 0.0,
-                "mode": "compatibility_fallback",
+                "candidates": [],
+                "intent": intent,
+                "intent_score": 1.0 if intent != "conversation" else 0.0,
+                "mode": "deterministic_fallback",
             }

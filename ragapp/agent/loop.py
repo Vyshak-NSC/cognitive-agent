@@ -217,18 +217,19 @@ def _load_persistent_instructions(cognition):
     except Exception:
         return []
     return instructions or []
-def _build_system_instruction(active_instructions, modules=None):
+def _build_system_instruction(active_instructions, modules=None, include_mutation_contract=False):
     """Build a bounded system instruction from the invariant kernel plus selected context."""
     system_instruction = COGNITIVE_AGENT_PROMPT
     system_instruction += "\n\nNever reproduce internal tool results, retrieval envelopes, JSON context payloads, or controller metadata in the user-facing answer."
-    system_instruction += (
-        "\n\nWhen the user explicitly approves applying one or more arbitrary changes to canonical cognition "
-        "(including deleting an entity/fact/relationship or changes whose consequences may affect connected cognition), "
-        "emit exactly one <STATE_UPDATE> JSON block with a semantic_changes array containing the approved changes in plain language. "
-        "Do not manually enumerate guessed cascade edits as deltas; the cognition transaction runtime loads connected cognition, "
-        "performs semantic cascade planning with the LLM, applies it atomically, cleans references, and commits the new state. "
-        "Use ordinary deltas only for simple isolated entity attribute state observations where no semantic cascade is requested."
-    )
+    if include_mutation_contract:
+        system_instruction += (
+            "\n\nWhen the user explicitly approves applying one or more arbitrary changes to canonical cognition "
+            "(including deleting an entity/fact/relationship or changes whose consequences may affect connected cognition), "
+            "emit exactly one <STATE_UPDATE> JSON block with a semantic_changes array containing the approved changes in plain language. "
+            "Do not manually enumerate guessed cascade edits as deltas; the cognition transaction runtime loads connected cognition, "
+            "performs semantic cascade planning with the LLM, applies it atomically, cleans references, and commits the new state. "
+            "Use ordinary deltas only for simple isolated entity attribute state observations where no semantic cascade is requested."
+        )
     module_lines = [str(x).strip() for x in (modules or []) if str(x).strip()]
     if module_lines:
         system_instruction += "\n\nTASK-RELEVANT RUNTIME GUIDANCE:\n" + "\n".join(f"- {x}" for x in module_lines)
@@ -757,7 +758,11 @@ def _run_agent_impl(context: AgentRunContext):
             "Do not ask the user to paste a project file that can be discovered/read with project tools. "
             "Do not stop at a plan, example, or offer to implement."
         )
-    system_instruction = _build_system_instruction(selection.get("instructions"), selected_modules)
+    system_instruction = _build_system_instruction(
+        selection.get("instructions"),
+        selected_modules,
+        include_mutation_contract=bool(explicit_cognition_mutation),
+    )
     if cognition_mutation_result is not None:
         system_instruction += (
             "\n\nRUNTIME COGNITION MUTATION RESULT (already executed; report only this actual result):\n"
@@ -851,13 +856,14 @@ def _run_agent_impl(context: AgentRunContext):
             return {"matches": [{"name": h["id"], "description": h["text"], "score": h["score"]} for h in hits]}
         except Exception as exc:
             return {"error": str(exc)}
-    registry.add(Tool(
-        "discover_tools",
-        "Fallback capability discovery. Use only when the currently exposed tools do not cover the required project operation. Describe the missing capability semantically.",
-        {"type": "object", "properties": {"requirement": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["requirement"]},
-        _discover_tools,
-    ))
-    allowed_tool_names.append("discover_tools")
+    if allowed_tool_names:
+        registry.add(Tool(
+            "discover_tools",
+            "Fallback capability discovery. Use only when the currently exposed tools do not cover the required project operation. Describe the missing capability semantically.",
+            {"type": "object", "properties": {"requirement": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["requirement"]},
+            _discover_tools,
+        ))
+        allowed_tool_names.append("discover_tools")
     function_declarations = registry.as_function_declarations(allowed_tool_names)
     trace_event(
         "model_context_ready",

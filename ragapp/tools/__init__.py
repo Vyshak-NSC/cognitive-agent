@@ -1,6 +1,4 @@
 from ragapp.tools.cognition_tools import build_cognition_tools
-from ragapp.tools.workspace_files import build_workspace_file_tools
-from ragapp.tools.regular_files import build_regular_file_tools
 from ragapp.tools.docx_files import build_docx_tools
 from ragapp.tools.pdf_files import build_pdf_tools
 from ragapp.tools.document_tools import build_document_tools
@@ -29,8 +27,6 @@ def build_default_tools(username, store, include_cognition=True, session_id=None
     tools.extend(build_compile_tools(store))
     if include_cognition and store.exists():
         tools.extend(build_cognition_tools(store, session_id=session_id))
-    tools.extend(build_workspace_file_tools(username))
-    tools.extend(build_regular_file_tools(username))
     tools.extend(build_docx_tools(username))
     tools.extend(build_pdf_tools(username))
     tools.extend(build_document_tools(username))

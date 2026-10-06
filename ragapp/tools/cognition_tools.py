@@ -99,18 +99,6 @@ def build_cognition_tools(store, session_id=None):
             lambda query, limit=8: retrieval.search_metadata_candidates(query, limit=limit),
         ),
         Tool(
-            "get_cognition_index",
-            "Compatibility tool. Do not use for normal retrieval because it may be large. Use search_cognition_metadata instead.",
-            {"type": "object", "properties": {}},
-            lambda: {
-                "project_id": store.project_id,
-                "current_version": store.master_metadata().get("current_version", 0),
-                "entity_count": len(store.master_metadata().get("entities", {})),
-                "artifact_count": len(store.master_metadata().get("artifacts", {})),
-                "use": "Call search_cognition_metadata(query) for actual retrieval.",
-            },
-        ),
-        Tool(
             "request_cognition_context",
             "Retrieve targeted cognition after a candidate has been identified. Prefer metadata/summary/state/section; request full only when necessary. If a full result returns next_requests, repeat the same request with the supplied chunk_index until complete.",
             {
@@ -153,8 +141,6 @@ def build_cognition_tools(store, session_id=None):
             {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}, "required": ["names"]},
             lambda names: _entity_metadata_with_current_state(store, names),
         ),
-        Tool("get_state_map", "Legacy compatibility view. Do not use for retrieval; use search_cognition_metadata and request_cognition_context.", {"type": "object", "properties": {}}, lambda: {"project_id": store.project_id, "entity_count": len(store.master_metadata().get("entities", {})), "use": "search_cognition_metadata"}),
-        Tool("get_ledger", "Legacy compatibility view. Do not use for retrieval; use request_cognition_context.", {"type": "object", "properties": {}}, lambda: {"entity_count": len(store.master_metadata().get("entities", {})), "use": "request_cognition_context"}),
         Tool("load_entities", "Load exact entity files and directly linked relationships. Use targeted names only.", {"type": "object", "properties": {"names": {"type": "array", "items": {"type": "string"}}}, "required": ["names"]}, lambda names: store.load_entities(names)),
         Tool("record_fact", "Persist a durable fact with provenance/confidence/temporal validity.", {"type": "object", "properties": {"id": {"type": "string"}, "claim": {"type": "string"}, "status": {"type": "string"}, "confidence": {"type": "number"}, "evidence_ids": {"type": "array", "items": {"type": "string"}}, "entities": {"type": "array", "items": {"type": "string"}}, "valid_from": {"type": "string"}, "valid_to": {"type": "string"}, "source": {"type": "string"}}, "required": ["claim"]}, lambda **a: _record_knowledge(store, "fact", a)),
         Tool("record_evidence", "Persist evidence and its source locator. Reuse id to update an existing evidence record.", {"type": "object", "properties": {"id": {"type": "string"}, "claim": {"type": "string"}, "source_file": {"type": "string"}, "locator": {"type": "string"}, "excerpt": {"type": "string"}, "reliability": {"type": "number"}, "source_type": {"type": "string"}, "source": {"type": "string"}}, "required": ["claim"]}, lambda **a: _record_knowledge(store, "evidence", a)),

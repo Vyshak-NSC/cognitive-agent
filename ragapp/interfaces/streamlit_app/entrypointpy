@@ -1,0 +1,20 @@
+"""Console entrypoint for the Streamlit application.
+
+The Streamlit UI module is intentionally a Streamlit script and renders at
+module execution time. The package console command therefore launches it
+through ``streamlit run`` instead of importing it as an ordinary Python module.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+
+
+def main() -> int:
+    app = Path(__file__).with_name("main.py")
+    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app)])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
