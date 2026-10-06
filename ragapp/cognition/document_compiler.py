@@ -190,7 +190,7 @@ def _provider_generator(store):
         from ragapp.llm.tool_calling.openrouter import generate_json
     elif provider == "gemini":
         from ragapp.llm.tool_calling.gemini import generate_json
-    elif provider == "azure":
+    elif provider in {"azure", "azure_openai"}:
         from ragapp.llm.tool_calling.azure_openai import generate_json
     else:
         raise RuntimeError(f"Unsupported cognition compiler provider: {provider}")

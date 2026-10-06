@@ -142,7 +142,7 @@ def _verification_prompt(request, context):
     )
 
 
-def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit, max_context_chars, max_passes=3):
+def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit, max_context_chars, max_passes=3, source_artifact=None):
     """Bounded generic semantic invariant: verify -> repair -> reverify."""
     applied = []
     reports = []
@@ -163,7 +163,7 @@ def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit
             return applied, reports
         if not operations:
             raise RuntimeError("semantic verification found unresolved conflicts but produced no repair operations")
-        repaired, rejected = _apply_semantic_operations(store, operations, source_label, pre_commit)
+        repaired, rejected = _apply_semantic_operations(store, operations, source_label, pre_commit, source_artifact=source_artifact)
         if rejected:
             raise RuntimeError("semantic verification repair contained rejected operations: " + json.dumps(rejected, ensure_ascii=False))
         applied.extend(repaired)
@@ -241,7 +241,118 @@ def _replace_fields(store, kind, ident, fields):
     if kind == "entity": store.db.sync_entity_index(store, ident)
 
 
-def _apply_semantic_operations(store, operations, source_label, pre_commit):
+
+def _chat_import_prompt(transcript, context):
+    schema = {
+        "operations": [
+            {"operation": "upsert_entity", "kind": "entity", "id": "stable_entity_id", "data": {}, "reason": "..."},
+            {"operation": "upsert_object", "kind": "relationship|event|location|concept|definition|knowledge", "id": "stable_id", "data": {}, "reason": "..."},
+            {"operation": "state_update", "entity": "stable_entity_id", "field": "field", "new": None, "reason": "...", "timeline": None},
+        ],
+        "affected": [{"kind": "...", "id": "...", "reason": "..."}],
+        "explanation": "short rationale",
+    }
+    return (
+        "You are importing durable knowledge from a chat conversation into a persistent cognition system.\n"
+        "The conversation itself is the input; there may be NO source documents.\n"
+        "Extract materially useful, durable information that should survive the chat session: entities, relationships, events, locations, concepts, definitions, facts/knowledge, decisions, requirements, and durable state changes.\n"
+        "Do not merely summarize the conversation. Build canonical cognition that can be retrieved later without reopening the chat.\n"
+        "Use stable IDs and reuse existing IDs from the connected cognition when the same object is clearly being discussed.\n"
+        "Treat explicit user-provided facts, requirements, decisions, corrections, and confirmed statements as authoritative for this import.\n"
+        "Treat assistant-only speculation as non-authoritative unless the user explicitly confirms it. Do not invent facts.\n"
+        "Preserve temporal/history information when the conversation describes changes over time.\n"
+        "Do not delete existing cognition merely because it is absent from this conversation. This is additive learning; only add or update information supported by the chat.\n"
+        "Return ONLY JSON matching the schema.\n\nSCHEMA:\n"
+        + json.dumps(schema, ensure_ascii=False)
+        + "\n\nCONNECTED EXISTING COGNITION:\n"
+        + json.dumps(context, ensure_ascii=False, default=str)
+        + "\n\nCHAT TRANSCRIPT TO LEARN FROM:\n"
+        + json.dumps(transcript, ensure_ascii=False, default=str)
+    )
+
+
+def import_chat_cognition(store, transcript, session_id=None, turn_id=None, max_context_chars=12000):
+    """Learn durable canonical cognition directly from chat, without source files.
+
+    Chat is an independent knowledge source. The resulting records are marked
+    with a chat provenance artifact so later retrieval can distinguish them from
+    source-document observations.
+    """
+    import shutil, tempfile
+    from pathlib import Path
+    from ragapp.core.metadata_sync import sync_store
+
+    messages = []
+    for m in transcript or []:
+        if not isinstance(m, dict):
+            continue
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        messages.append({
+            "role": str(m.get("role") or "user"),
+            "content": content,
+            "turn_id": m.get("turn_id"),
+        })
+    if not messages:
+        raise ValueError("chat cognition import requires a non-empty transcript")
+
+    request_text = "Learn durable cognition from this conversation. " + " ".join(
+        m["content"] for m in messages if m["role"] == "user"
+    )[:12000]
+    pre_commit = store.commit_authoritative_change("Pre-state backup before chat cognition import")
+    context = _semantic_context(store, request_text, max_chars=max_context_chars)
+    generator = _semantic_generator(store)
+    plan = json.loads(generator(_chat_import_prompt(messages, context)))
+    if not isinstance(plan, dict) or not isinstance(plan.get("operations"), list):
+        raise ValueError("chat cognition import returned an invalid operation plan")
+
+    source_artifact = f"chat:{session_id or 'unknown'}:{turn_id or 'unknown'}"
+    source_label = source_artifact
+    with tempfile.TemporaryDirectory(prefix="chat-cognition-") as tmp:
+        backup = Path(tmp) / "cognition"
+        shutil.copytree(store.cognition, backup)
+        try:
+            applied, rejected = _apply_semantic_operations(
+                store, plan.get("operations"), source_label, pre_commit,
+                source_artifact=source_artifact,
+            )
+            if rejected:
+                raise RuntimeError("chat cognition import contained rejected operations: " + json.dumps(rejected, ensure_ascii=False))
+
+            verification_applied, verification_reports = _verify_and_repair_semantic_closure(
+                store, request_text, source_label, pre_commit, max_context_chars,
+                source_artifact=source_artifact,
+            )
+            applied.extend(verification_applied)
+            store.mark_compiled()
+            sync_store(store)
+            git_commit = store.commit_authoritative_change("Import durable cognition from chat")
+            return {
+                "status": "applied",
+                "mode": "chat",
+                "source_artifact": source_artifact,
+                "messages_considered": len(messages),
+                "affected": list(plan.get("affected") or []),
+                "applied": applied,
+                "explanation": plan.get("explanation", ""),
+                "pre_state_git_commit": pre_commit,
+                "git_commit": git_commit,
+                "semantic_verification": {
+                    "performed": True,
+                    "repairs_applied": len(verification_applied),
+                    "passes": verification_reports,
+                },
+            }
+        except Exception:
+            if store.cognition.exists():
+                shutil.rmtree(store.cognition)
+            shutil.copytree(backup, store.cognition)
+            sync_store(store)
+            raise
+
+
+def _apply_semantic_operations(store, operations, source_label, pre_commit, source_artifact=source_artifact):
     applied, rejected = [], []
     for op in operations or []:
         if not isinstance(op, dict): continue
@@ -268,16 +379,17 @@ def _apply_semantic_operations(store, operations, source_label, pre_commit):
                     requested_timeline = op.get("timeline")
                 store.upsert_entity_update(
                     {"id": eid, "attributes": {field: {"value": requested_value, "summary": requested_summary, "timeline": requested_timeline}}},
+                    source_artifact=source_artifact,
                     change_metadata={"origin": source_label, "change_type": "semantic_state_update", "authority": "durable", "reason": op.get("reason", ""), "pre_state_git_commit": pre_commit, "requested_value": requested_value, "previous_value": prior.get("value") if isinstance(prior, dict) else None},
                 )
             elif operation == "upsert_entity":
                 data = dict(op.get("data") or {}); data.setdefault("id", op.get("id"))
-                store.upsert_entity_update(data, change_metadata={"origin": source_label, "authority": "durable", "reason": op.get("reason", "")})
+                store.upsert_entity_update(data, source_artifact=source_artifact, change_metadata={"origin": source_label, "authority": "durable", "reason": op.get("reason", "")})
             elif operation == "upsert_object":
                 kind = str(op.get("kind") or ""); data = dict(op.get("data") or {}); data.setdefault("id", op.get("id"))
-                if kind == "relationship": store.add_relationship(data)
-                elif kind == "event": store.add_event(data)
-                elif kind in CANONICAL_KINDS - {"entity"}: store.upsert_canonical(kind, data)
+                if kind == "relationship": store.add_relationship(data, source_artifact=source_artifact)
+                elif kind == "event": store.add_event(data, source_artifact=source_artifact)
+                elif kind in CANONICAL_KINDS - {"entity"}: store.upsert_canonical(kind, data, source_artifact=source_artifact)
                 else: raise ValueError(f"unsupported upsert kind: {kind}")
             else: raise ValueError(f"unsupported semantic mutation operation: {operation}")
             applied.append(op)

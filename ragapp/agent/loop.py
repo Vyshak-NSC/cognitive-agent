@@ -206,6 +206,19 @@ def _semantic_change_text(query):
     return text or str(query or "").strip()
 
 
+
+def _requests_chat_cognition(query):
+    """Detect an explicit request to learn/compile durable cognition from chat itself."""
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    learn = re.search(r"\b(generate|compile|create|build|learn|import|distill|extract|save|store)\b", q)
+    cognition = re.search(r"\b(cognition|knowledge|memory|canon|canonical|lore|facts?|entities|relationships|events)\b", q)
+    chat = re.search(r"\b(this chat|the chat|chat|conversation|conversation history|these messages|our conversation)\b", q)
+    source_only = re.search(r"\b(from|using)\s+(the\s+)?(source|documents?|files?)\b", q)
+    return bool(learn and cognition and chat and not source_only)
+
+
 def _load_persistent_instructions(cognition):
     """Load active persistent instructions locally."""
     if cognition is None or not cognition.exists():
@@ -724,6 +737,29 @@ def _run_agent_impl(context: AgentRunContext):
             recompile_result = {"status": cognition_mutation_result.get("status") == "applied" and "compiled" or "error",
                                 "mode": "surgical_cognition_mutation",
                                 "error": cognition_mutation_result.get("error")}
+
+    chat_cognition_result = None
+    if _requests_chat_cognition(query) and not explicit_cognition_mutation and not explicit_recompile:
+        if cognition is None or not cognition.exists():
+            chat_cognition_result = {"status": "error", "error": "cognition store does not exist"}
+        else:
+            try:
+                from ragapp.cognition.merge import import_chat_cognition
+                chat_cognition_result = import_chat_cognition(
+                    cognition,
+                    transcript,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+            except Exception as exc:
+                LOGGER.exception("Chat cognition import failed project=%s", project_id)
+                chat_cognition_result = {"status": "error", "error": str(exc)}
+        _record_tool_call(
+            calls,
+            "cognition.import_chat",
+            {"session_id": session_id, "turn_id": turn_id, "message_count": len(transcript)},
+            chat_cognition_result,
+        )
 
     # Selection/prefetch was computed before the mutation. Refresh it after a
     # successful mutation so the model cannot be shown stale pre-mutation state.

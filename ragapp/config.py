@@ -7,9 +7,12 @@ _ENV_KEYS = {
     "gemini": "GEMINI_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "AZURE_API_KEY",
-    "azure": "AZURE_API_KEY",
+    "azure": "AZURE_FOUNDRY_API_KEY",
+    "azure_openai": "AZURE_FOUNDRY_API_KEY",
+    "azure_anthropic": "AZURE_FOUNDRY_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
+
 _DEFAULT_MODELS = {
     "gemini": "gemini-3.5-flash-lite",
     "openrouter": "openrouter/free",
@@ -49,11 +52,19 @@ def get_api_keys(store, provider):
             value = os.getenv(base + suffix)
             if value:
                 keys.append(value)
-    cfg = load_project_config(store).get("provider", {}).get("api_keys", {}).get(provider)
-    if isinstance(cfg, list):
-        keys.extend(str(k) for k in cfg if k)
-    elif isinstance(cfg, str) and cfg:
-        keys.append(cfg)
+    api_keys = load_project_config(store).get("provider", {}).get("api_keys", {}) or {}
+    # Azure OpenAI/Anthropic deliberately share the `azure` key slot in the
+    # provider registry. Accept both the shared slot and the provider-specific
+    # name so older project configs continue to work.
+    slots = [provider]
+    if provider in {"azure", "azure_openai", "azure_anthropic"}:
+        slots.insert(0, "azure")
+    for slot in dict.fromkeys(slots):
+        cfg = api_keys.get(slot)
+        if isinstance(cfg, list):
+            keys.extend(str(k) for k in cfg if k)
+        elif isinstance(cfg, str) and cfg:
+            keys.append(cfg)
     seen = set()
     return [k for k in keys if not (k in seen or seen.add(k))]
 

@@ -504,7 +504,7 @@ def compile_project(
         provider=provider_name,
     )
 
-    if provider_name in ("openrouter", "gemini", "azure"):
+    if provider_name in ("openrouter", "gemini", "azure", "azure_openai"):
         if provider_name == "openrouter":
             from ragapp.llm.tool_calling.openrouter import (
                 generate_json as _adapter_generate_json,
@@ -529,7 +529,7 @@ def compile_project(
         raise RuntimeError(
             f"'{provider_name}' is configured as the provider "
             "but the cognition compiler only supports "
-            "'gemini' and 'openrouter' right now."
+            "'gemini', 'openrouter', and Azure providers right now."
         )
 
     # Leave headroom for the schema prompt and known-entity context.
