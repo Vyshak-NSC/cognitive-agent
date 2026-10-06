@@ -24,7 +24,9 @@ For project modifications, normal chat can inspect authoritative `/source`, work
 - Document and code cognition compilation.
 - Additive source recompilation through the `recompile_source` capability.
 - Durable compilation overrides are supplied to document compilation so persisted higher-authority state can participate in reconciliation.
-- Semantic mutation/reconciliation support for existing cognition.
+- Chat-authored cognition: explicitly ask the agent to define or add a character, trait, condition, rule, relationship, or other project knowledge; user-provided chat descriptions do not need to exist in a source/workspace document. Requests to create cognition from the conversation pass the active user/assistant transcript to the compiler using the same canonical JSON schema as document cognition, then persist entities, relationships, events, concepts, definitions, and knowledge as canonical records.
+- Semantic mutation/reconciliation support for existing cognition and creation of new canonical entities/concepts from chat.
+- Empty semantic plans and unsuccessful source compiles are reported as failures rather than successful generation. Source compilation reports how many canonical records it actually created or updated and does not claim generation if that count is zero.
 - Cognition validation, contradiction inspection, impact analysis, state maps, ledgers, world-model snapshots, and session distillation.
 - Git-backed pre-compilation/state history support through the project VCS layer.
 
@@ -485,7 +487,9 @@ This subsystem is designed to be extensible: additional themes can reuse the exi
 
 Cognition can be compiled from supported project artifacts. The source recompilation capability uses the same compilation pipeline as the application and can compile all source files or a selected subset.
 
-Recompilation is additive: existing cognition is not cleared as a prerequisite to compilation. The compiler also supplies persisted durable compilation overrides to the document compiler for reconciliation with newly observed source information.
+Chat is also an authoritative input path for explicit cognition changes. For example, a user can ask the agent to create a character with specified traits and add a related condition without first creating a document. The agent plans canonical entity/concept operations from the chat request and persists those operations through the cognition transaction.
+
+Recompilation is additive: existing cognition is not cleared as a prerequisite to compilation. The compiler also supplies persisted durable compilation overrides to the document compiler for reconciliation with newly observed source information. Chat compilation uses the same extraction schema and canonical record model, while attaching chat-origin provenance instead of fabricated document/file locators. A compile request is only reported as successful when the underlying compiler reports success; empty generation plans and failed source files are surfaced as unsuccessful instead of being described as completed generation. The agent compares canonical record files before and after source compilation and reports a completed run with zero created/updated records as such, rather than claiming that new cognition was generated.
 
 Compilation may invoke the configured LLM per document segment and can therefore take time and consume provider tokens.
 

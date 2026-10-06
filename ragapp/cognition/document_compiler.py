@@ -8,6 +8,7 @@ copying the same description into multiple files.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Iterable
 
@@ -285,185 +286,20 @@ def _compiler_context(store, segment_text, max_chars=6500):
     return retrieval.retrieve(requests, max_chars=max_chars)
 
 
-_VERIFY_SCHEMA = r"""
-You are verifying a bounded connected slice of canonical cognition produced by one compilation job.
-Perform semantic consistency checking. The host code will NOT infer meaning for you.
-Return ONLY JSON:
-{
-  "valid": true,
-  "patches": [
-    {"kind":"entity|relationship|event|location|concept|definition|knowledge",
-     "id":"canonical id",
-     "op":"add|replace|remove",
-     "path":"/json/pointer/path",
-     "value": "required for add/replace"}
-  ]
-}
-Use patches only for genuine contradictions/inconsistencies in the supplied compiled cognition.
-Do not rewrite merely for style. Preserve legitimate temporal evolution and provenance.
-Never patch /id, /schema_version, /provenance, /created_at or /updated_at.
-If cognition is consistent, return {"valid":true,"patches":[]}.
-If repairs are required, return valid=false with the minimal patches that make the supplied cognition consistent.
-"""
-
-
-def _json_pointer_parts(path):
-    if not isinstance(path, str) or not path.startswith("/"):
-        return []
-    return [p.replace("~1", "/").replace("~0", "~") for p in path[1:].split("/")]
-
-
-def _apply_verification_patches(store, patches, allowed_refs):
-    """Apply verifier-selected JSON patches mechanically to canonical files."""
-    forbidden = {"id", "schema_version", "provenance", "created_at", "updated_at"}
-    applied = []
-    for patch in patches or []:
-        if not isinstance(patch, dict):
-            continue
-        kind, ident, op = str(patch.get("kind") or ""), str(patch.get("id") or ""), str(patch.get("op") or "")
-        if (kind, ident) not in allowed_refs or kind not in CANONICAL_KINDS or op not in {"add", "replace", "remove"}:
-            continue
-        parts = _json_pointer_parts(patch.get("path"))
-        if not parts or parts[0] in forbidden:
-            continue
-        path = store._entity_path(ident) if kind == "entity" else store._object_path(kind, ident)
-        rec = store._read_json(path, {}) if path else {}
-        if not rec:
-            continue
-        parent = rec
-        ok = True
-        for part in parts[:-1]:
-            if isinstance(parent, dict) and part in parent:
-                parent = parent[part]
-            elif isinstance(parent, list) and part.isdigit() and int(part) < len(parent):
-                parent = parent[int(part)]
-            else:
-                ok = False
-                break
-        if not ok:
-            continue
-        leaf = parts[-1]
-        try:
-            if isinstance(parent, dict):
-                if op == "remove":
-                    if leaf not in parent:
-                        continue
-                    parent.pop(leaf)
-                else:
-                    parent[leaf] = patch.get("value")
-            elif isinstance(parent, list):
-                if leaf == "-" and op == "add":
-                    parent.append(patch.get("value"))
-                elif leaf.isdigit():
-                    idx = int(leaf)
-                    if op == "add" and idx <= len(parent):
-                        parent.insert(idx, patch.get("value"))
-                    elif op == "replace" and idx < len(parent):
-                        parent[idx] = patch.get("value")
-                    elif op == "remove" and idx < len(parent):
-                        parent.pop(idx)
-                    else:
-                        continue
-                else:
-                    continue
-            else:
-                continue
-        except (IndexError, TypeError, ValueError):
-            continue
-        from ragapp.cognition.store import now_iso
-        rec["updated_at"] = now_iso()
-        store._write_json(path, rec)
-        applied.append({"kind": kind, "id": ident, "op": op, "path": patch.get("path")})
-    return applied
-
-
-def _verify_compilation(store, generator, touched_refs, max_chars=7000):
-    """One bounded semantic reconciliation pass for a multi-segment compile job."""
-    connected = _connected_refs(store, list(touched_refs), limit=16)
-    if len(connected) < 2:
-        return {"performed": False, "reason": "insufficient_connected_cognition", "patches_applied": []}
-    retrieval = RetrievalStore(store)
-    requests = [{"kind": k, "id": i, "detail": "full"} for k, i in connected]
-    snapshot = retrieval.retrieve(requests, max_chars=max_chars)
-    prompt = _VERIFY_SCHEMA + "\n\nCOMPILED CONNECTED COGNITION:\n" + json.dumps(snapshot, ensure_ascii=False)
-    try:
-        result = json.loads(generator(prompt))
-    except Exception as exc:
-        return {"performed": True, "error": str(exc), "patches_applied": []}
-    patches = result.get("patches", []) if isinstance(result, dict) else []
-    applied = _apply_verification_patches(store, patches, set(connected))
-    reverified = None
-    if applied:
-        # A second API call is spent only when the first verifier actually found
-        # and repaired a semantic conflict. Normal compilations stop after one
-        # bounded verification call.
-        repaired_snapshot = retrieval.retrieve(requests, max_chars=max_chars)
-        retry_prompt = _VERIFY_SCHEMA + "\n\nREPAIRED CONNECTED COGNITION; verify the repair:\n" + json.dumps(repaired_snapshot, ensure_ascii=False)
-        try:
-            retry = json.loads(generator(retry_prompt))
-            retry_patches = retry.get("patches", []) if isinstance(retry, dict) else []
-            retry_applied = _apply_verification_patches(store, retry_patches, set(connected))
-            reverified = {"valid": bool(retry.get("valid")) if isinstance(retry, dict) else False,
-                          "patches_requested": len(retry_patches), "patches_applied": retry_applied}
-        except Exception as exc:
-            reverified = {"valid": False, "error": str(exc), "patches_applied": []}
-    return {"performed": True, "valid_before_repair": bool(result.get("valid")) if isinstance(result, dict) else False,
-            "patches_requested": len(patches), "patches_applied": applied, "reverification": reverified}
-
-
-def _valid_evidence(ids, allowed):
-    return [x for x in (ids or []) if isinstance(x, str) and x in allowed]
-
-
-def _location_for(segment, parsed, evidence_ids):
-    ids = _valid_evidence(evidence_ids, set(segment.node_ids)) or list(segment.node_ids)
-    nodes = [parsed.nodes[x] for x in ids if x in parsed.nodes]
-    loc = dict(segment.locator or {})
-    if nodes:
-        first, last = nodes[0], nodes[-1]
-        loc = dict(first.locator or {})
-        for k, v in (last.locator or {}).items():
-            if k in {"page", "paragraph_index", "slide", "row"}:
-                loc[f"{k}_end"] = v
-            elif k.endswith("_end"):
-                loc[k] = v
-        if "paragraph_index" in loc:
-            loc.setdefault("paragraph_start", loc.get("paragraph_index"))
-            loc.setdefault("paragraph_end", loc.get("paragraph_index_end", loc.get("paragraph_index")))
-        if "page" in loc:
-            loc.setdefault("page_start", loc.get("page"))
-            loc.setdefault("page_end", loc.get("page_end", loc.get("page")))
-        if "slide" in loc:
-            loc.setdefault("slide_start", loc.get("slide"))
-            loc.setdefault("slide_end", loc.get("slide_end", loc.get("slide")))
-        if "row" in loc:
-            loc.setdefault("row_start", loc.get("row"))
-            loc.setdefault("row_end", loc.get("row_end", loc.get("row")))
-    loc["node_ids"] = ids
-    return loc
-
-
-def _provenance(segment, parsed, artifact_id, evidence_ids):
-    return {
-        "artifact_id": artifact_id,
-        "segment_id": segment.id,
-        "node_ids": _valid_evidence(evidence_ids, set(segment.node_ids)) or list(segment.node_ids),
-        "locator": _location_for(segment, parsed, evidence_ids),
-        "section_ids": list(segment.section_ids),
-        "chapter_id": segment.chapter_id,
-        "scene_id": segment.scene_id,
-    }
-
 
 class DocumentCognitionCompiler:
     def __init__(self, store):
         self.store = store
         self.index = DocumentIndex(store)
 
-    def compile_files(self, files: Iterable[tuple[str, Path]], progress_callback=None, authoritative_changes=None) -> dict:
+    def compile_files(self, files: Iterable[tuple[str, Path]], progress_callback=None, authoritative_changes=None, semantic_enrichment=True) -> dict:
         files = list(files)
         authoritative_changes = [str(x).strip() for x in (authoritative_changes or []) if str(x).strip()]
-        generator, provider, model = _provider_generator(self.store)
+        # Deterministic parsing/indexing happens before any provider is initialized.
+        # Semantic enrichment is explicitly opt-in at the compiler boundary.
+        generator = provider = model = None
+        if semantic_enrichment:
+            generator, provider, model = _provider_generator(self.store)
         parsed_docs = []
         failures = []
         per_segment_budget = max(5000, int(MAX_CONTEXT_CHARS * 0.48))
@@ -515,6 +351,38 @@ class DocumentCognitionCompiler:
                       "relationships, comparative/derived claims, and connected cognition. Do not re-emit a stale source "
                       "claim as current state merely because it appears in the source text.\n"
                 )
+            if not semantic_enrichment:
+                # Zero-LLM structural cognition: retain the source segment as a
+                # canonical evidence/knowledge record. This makes project cognition
+                # usable without an AI provider while preserving exact provenance.
+                stable = hashlib.sha256(f"{doc.artifact_id}:{seg.id}".encode("utf-8")).hexdigest()[:24]
+                artifact_id = doc.artifact_id
+                timeline_label = (seg.title or doc.title or "document")
+                timeline_sequence = i
+                prov = _provenance(seg, doc, artifact_id, seg.node_ids)
+                self.store.upsert_canonical(
+                    "knowledge",
+                    {
+                        "id": f"source_segment_{stable}",
+                        "title": seg.title or doc.title or seg.id,
+                        "description": seg.text,
+                        "description_addition": seg.text,
+                        "source_node_ids": list(seg.node_ids),
+                        "provenance": [prov],
+                        "deterministic": True,
+                        "semantic_enrichment": False,
+                    },
+                    source_artifact=artifact_id,
+                    timeline=timeline_label,
+                    location=prov["locator"],
+                )
+                self.store.record_compilation_chunk(artifact_id, i, locator=json.dumps(seg.locator, ensure_ascii=False), summary=seg.title or "")
+                touched_refs.add(("knowledge", f"source_segment_{stable}"))
+                processed += 1
+                if progress_callback:
+                    progress_callback(i, len(segments))
+                continue
+
             prompt = (
                 SCHEMA
                 + "\n\nRELATED EXISTING COGNITION (bounded canonical context):\n"
@@ -531,15 +399,16 @@ class DocumentCognitionCompiler:
                 + seg.text
             )
             try:
-                data = json.loads(generator(prompt))
+                raw = generator(prompt)
+                data = json.loads(raw)
             except Exception as exc:
-                try:
-                    data = json.loads(generator(prompt + "\n\nReturn complete valid JSON only. Preserve every useful fact and use additive fields exactly as specified."))
-                except Exception:
-                    skipped.append({"segment": seg.id, "error": str(exc)})
-                    if progress_callback:
-                        progress_callback(i, len(segments))
-                    continue
+                # Do not spend another provider call repairing malformed output.
+                # A failed segment is explicitly reported and can be retried by a
+                # caller; deterministic compilation/indexing remains intact.
+                skipped.append({"segment": seg.id, "error": str(exc)})
+                if progress_callback:
+                    progress_callback(i, len(segments))
+                continue
 
             if not isinstance(data, dict):
                 skipped.append({"segment": seg.id, "error": "non_object_json"})
@@ -694,12 +563,9 @@ class DocumentCognitionCompiler:
             if progress_callback:
                 progress_callback(i, len(segments))
 
-        verification = {"performed": False, "reason": "single_segment_or_no_cognition", "patches_applied": []}
-        if processed > 0 and len(touched_refs) > 1:
-            verification = _verify_compilation(
-                self.store, generator, touched_refs,
-                max_chars=min(7000, max(3000, int(MAX_CONTEXT_CHARS * 0.20))),
-            )
+        # Validation is deterministic: schema/type/provenance checks happen while
+        # applying each record. Do not ask the provider to verify provider output.
+        verification = {"performed": False, "reason": "deterministic_validation", "patches_applied": []}
 
         self.store.mark_compiled()
         sync_store(self.store)
@@ -707,6 +573,7 @@ class DocumentCognitionCompiler:
             "status": "compiled",
             "provider": provider,
             "model": model,
+            "semantic_enrichment": bool(semantic_enrichment),
             "source_files": sum(1 for a, _ in files if a == "source"),
             "workspace_files": sum(1 for a, _ in files if a == "workspace"),
             "documents": len(parsed_docs),

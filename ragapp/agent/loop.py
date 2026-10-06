@@ -27,7 +27,13 @@ from ragapp.core.instructions import InstructionStore
 from ragapp.agent.cognitive_cycle import CognitiveCycle
 from ragapp.cognition.session_memory import SessionMemory
 from ragapp.core.retrieval import RetrievalStore
-from ragapp.agent.context_selector import ContextSelector, _looks_like_cognition_mutation, _requests_recompile, _looks_like_document_transform
+from ragapp.agent.context_selector import (
+    ContextSelector,
+    _looks_like_cognition_mutation,
+    _requests_chat_cognition_compilation,
+    _requests_recompile,
+    _looks_like_document_transform,
+)
 from ragapp.agent.run_context import AgentRunContext
 from ragapp.agent.trace import trace_event, trace_scope
 from ragapp.tools.definitions import Tool
@@ -200,10 +206,34 @@ def _edits_known_entity(query, cognition):
         return False
 
 
-def _semantic_change_text(query):
-    """Remove compile-only wording before sending a compound command to mutation planning."""
+def _semantic_change_text(query, transcript=None):
+    """Build a cognition request with the active chat as its available evidence."""
     text = re.sub(_COMPILE_TAIL, "", str(query or "")).strip(" .;,:")
-    return text or str(query or "").strip()
+    request = text or str(query or "").strip()
+    conversation = []
+    for message in transcript or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        conversation.append(f"[{role.upper()}]\n{content.strip()}")
+
+    if not conversation:
+        return request
+    transcript_text = "\n\n".join(conversation)
+    max_chars = max(1000, int(MAX_CONTEXT_CHARS))
+    if len(transcript_text) > max_chars:
+        transcript_text = "[Earlier conversation omitted due to the cognition input size limit.]\n\n" + transcript_text[-max_chars:]
+    return (
+        f"USER REQUEST:\n{request}\n\n"
+        "ACTIVE CHAT TRANSCRIPT (use this conversation as the source material for the requested cognition; "
+        "include relevant details stated or developed in the dialogue, and do not invent unsupported details):\n"
+        f"{transcript_text}"
+    )
 
 
 def _load_persistent_instructions(cognition):
@@ -217,18 +247,15 @@ def _load_persistent_instructions(cognition):
     except Exception:
         return []
     return instructions or []
-def _build_system_instruction(active_instructions, modules=None, include_mutation_contract=False):
+def _build_system_instruction(active_instructions, modules=None, cognition_mutation_preapplied=False):
     """Build a bounded system instruction from the invariant kernel plus selected context."""
     system_instruction = COGNITIVE_AGENT_PROMPT
     system_instruction += "\n\nNever reproduce internal tool results, retrieval envelopes, JSON context payloads, or controller metadata in the user-facing answer."
-    if include_mutation_contract:
+    if cognition_mutation_preapplied:
         system_instruction += (
-            "\n\nWhen the user explicitly approves applying one or more arbitrary changes to canonical cognition "
-            "(including deleting an entity/fact/relationship or changes whose consequences may affect connected cognition), "
-            "emit exactly one <STATE_UPDATE> JSON block with a semantic_changes array containing the approved changes in plain language. "
-            "Do not manually enumerate guessed cascade edits as deltas; the cognition transaction runtime loads connected cognition, "
-            "performs semantic cascade planning with the LLM, applies it atomically, cleans references, and commits the new state. "
-            "Use ordinary deltas only for simple isolated entity attribute state observations where no semantic cascade is requested."
+            "\n\nThe runtime has already attempted the user's explicit canonical-cognition change before this model call. "
+            "Do not emit a <STATE_UPDATE> block or repeat the mutation. Report only the actual RUNTIME COGNITION MUTATION RESULT supplied below; "
+            "if it does not say status=applied, state clearly that no cognition change was applied."
         )
     module_lines = [str(x).strip() for x in (modules or []) if str(x).strip()]
     if module_lines:
@@ -635,6 +662,26 @@ def _run_agent_impl(context: AgentRunContext):
         project_id, session_id or "none", len(transcript), max_steps, len(tools),
     )
     registry = ToolRegistry(tools)
+
+    # Persistent agent workflows are a runtime contract, not model advice.
+    # Execute their deterministic prefix before exposing the turn to the LLM.
+    # If the workflow contains no inference boundary, the deterministic result
+    # is complete and no model call is needed.
+    workflow_result = None
+    if context.agent and context.agent.get("workflow_steps"):
+        from ragapp.core.workflows import run_deterministic_prefix
+        workflow_result = run_deterministic_prefix(
+            context.agent.get("workflow_steps") or [],
+            registry,
+            allowed_tools=[t.name for t in tools],
+        )
+        if workflow_result.completed:
+            return (
+                json.dumps({"status": "completed", "workflow": workflow_result.outputs}, ensure_ascii=False, default=str),
+                workflow_result.calls,
+                [],
+            )
+
     contents = to_provider_contents(
         transcript,
         cognition,
@@ -685,6 +732,7 @@ def _run_agent_impl(context: AgentRunContext):
         or _asserts_known_entity_state(query, cognition)
         or _edits_known_entity(query, cognition)
     )
+    chat_cognition_compilation = _requests_chat_cognition_compilation(query)
     explicit_recompile = _requests_recompile(query)
     cognition_mutation_result = None
     recompile_result = None
@@ -694,16 +742,19 @@ def _run_agent_impl(context: AgentRunContext):
         else:
             try:
                 from ragapp.cognition.merge import apply_semantic_mutation
-                change_text = _semantic_change_text(query)
+                change_text = _semantic_change_text(query, transcript)
                 cognition_mutation_result = apply_semantic_mutation(
-                    cognition, [change_text], source_label=f"user:{project_id}"
+                    cognition,
+                    [change_text],
+                    source_label=f"user:{project_id}",
+                    chat_compilation=chat_cognition_compilation,
                 )
             except Exception as exc:
                 LOGGER.exception("Explicit cognition mutation failed project=%s", project_id)
                 cognition_mutation_result = {"status": "error", "error": str(exc)}
         _record_tool_call(
             calls, "cognition.semantic_mutation",
-            {"requested_change": _semantic_change_text(query)}, cognition_mutation_result,
+            {"requested_change": _semantic_change_text(query, transcript)}, cognition_mutation_result,
         )
 
     if explicit_recompile and not explicit_cognition_mutation:
@@ -723,7 +774,7 @@ def _run_agent_impl(context: AgentRunContext):
         # not re-extract the unchanged source documents.
         if isinstance(cognition_mutation_result, dict):
             recompile_result = {"status": cognition_mutation_result.get("status") == "applied" and "compiled" or "error",
-                                "mode": "surgical_cognition_mutation",
+                                "mode": "chat_cognition_compilation" if chat_cognition_compilation else "surgical_cognition_mutation",
                                 "error": cognition_mutation_result.get("error")}
 
     # Selection/prefetch was computed before the mutation. Refresh it after a
@@ -761,8 +812,14 @@ def _run_agent_impl(context: AgentRunContext):
     system_instruction = _build_system_instruction(
         selection.get("instructions"),
         selected_modules,
-        include_mutation_contract=bool(explicit_cognition_mutation),
+        cognition_mutation_preapplied=bool(explicit_cognition_mutation),
     )
+    if workflow_result is not None and workflow_result.inference:
+        system_instruction += (
+            "\n\nDETERMINISTIC WORKFLOW PREFIX ALREADY EXECUTED:\n"
+            + json.dumps({"outputs": workflow_result.outputs, "inference_boundary": workflow_result.inference}, ensure_ascii=False, default=str)
+            + "\nTreat these outputs as authoritative runtime state. Continue from the explicit inference boundary; do not repeat deterministic steps."
+        )
     if cognition_mutation_result is not None:
         system_instruction += (
             "\n\nRUNTIME COGNITION MUTATION RESULT (already executed; report only this actual result):\n"
@@ -932,6 +989,18 @@ def _run_agent_impl(context: AgentRunContext):
             if explicit_recompile and (not isinstance(recompile_result, dict) or recompile_result.get("status") not in {"compiled", "ok", "success"}):
                 error = (recompile_result or {}).get("error") if isinstance(recompile_result, dict) else "unknown error"
                 return (f"I could not recompile the project cognition: {error}", calls, [])
+            if (
+                explicit_recompile
+                and isinstance(recompile_result, dict)
+                and recompile_result.get("mode") != "surgical_cognition_mutation"
+                and recompile_result.get("canonical_records_created") == 0
+                and recompile_result.get("canonical_records_updated") == 0
+            ):
+                return (
+                    "Source compilation completed, but it created or updated no canonical cognition records.",
+                    calls,
+                    [],
+                )
             # A project inspection must consume real authoritative source before
             # the model may finish. This prevents partial cognition/metadata from
             # being presented as if it were the complete project schema/content.

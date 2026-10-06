@@ -197,20 +197,67 @@ def _looks_like_project_inspection(query: str) -> bool:
 
 
 def _looks_like_cognition_mutation(query: str) -> bool:
-    """Deterministic backstop for explicit canonical/cognition state changes."""
+    """Detect explicit chat-authored changes to persistent project cognition."""
     q = str(query or "").strip().lower()
     if not q:
         return False
-    # Explicit requests to mutate the persistent semantic state.
+    action = (
+        r"(?:create|add|define|introduce|record|remember|establish|generate|build|"
+        r"extract|convert|compile|"
+        r"update|change|correct|set|make|replace|remove|delete|revise|apply|persist)"
+    )
+    polite_action_request = re.match(
+        rf"^(?:can|could|would|will)\s+you\s+(?:please\s+)?{action}\b",
+        q,
+    )
+    if ("?" in q and not polite_action_request) or (
+        re.match(r"^(what|who|why|how|when|where|should|do|does|is|are)\b", q)
+        and not polite_action_request
+    ):
+        return False
+
+    # Code and project-file requests belong to the source/workspace mutation
+    # path even when their wording includes an ambiguous word such as "rule".
+    if _looks_like_project_mutation(q) and re.search(
+        r"\b(code|file|app|page|screen|ui|interface|component|"
+        r"function|class|method|api|route|endpoint|database|schema|config|"
+        r"python|javascript|typescript|streamlit)\b",
+        q,
+    ):
+        return False
+
     cognition_target = re.search(
-        r"\b(cognition|canon|canonical|world state|project state|state|fact|relationship|entity|knowledge)\b",
+        r"\b(cognition|canon|canonical|world state|project state|state|fact|facts|"
+        r"relationship|relationships|relation|relations|entity|entities|knowledge|character|characters|person|people|"
+        r"creature|trait|traits|characteristic|characteristics|attribute|attributes|"
+        r"condition|conditions|rule|rules|mechanic|mechanics|concept|concepts|"
+        r"definition|definitions|lore)\b",
         q,
     )
     mutation = re.search(
-        r"\b(update|change|correct|set|make|replace|remove|delete|revise|apply|persist|remember)\b",
+        action,
         q,
     )
     return bool(cognition_target and mutation)
+
+
+def _requests_chat_cognition_compilation(query: str) -> bool:
+    """Identify requests to compile durable cognition from chat-authored content."""
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    action = re.search(
+        r"\b(create|add|define|introduce|generate|build|extract|convert|compile|"
+        r"recompile|record|persist)\b",
+        q,
+    )
+    target = re.search(
+        r"\b(cognition|canonical|canon|entity|entities|character|characters|"
+        r"relationship|relationships|event|events|concept|concepts|definition|"
+        r"definitions|knowledge|lore|condition|conditions|rule|rules|mechanic|mechanics)\b",
+        q,
+    )
+    return bool(action and target)
 
 
 def _requests_recompile(query: str) -> bool:

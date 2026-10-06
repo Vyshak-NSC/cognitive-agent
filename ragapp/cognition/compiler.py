@@ -464,6 +464,7 @@ def compile_project(
     progress_callback=None,
     selected_files=None,
     reconcile_selected=True,
+    semantic_enrichment=True,
 ):
     """Compile project files additively, preserving existing cognition.
 
@@ -498,6 +499,7 @@ def compile_project(
             progress_callback=progress_callback,
             selected_files=selected_files,
             reconcile_selected=reconcile_selected,
+            semantic_enrichment=semantic_enrichment,
         )
         if isinstance(result, dict):
             result.setdefault("pre_state_git_commit", pre_state_git_commit)
@@ -516,6 +518,7 @@ def compile_project(
                 progress_callback=progress_callback,
                 selected_files=selected_files,
                 reconcile_selected=reconcile_selected,
+                semantic_enrichment=semantic_enrichment,
             )
             if isinstance(result, dict):
                 result.setdefault("pre_state_git_commit", pre_state_git_commit)
@@ -533,6 +536,7 @@ def _compile_project_impl(
     progress_callback=None,
     selected_files=None,
     reconcile_selected=True,
+    semantic_enrichment=True,
 ):
     """Compile selected project files into the cognition store.
 
@@ -660,6 +664,7 @@ def _compile_project_impl(
         [(area, p) for area, _, p in llm_files],
         progress_callback=progress_callback,
         authoritative_changes=_durable_compilation_overrides(store),
+        semantic_enrichment=semantic_enrichment,
     )
 
     document_result["deterministic_code"] = deterministic_result or {}

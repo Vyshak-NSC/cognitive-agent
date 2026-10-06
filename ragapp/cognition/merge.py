@@ -101,7 +101,8 @@ def _mutation_prompt(request, context, source_recompile=False):
         "4. state_update is for durable entity attribute evolution, not erasure.\n"
         "5. Keep operations minimal but complete across relationships, events, knowledge, concepts and summaries that are semantically affected.\n"
         "6. Never modify provenance merely to hide the origin of retained knowledge.\n"
-        "7. Treat every current claim in the connected cognition as subject to reconciliation. Any claim whose truth, meaning, validity, or completeness depends on changed state must be updated, invalidated, or removed when the resulting state no longer supports it."
+        "7. Treat every current claim in the connected cognition as subject to reconciliation. Any claim whose truth, meaning, validity, or completeness depends on changed state must be updated, invalidated, or removed when the resulting state no longer supports it.\n"
+        "8. User chat is an authoritative input for new cognition; source files are not required. The request may include the active chat transcript: use the dialogue as source material when the user asks to create cognition from the conversation. Extract details the dialogue actually establishes, including assistant-generated story text when the user asks to persist that chat content, but do not invent unsupported details. When the user defines a new character/person/creature, create it with upsert_entity, preserving the provided name, description, traits and attributes. Represent a condition, rule or mechanic as a concept or definition with upsert_object, and link it to relevant entities when supported by the request. Do not claim success by returning an empty operations array."
         + source_rule
     )
     return (
@@ -112,133 +113,147 @@ def _mutation_prompt(request, context, source_recompile=False):
     )
 
 
-def _verification_prompt(request, context):
-    """Ask the semantic model to verify closure of the resulting connected state."""
-    schema = {
-        "valid": True,
-        "conflicts": [{"kind": "...", "id": "...", "reason": "..."}],
-        "operations": [
-            {"operation": "delete_object", "kind": "entity|relationship|event|location|concept|definition|knowledge", "id": "...", "reason": "..."},
-            {"operation": "state_update", "entity": "...", "field": "...", "new": None, "reason": "...", "timeline": None},
-            {"operation": "replace_fields", "kind": "entity|relationship|event|location|concept|definition|knowledge", "id": "...", "fields": {}, "reason": "..."},
-            {"operation": "upsert_entity", "id": "...", "data": {}, "reason": "..."},
-            {"operation": "upsert_object", "kind": "relationship|event|location|concept|definition|knowledge", "id": "...", "data": {}, "reason": "..."},
-        ],
-    }
-    instructions = (
-        "Verify semantic closure after an authoritative cognition mutation. "
-        "The requested mutation is authoritative current state. Inspect ALL supplied connected cognition, not only directly edited objects. "
-        "A result is valid only when no current claim is false, contradictory, stale, or materially incomplete as a consequence of the mutation together with unchanged connected facts. "
-        "Do not defend pre-mutation cognition against the mutation. Do not require the user to enumerate consequences. "
-        "If invalid, return the minimal repair operations needed to make the connected current state semantically consistent. "
-        "Do not invent unrelated changes. Preserve historical/provenance evidence unless it is itself claimed as current state. "
-        "Set valid=true only when no repair operation is required. Return ONLY JSON matching the schema."
-    )
+def _chat_compilation_prompt(request, context):
+    from ragapp.cognition.document_compiler import SCHEMA
+
     return (
-        instructions
-        + "\n\nSCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
-        + "\n\nAUTHORITATIVE MUTATION:\n" + str(request)
-        + "\n\nRESULTING CONNECTED COGNITION:\n" + json.dumps(context, ensure_ascii=False, default=str)
+        SCHEMA
+        + "\n\nCHAT-BASED COGNITION COMPILATION\n"
+        "Compile the supplied conversation using exactly the canonical entities, relationships, events, "
+        "locations, concepts, definitions, and knowledge schema above. This is generation from a user-provided "
+        "chat source, not a request to modify source files. Extract all materially useful supported content; "
+        "create one canonical record for every distinct entity and first-class relationship/event described. "
+        "Use stable IDs, preserve detailed descriptions and attributes, and connect records through the schema's "
+        "reference fields. Reuse IDs from existing cognition when the same object is clearly being described. "
+        "Do not emit operations or a prose-only summary. Chat has no document node IDs or file locators, so omit "
+        "source_node_ids and do not invent file provenance. Empty canonical arrays are allowed only when the "
+        "conversation contains no durable cognition to compile.\n\n"
+        "RELATED EXISTING CANONICAL COGNITION:\n"
+        + json.dumps(context, ensure_ascii=False, default=str)
+        + "\n\nCHAT SOURCE (the conversation to compile):\n"
+        + str(request)
     )
 
 
-def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit, max_context_chars, max_passes=3):
-    """Bounded generic semantic invariant: verify -> repair -> reverify."""
-    applied = []
-    reports = []
-    generator = _semantic_generator(store)
-    for pass_no in range(1, max_passes + 1):
-        context = _semantic_context(store, request, max_chars=max_context_chars)
-        report = json.loads(generator(_verification_prompt(request, context)))
-        if not isinstance(report, dict) or not isinstance(report.get("operations", []), list):
-            raise ValueError("semantic verification returned an invalid result")
-        reports.append({
-            "pass": pass_no,
-            "valid": bool(report.get("valid")),
-            "conflicts": list(report.get("conflicts") or []),
-            "operations_requested": len(report.get("operations") or []),
+def _chat_cognition_operations(data, source_label):
+    """Map the document compiler's canonical JSON shape to store operations."""
+    operations = []
+    provenance = [{"origin": source_label, "source_type": "chat"}]
+    for stable_id, item in (data.get("entities") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        ident = str(item.get("id") or stable_id)
+        entity = {
+            "id": ident,
+            "type": item.get("type", "other"),
+            "name": item.get("name") or ident,
+            "description": item.get("description_addition") or item.get("description") or item.get("summary") or "",
+            "summary": item.get("summary") or item.get("description_addition") or "",
+            "tags": item.get("tags") or [],
+            "knowledge": item.get("knowledge_additions") or {},
+            "attributes": item.get("attributes") or {},
+            "relationships": item.get("relationship_ids") or [],
+            "events": item.get("event_ids") or [],
+            "locations": item.get("location_ids") or [],
+            "concepts": item.get("concept_ids") or [],
+            "definitions": item.get("definition_ids") or [],
+            "knowledge_links": item.get("knowledge_ids") or [],
+            "provenance": provenance,
+        }
+        operations.append({
+            "operation": "upsert_entity",
+            "id": ident,
+            "data": entity,
+            "reason": "Compiled from user-provided chat.",
         })
-        operations = list(report.get("operations") or [])
-        if bool(report.get("valid")) and not operations:
-            return applied, reports
-        if not operations:
-            raise RuntimeError("semantic verification found unresolved conflicts but produced no repair operations")
-        repaired, rejected = _apply_semantic_operations(store, operations, source_label, pre_commit)
-        if rejected:
-            raise RuntimeError("semantic verification repair contained rejected operations: " + json.dumps(rejected, ensure_ascii=False))
-        applied.extend(repaired)
-    # Never commit a mutation merely because the repair budget was exhausted.
-    context = _semantic_context(store, request, max_chars=max_context_chars)
-    final = json.loads(generator(_verification_prompt(request, context)))
-    if not isinstance(final, dict):
-        raise ValueError("final semantic verification returned an invalid result")
-    reports.append({
-        "pass": max_passes + 1,
-        "valid": bool(final.get("valid")),
-        "conflicts": list(final.get("conflicts") or []),
-        "operations_requested": len(final.get("operations") or []),
-    })
-    if not bool(final.get("valid")) or final.get("operations"):
-        raise RuntimeError("semantic cognition mutation did not reach a consistent closed state: " + json.dumps(final.get("conflicts") or [], ensure_ascii=False))
-    return applied, reports
 
-
-def _strip_reference(value, deleted_kind, deleted_id):
-    if isinstance(value, list):
-        out = []
-        for item in value:
-            if isinstance(item, dict):
-                iid = str(item.get("id") or item.get("entity_id") or item.get("object_id") or "")
-                ikind = str(item.get("kind") or "")
-                if iid == deleted_id and (not ikind or ikind == deleted_kind):
-                    continue
-                out.append(_strip_reference(item, deleted_kind, deleted_id))
-            elif str(item) == deleted_id:
+    object_specs = (
+        ("locations", "location", lambda item, ident: {
+            "id": ident, "name": item.get("name") or ident, "type": item.get("type", "place"),
+            "description": item.get("description_addition") or item.get("description") or "",
+            "attributes": item.get("attributes") or {}, "entity_ids": item.get("entity_ids") or [],
+            "event_ids": item.get("event_ids") or [], "concept_ids": item.get("concept_ids") or [],
+            "provenance": provenance,
+        }),
+        ("concepts", "concept", lambda item, ident: {
+            "id": ident, "name": item.get("name") or ident, "type": item.get("type", "concept"),
+            "description": item.get("description_addition") or item.get("description") or "",
+            "related_entity_ids": item.get("related_entity_ids") or [],
+            "related_event_ids": item.get("related_event_ids") or [],
+            "related_concept_ids": item.get("related_concept_ids") or [],
+            "provenance": provenance,
+        }),
+        ("definitions", "definition", lambda item, ident: {
+            "id": ident, "term": item.get("term") or ident,
+            "description": item.get("definition_addition") or item.get("definition") or "",
+            "related_ids": item.get("related_ids") or [], "provenance": provenance,
+        }),
+        ("knowledge", "knowledge", lambda item, ident: {
+            "id": ident, "title": item.get("title") or ident,
+            "description": item.get("description_addition") or item.get("description") or "",
+            "subject_ids": item.get("subject_ids") or [], "provenance": provenance,
+        }),
+    )
+    for collection, kind, build_record in object_specs:
+        for item in data.get(collection) or []:
+            if not isinstance(item, dict):
                 continue
-            else:
-                out.append(item)
-        return out
-    if isinstance(value, dict):
-        return {k: _strip_reference(v, deleted_kind, deleted_id) for k, v in value.items()}
-    return value
+            ident = str(item.get("id") or item.get("stable_id") or "")
+            if ident:
+                operations.append({
+                    "operation": "upsert_object",
+                    "kind": kind,
+                    "id": ident,
+                    "data": build_record(item, ident),
+                    "reason": "Compiled from user-provided chat.",
+                })
 
+    for item in data.get("relationships") or []:
+        if not isinstance(item, dict):
+            continue
+        ident = str(item.get("id") or "")
+        if not ident:
+            continue
+        relation = {
+            "id": ident, "type": item.get("type", "related_to"),
+            "source": item.get("source"), "target": item.get("target"),
+            "source_kind": item.get("source_kind", "entity"),
+            "target_kind": item.get("target_kind", "entity"),
+            "state": item.get("state"),
+            "description": item.get("description_addition") or item.get("description") or "",
+            "event_ids": item.get("event_ids") or [],
+            "provenance": provenance,
+        }
+        operations.append({
+            "operation": "upsert_object", "kind": "relationship", "id": ident,
+            "data": relation, "reason": "Compiled from user-provided chat.",
+        })
 
-def _delete_object(store, kind, ident):
-    kind, ident = str(kind), str(ident)
-    if kind not in CANONICAL_KINDS:
-        raise ValueError(f"unsupported cognition kind: {kind}")
-    path = store._entity_path(ident) if kind == "entity" else store._object_path(kind, ident)
-    if path and path.exists(): path.unlink()
-    if kind == "entity":
-        master = store.master_metadata(); master.get("entities", {}).pop(ident, None); store._write_master(master)
-        store.db.delete_entity(ident)
-    for other_kind in CANONICAL_KINDS:
-        for rec in list(store._all_kind_records(other_kind)):
-            oid = str(rec.get("id") or "")
-            cleaned = _strip_reference(rec, kind, ident)
-            if cleaned != rec:
-                cleaned["updated_at"] = now_iso()
-                opath = store._entity_path(oid) if other_kind == "entity" else store._object_path(other_kind, oid)
-                if opath: store._write_json(opath, cleaned)
-    if store.timeline_path.exists():
-        timeline = store._read_json(store.timeline_path, {}); entries = timeline.get("entries") or []
-        kept = [e for e in entries if not (str(e.get("kind") or "") == kind and str(e.get("object_id") or "") == ident)]
-        if kept != entries: timeline["entries"] = kept; store._write_json(store.timeline_path, timeline)
+    for item in data.get("events") or []:
+        if not isinstance(item, dict):
+            continue
+        ident = str(item.get("id") or "")
+        if not ident:
+            continue
+        event = {
+            "id": ident, "type": item.get("type", "event"),
+            "title": item.get("title") or ident,
+            "description": item.get("description_addition") or item.get("description") or "",
+            "entities": item.get("entities") or [],
+            "location_ids": item.get("location_ids") or [],
+            "concept_ids": item.get("concept_ids") or [],
+            "story_time": item.get("story_time"),
+            "previous_events": item.get("previous_event_ids") or [],
+            "next_events": item.get("next_event_ids") or [],
+            "state_changes": item.get("state_changes") or [],
+            "provenance": provenance,
+        }
+        operations.append({
+            "operation": "upsert_object", "kind": "event", "id": ident,
+            "data": event, "reason": "Compiled from user-provided chat.",
+        })
 
-
-def _replace_fields(store, kind, ident, fields):
-    if kind not in CANONICAL_KINDS or not isinstance(fields, dict):
-        raise ValueError("replace_fields requires a canonical kind and fields object")
-    path = store._entity_path(ident) if kind == "entity" else store._object_path(kind, ident)
-    rec = store._read_json(path, {}) if path else {}
-    if not rec: raise ValueError(f"unknown {kind}: {ident}")
-    protected = {"id", "schema_version", "created_at", "provenance"}
-    for key, value in fields.items():
-        if key in protected: continue
-        if value is None: rec.pop(key, None)
-        else: rec[key] = value
-    rec["updated_at"] = now_iso(); store._write_json(path, rec)
-    if kind == "entity": store.db.sync_entity_index(store, ident)
+    return operations
 
 
 def _apply_semantic_operations(store, operations, source_label, pre_commit):
@@ -276,9 +291,20 @@ def _apply_semantic_operations(store, operations, source_label, pre_commit):
             elif operation == "upsert_object":
                 kind = str(op.get("kind") or ""); data = dict(op.get("data") or {}); data.setdefault("id", op.get("id"))
                 if kind == "relationship": store.add_relationship(data)
-                elif kind == "event": store.add_event(data)
+                elif kind == "event":
+                    store.add_event(data)
+                    if data.get("provenance"):
+                        path = store._event_path(str(data["id"]))
+                        record = store._read_json(path, {})
+                        store._record_provenance(record, data["provenance"])
+                        store._write_json(path, record)
                 elif kind in CANONICAL_KINDS - {"entity"}: store.upsert_canonical(kind, data)
                 else: raise ValueError(f"unsupported upsert kind: {kind}")
+                if kind == "relationship" and data.get("provenance"):
+                    path = store._object_path(kind, str(data["id"]))
+                    record = store._read_json(path, {})
+                    store._record_provenance(record, data["provenance"])
+                    store._write_json(path, record)
             else: raise ValueError(f"unsupported semantic mutation operation: {operation}")
             applied.append(op)
         except Exception as exc:
@@ -355,7 +381,14 @@ def _recompile_authoritative_sources(store, changes, request, files=None):
     return DocumentCognitionCompiler(store).compile_files(files, authoritative_changes=changes)
 
 
-def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent", max_context_chars=10000, recompile_source=False):
+def apply_semantic_mutation(
+    store: CognitionStore,
+    changes,
+    source_label="agent",
+    max_context_chars=10000,
+    recompile_source=False,
+    chat_compilation=False,
+):
     """Apply arbitrary approved cognition changes as one semantic transaction.
 
     Order: (1) Git commit of the current state, (2) load the connected subgraph,
@@ -372,7 +405,20 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
     pre_commit = store.commit_authoritative_change("Pre-state backup before semantic cognition mutation")
     context = _semantic_context(store, request, max_chars=max_context_chars)
     source_files = _source_files_for_semantic_request(store, request) if recompile_source else []
-    plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, context, source_recompile=bool(source_files))))
+    prompt = (
+        _chat_compilation_prompt(request, context)
+        if chat_compilation
+        else _mutation_prompt(request, context, source_recompile=bool(source_files))
+    )
+    plan = json.loads(_semantic_generator(store)(prompt))
+    if chat_compilation:
+        if not isinstance(plan, dict):
+            raise ValueError("chat cognition compiler returned a non-object result")
+        plan = {
+            "operations": _chat_cognition_operations(plan, source_label),
+            "affected": [],
+            "explanation": "Compiled canonical cognition records from the active chat.",
+        }
     if not isinstance(plan, dict) or not isinstance(plan.get("operations"), list):
         raise ValueError("semantic cognition mutation returned an invalid operation plan")
     with tempfile.TemporaryDirectory(prefix="cognition-mutation-") as tmp:
@@ -381,6 +427,10 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
             applied, rejected = _apply_semantic_operations(store, plan.get("operations"), source_label, pre_commit)
             if rejected:
                 raise RuntimeError("semantic cognition mutation contained rejected operations: " + json.dumps(rejected, ensure_ascii=False))
+            if not applied:
+                raise RuntimeError(
+                    "semantic cognition mutation produced no operations; no cognition was changed"
+                )
             # Source-derived cognition is rebuilt under the approved override instead
             # of relying on surgical JSON edits alone. The source remains unchanged;
             # the explicit current-state mutation outranks conflicting old source facts.
@@ -393,33 +443,25 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
                     files=source_files,
                 )
 
-            # Re-plan once against the post-recompile graph, then enforce a
-            # generic semantic-closure invariant. The transaction is not allowed
-            # to commit while any connected current claim remains inconsistent
-            # with the authoritative mutation and unchanged connected state.
-            post_plan, post_applied = {}, []
-            if source_files:  # re-plan only when a recompile could have re-introduced stale facts
-                post_context = _semantic_context(store, request, max_chars=max_context_chars)
-                post_plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, post_context, source_recompile=False)))
-                if not isinstance(post_plan, dict) or not isinstance(post_plan.get("operations"), list):
-                    raise ValueError("post-recompile semantic reconciliation returned an invalid operation plan")
-                post_applied, post_rejected = _apply_semantic_operations(store, post_plan.get("operations"), source_label, pre_commit)
-                if post_rejected:
-                    raise RuntimeError("post-recompile semantic reconciliation contained rejected operations: " + json.dumps(post_rejected, ensure_ascii=False))
-                applied.extend(post_applied)
-
-            verification_applied, verification_reports = _verify_and_repair_semantic_closure(
-                store, request, source_label, pre_commit, max_context_chars
-            )
-            applied.extend(verification_applied)
-
+            # One controller pass is sufficient. Deterministic validation and
+            # transactional rollback protect canonical state; a second LLM
+            # reconciliation pass would only increase cost and introduce another
+            # hallucination surface.
             store.mark_compiled(); sync_store(store)
             git_commit = store.commit_authoritative_change("Apply semantic cognition mutation")
             affected = list(plan.get("affected") or [])
-            for item in post_plan.get("affected") or []:
-                if item not in affected:
-                    affected.append(item)
-            return {"status":"applied", "requested_changes":request, "affected":affected, "applied":applied, "explanation":post_plan.get("explanation") or plan.get("explanation", ""), "pre_state_git_commit":pre_commit, "git_commit":git_commit, "recompilation":recompilation, "post_reconciliation": {"performed": True, "operations": len(post_applied)}, "semantic_verification": {"performed": True, "repairs_applied": len(verification_applied), "passes": verification_reports}}
+            return {
+                "status": "applied",
+                "mode": "chat_cognition_compilation" if chat_compilation else "semantic_mutation",
+                "requested_changes": request,
+                "affected": affected,
+                "applied": applied,
+                "explanation": plan.get("explanation", ""),
+                "pre_state_git_commit": pre_commit,
+                "git_commit": git_commit,
+                "recompilation": recompilation,
+                "semantic_verification": {"performed": False, "reason": "deterministic_transaction_validation"},
+            }
         except Exception:
             if store.cognition.exists(): shutil.rmtree(store.cognition)
             shutil.copytree(backup, store.cognition); sync_store(store); raise

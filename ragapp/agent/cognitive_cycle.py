@@ -11,6 +11,7 @@ class CognitiveCycle:
         self.state["stage"]=stage; self.state["history"].append({"stage":stage,"timestamp":now(),**details})
         return self.state
     def briefing(self,task):
-        self.advance("interpret",task=task)
-        self.advance("assess_state",current_version=self.store.state_map().get("current_version",0))
-        return {"lifecycle":list(self.STAGES),"current_stage":self.state["stage"],"execution_state":self.state}
+        self.advance("interpret", task=task)
+        metadata = self.store.master_metadata() if hasattr(self.store, "master_metadata") else {}
+        self.advance("assess_state", current_version=metadata.get("current_version", 0))
+        return {"lifecycle": list(self.STAGES), "current_stage": self.state["stage"], "execution_state": self.state}
