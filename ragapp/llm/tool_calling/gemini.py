@@ -1,6 +1,20 @@
+import os
 from google.genai import types
 from ragapp.settings import CHAT_MODEL, DEFAULT_CHAT_MODEL
 from ragapp.config import get_api_keys, resolve_model
+
+# A hung request used to leave the UI spinning forever with no reply. Bound every call.
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120") or 120)
+
+
+def _config(**kwargs):
+    """GenerateContentConfig with a request timeout (falls back if the SDK rejects it)."""
+    try:
+        return types.GenerateContentConfig(
+            http_options=types.HttpOptions(timeout=int(REQUEST_TIMEOUT_SECONDS * 1000)), **kwargs)
+    except Exception:
+        return types.GenerateContentConfig(**kwargs)
+
 
 class EmptyResponseError(RuntimeError):
     """Raised when Gemini returns no usable content."""
@@ -82,7 +96,7 @@ def generate_step(contents, function_declarations, system_instruction=None, stor
     if store is None:
         raise RuntimeError("A project store is required for Gemini generation.")
     model = resolve_model(store, CHAT_MODEL, DEFAULT_CHAT_MODEL)
-    cfg = types.GenerateContentConfig(
+    cfg = _config(
         tools=[to_gemini_tool(function_declarations)] if function_declarations else None,
         system_instruction=system_instruction,
     )
@@ -128,7 +142,7 @@ def generate_json(store, prompt, model=None):
             role="user",
             parts=[types.Part.from_text(text=prompt)]
         )],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+        config=_config(response_mime_type="application/json"),
     ))
     text = response.text or ""
     if not text.strip():

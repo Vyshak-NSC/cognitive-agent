@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from ragapp.cognition.store import CognitionStore, now_iso
 
 ALLOWED_PERMANENCE = {"permanent", "transient"}
@@ -12,6 +13,53 @@ def _semantic_generator(store):
     from ragapp.cognition.document_compiler import _provider_generator
     generator, _provider, _model = _provider_generator(store)
     return generator
+
+
+def _loads_json(text):
+    """Parse model JSON tolerantly (code fences / leading or trailing prose)."""
+    s = str(text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s).strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        start, end = s.find("{"), s.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(s[start:end + 1])
+        raise
+
+
+def _resolve_entity_id(store, ident):
+    """Map a planner-supplied id or display name to a canonical entity id (or None)."""
+    wanted = str(ident or "").strip().lower()
+    if not wanted:
+        return None
+    for eid, meta in (store.master_metadata().get("entities") or {}).items():
+        if wanted in {str(eid).strip().lower(), str((meta or {}).get("name") or "").strip().lower()}:
+            return str(eid)
+    return None
+
+
+def _planned_entity_targets(store, plan):
+    """Entity ids a plan changes (any entity-touching operation) or justifies leaving unchanged."""
+    changed, justified = set(), set()
+    for op in plan.get("operations") or []:
+        if not isinstance(op, dict):
+            continue
+        operation = str(op.get("operation") or "")
+        kind = str(op.get("kind") or "")
+        if not kind and operation in {"state_update", "upsert_entity"}:
+            kind = "entity"
+        ident = str(op.get("id") or op.get("entity") or "")
+        if kind == "entity" and ident:
+            changed.add(_resolve_entity_id(store, ident) or ident)
+    for item in plan.get("unchanged_named_entities") or []:
+        if isinstance(item, dict) and str(item.get("reason") or "").strip():
+            ident = str(item.get("id") or item.get("entity") or item.get("name") or "")
+            if ident:
+                justified.add(_resolve_entity_id(store, ident) or ident)
+    return changed, justified
 
 
 def _named_entity_seeds(store, request):
@@ -66,10 +114,29 @@ def _semantic_context(store, request, max_chars=10000):
         for ref in refs:
             if ref not in seen: queue.append((ref[0], ref[1], depth + 1))
     requests = [{"kind": kind, "id": ident, "detail": "section", "sections": ["description", "summary", "attributes", "participants", "relationships", "events", "location_ids", "concept_ids", "definition_ids", "knowledge_ids", "timeline", "evolution"]} for kind, ident in ordered]
-    return retrieval.retrieve(requests, max_chars=max_chars).get("requests") or []
+    result = retrieval.retrieve(requests, max_chars=max_chars).get("requests") or []
+    # Named entities are the objects the user explicitly changed. Include their
+    # complete canonical record so profile fields such as abilities, traits,
+    # elemental affinities, and other top-level fields cannot be silently omitted
+    # by a section-oriented retrieval projection. Keep this bounded to named seeds.
+    named = {(kind, ident) for kind, ident, _ in _named_entity_seeds(store, request)}
+    if named:
+        by_key = {(str(r.get("kind") or ""), str(r.get("id") or "")): r for r in result if isinstance(r, dict)}
+        for kind, ident in named:
+            if kind != "entity":
+                continue
+            rec = store._read_entity(ident)
+            if not rec:
+                continue
+            item = by_key.get((kind, ident))
+            if item is None:
+                item = {"kind": kind, "id": ident}
+                result.append(item)
+            item["canonical_record"] = rec
+    return result
 
 
-def _mutation_prompt(request, context, source_recompile=False):
+def _mutation_prompt(request, context, source_recompile=False, coverage_feedback=None):
     schema = {
         "operations": [
             {"operation": "delete_object", "kind": "entity|relationship|event|location|concept|definition|knowledge", "id": "...", "reason": "..."},
@@ -79,6 +146,7 @@ def _mutation_prompt(request, context, source_recompile=False):
             {"operation": "upsert_object", "kind": "relationship|event|location|concept|definition|knowledge", "id": "...", "data": {}, "reason": "..."},
         ],
         "affected": [{"kind": "...", "id": "...", "reason": "..."}],
+        "unchanged_named_entities": [{"id": "...", "reason": "named in the request only as context; nothing about it changes"}],
         "explanation": "short transaction rationale",
     }
     source_rule = (
@@ -102,8 +170,14 @@ def _mutation_prompt(request, context, source_recompile=False):
         "5. Keep operations minimal but complete across relationships, events, knowledge, concepts and summaries that are semantically affected.\n"
         "6. Never modify provenance merely to hide the origin of retained knowledge.\n"
         "7. Treat every current claim in the connected cognition as subject to reconciliation. Any claim whose truth, meaning, validity, or completeness depends on changed state must be updated, invalidated, or removed when the resulting state no longer supports it."
+        "8. Every explicitly named entity in USER-APPROVED CHANGE is a required coverage target. If the request changes its profile, capabilities, elemental affinity, traits, evolution, description, or other current details, emit an operation for that entity. Do not silently omit a named entity merely because its old metadata appears compatible."
+        "9. For profile redesigns, update all materially affected current profile fields (for example summary, description, abilities/capabilities, traits, elemental affinities, evolution/profile fields) when those fields exist in the supplied canonical record. Do not leave obsolete current abilities behind while changing only summary/description.\n"
+        "10. A named entity that the request only mentions as context (nothing about it changes) must be listed in unchanged_named_entities with a reason instead of being edited.\n"
+        "11. When the request asks to save something 'as a concept' (or fact, definition, rule), emit upsert_object with that kind and a complete, self-contained definition; link it to the entities it concerns through related_entity_ids."
         + source_rule
     )
+    if coverage_feedback:
+        instructions += "\n\nCOVERAGE FEEDBACK ON YOUR PREVIOUS PLAN (fix it in this plan): " + str(coverage_feedback)
     return (
         instructions
         + "\n\nSCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
@@ -142,38 +216,41 @@ def _verification_prompt(request, context):
     )
 
 
-def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit, max_context_chars, max_passes=1):
-    """Bounded semantic invariant: at most one verify/repair cycle."""
-    applied = []
-    reports = []
+def _verify_and_repair_semantic_closure(store, request, source_label, pre_commit, max_context_chars, max_passes=2):
+    """Bounded semantic invariant: verify, repair, re-verify (at most ``max_passes`` model checks).
+
+    Previously a single pass was allowed and *any* repair request fell through to a
+    RuntimeError, which rolled back an otherwise correct mutation. Now repairs are applied
+    and re-checked once; repairs from the final pass are accepted (they were applied and
+    not rejected) and flagged in the report. Conflicts the verifier cannot propose a repair
+    for are returned as warnings instead of discarding the whole transaction.
+    """
+    applied, reports, warnings = [], [], []
     generator = _semantic_generator(store)
     for pass_no in range(1, max_passes + 1):
         context = _semantic_context(store, request, max_chars=max_context_chars)
-        report = json.loads(generator(_verification_prompt(request, context)))
+        report = _loads_json(generator(_verification_prompt(request, context)))
         if not isinstance(report, dict) or not isinstance(report.get("operations", []), list):
             raise ValueError("semantic verification returned an invalid result")
+        operations = list(report.get("operations") or [])
+        conflicts = list(report.get("conflicts") or [])
         reports.append({
             "pass": pass_no,
             "valid": bool(report.get("valid")),
-            "conflicts": list(report.get("conflicts") or []),
-            "operations_requested": len(report.get("operations") or []),
+            "conflicts": conflicts,
+            "operations_requested": len(operations),
         })
-        operations = list(report.get("operations") or [])
-        if bool(report.get("valid")) and not operations:
-            return applied, reports
         if not operations:
-            raise RuntimeError("semantic verification found unresolved conflicts but produced no repair operations")
+            if not bool(report.get("valid")) and conflicts:
+                warnings.append({"unresolved_conflicts": conflicts})
+            return applied, reports, warnings
         repaired, rejected = _apply_semantic_operations(store, operations, source_label, pre_commit)
         if rejected:
             raise RuntimeError("semantic verification repair contained rejected operations: " + json.dumps(rejected, ensure_ascii=False))
         applied.extend(repaired)
-    # Bounded safety: do not enter an unbounded verification/repair loop.
-    # A repair pass is applied at most once; the caller rolls the transaction
-    # back if the repair itself cannot establish closure.
-    raise RuntimeError(
-        "semantic cognition mutation requires more than the allowed verification/repair pass; "
-        "transaction rolled back to the pre-mutation checkpoint"
-    )
+    reports[-1]["final_pass_repairs_unverified"] = True
+    warnings.append({"note": "repairs from the final verification pass were applied but not re-verified"})
+    return applied, reports, warnings
 
 
 def _strip_reference(value, deleted_kind, deleted_id):
@@ -365,9 +442,30 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
     pre_commit = store.commit_authoritative_change("Pre-state backup before semantic cognition mutation")
     context = _semantic_context(store, request, max_chars=max_context_chars)
     source_files = _source_files_for_semantic_request(store, request) if recompile_source else []
-    plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, context, source_recompile=bool(source_files))))
+    generator = _semantic_generator(store)
+    plan = _loads_json(generator(_mutation_prompt(request, context, source_recompile=bool(source_files))))
     if not isinstance(plan, dict) or not isinstance(plan.get("operations"), list):
         raise ValueError("semantic cognition mutation returned an invalid operation plan")
+    # Coverage gate: every entity the user explicitly named must be either changed by an
+    # operation or explicitly justified as context-only. (Before, state_update/upsert_entity
+    # operations never counted because only ops carrying kind="entity" were recognised, and
+    # words such as "Light" or "Earth" that are also entity names made valid plans fail.)
+    named_targets = {ident for kind, ident, _ in _named_entity_seeds(store, request) if kind == "entity"}
+    changed, justified = _planned_entity_targets(store, plan)
+    missing = sorted(named_targets - changed - justified)
+    if missing:
+        feedback = (
+            "These entities are named in the request but your plan neither changes them nor lists them in "
+            "unchanged_named_entities: " + ", ".join(missing) + ". For each, emit the needed operation, or list it in "
+            "unchanged_named_entities with a reason. Keep every other operation from your previous plan."
+        )
+        plan = _loads_json(generator(_mutation_prompt(request, context, source_recompile=bool(source_files), coverage_feedback=feedback)))
+        if not isinstance(plan, dict) or not isinstance(plan.get("operations"), list):
+            raise ValueError("semantic cognition mutation returned an invalid operation plan")
+        changed, justified = _planned_entity_targets(store, plan)
+        missing = sorted(named_targets - changed - justified)
+        if missing:
+            raise RuntimeError("semantic cognition mutation plan omitted explicitly named entities: " + ", ".join(f"entity:{i}" for i in missing))
     with tempfile.TemporaryDirectory(prefix="cognition-mutation-") as tmp:
         backup = Path(tmp) / "cognition"; shutil.copytree(store.cognition, backup)
         try:
@@ -393,7 +491,7 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
             post_plan, post_applied = {}, []
             if source_files:  # re-plan only when a recompile could have re-introduced stale facts
                 post_context = _semantic_context(store, request, max_chars=max_context_chars)
-                post_plan = json.loads(_semantic_generator(store)(_mutation_prompt(request, post_context, source_recompile=False)))
+                post_plan = _loads_json(generator(_mutation_prompt(request, post_context, source_recompile=False)))
                 if not isinstance(post_plan, dict) or not isinstance(post_plan.get("operations"), list):
                     raise ValueError("post-recompile semantic reconciliation returned an invalid operation plan")
                 post_applied, post_rejected = _apply_semantic_operations(store, post_plan.get("operations"), source_label, pre_commit)
@@ -401,7 +499,7 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
                     raise RuntimeError("post-recompile semantic reconciliation contained rejected operations: " + json.dumps(post_rejected, ensure_ascii=False))
                 applied.extend(post_applied)
 
-            verification_applied, verification_reports = _verify_and_repair_semantic_closure(
+            verification_applied, verification_reports, verification_warnings = _verify_and_repair_semantic_closure(
                 store, request, source_label, pre_commit, max_context_chars
             )
             applied.extend(verification_applied)
@@ -412,7 +510,7 @@ def apply_semantic_mutation(store: CognitionStore, changes, source_label="agent"
             for item in post_plan.get("affected") or []:
                 if item not in affected:
                     affected.append(item)
-            return {"status":"applied", "requested_changes":request, "affected":affected, "applied":applied, "explanation":post_plan.get("explanation") or plan.get("explanation", ""), "pre_state_git_commit":pre_commit, "git_commit":git_commit, "recompilation":recompilation, "post_reconciliation": {"performed": True, "operations": len(post_applied)}, "semantic_verification": {"performed": True, "repairs_applied": len(verification_applied), "passes": verification_reports}}
+            return {"status":"applied", "requested_changes":request, "affected":affected, "applied":applied, "explanation":post_plan.get("explanation") or plan.get("explanation", ""), "pre_state_git_commit":pre_commit, "git_commit":git_commit, "recompilation":recompilation, "post_reconciliation": {"performed": True, "operations": len(post_applied)}, "semantic_verification": {"performed": True, "repairs_applied": len(verification_applied), "passes": verification_reports}, "warnings": verification_warnings}
         except Exception:
             if store.cognition.exists(): shutil.rmtree(store.cognition)
             shutil.copytree(backup, store.cognition); sync_store(store); raise

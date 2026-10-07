@@ -143,21 +143,48 @@ def _latest_user_query(transcript):
     return ""
 
 
-def _is_chat_cognition_approval(query):
-    """True when the user is approving previously discussed chat knowledge.
+_APPROVAL_VERBS = ("apply", "commit", "save", "persist", "learn", "remember", "promote", "store", "record",
+                   "merge", "write", "include", "update", "compile", "compiled", "compiling", "updated")
+_COGNITION_WORDS = ("cognition", "canon", "canonical")
 
-    These requests are intentionally handled by the normal model turn so the
-    full transcript remains available.  Running a semantic mutation directly
-    from the short approval phrase (for example, "apply that to cognition")
-    loses the antecedent and can also cause the same mutation to run twice.
+
+def _fuzzy_has(tokens, words, cutoff=0.82):
+    """True when any token is (nearly) one of ``words`` - tolerates typos like 'updaete'/'compoiled'."""
+    import difflib
+    return any(difflib.get_close_matches(t, words, n=1, cutoff=cutoff) for t in tokens if len(t) >= 4)
+
+
+def _is_chat_cognition_approval(query):
+    """True when the user asks to write discussed/new knowledge into cognition.
+
+    Covers "apply the changes we discussed to cognition", scoped forms such as "save the
+    healing mechanic as concept, compile that part into cognition", and typo-ridden
+    requests like "updaete the data ... compoiled into cognition files".
+    "compile" here means "write into cognition", NOT "re-extract every source file".
+
+    These requests are handled by a runtime-owned extraction + semantic mutation
+    (see _apply_chat_approval) so the antecedent comes from the full transcript and
+    success is only reported when the mutation really committed.
     """
     q = str(query or "").strip().lower()
-    if not q:
+    if not q or "?" in q or re.match(r"^(what|who|why|how|when|where|is|are|does|do|can|could|would|should)\b", q):
         return False
-    approval = re.search(r"\b(apply|commit|save|persist|learn|remember|add|promote|store)\b", q)
-    target = re.search(r"\b(cognition|canon|canonical|knowledge|memory|state)\b", q)
-    reference = re.search(r"\b(that|this|these|those|above|discussed|conversation|chat|changes?|updates?|decisions?|facts?)\b", q)
-    return bool(approval and target and reference)
+    tokens = re.findall(r"[a-z]+", q)
+    # "recompile / rebuild / re-ingest" is the explicit source-recompile command, not an approval.
+    plain = [t for t in tokens if not re.match(r"^(re|rebuil|reingest)", t)]
+    if len(plain) < len(tokens) and not re.search(r"\b(chat|conversation|discussed|above)\b", q):
+        return False
+    verb = _fuzzy_has(plain, _APPROVAL_VERBS) or re.search(r"\b(add|put)\b", q)
+    strong_target = _fuzzy_has(plain, _COGNITION_WORDS, cutoff=0.8)
+    weak_target = re.search(r"\b(knowledge|memory|state)\b", q)
+    reference = re.search(
+        r"\b(that|this|these|those|above|discussed|conversation|chat|changes?|updates?|decisions?|facts?|"
+        r"part|mechanics?|mechanism|logic|design|redesign|it|them|new|method|explanation)\b|"
+        r"\bas (?:a |an )?(?:concept|fact|rule|definition|decision)\b", q)
+    if not verb:
+        return False
+    # An explicit "cognition"/"canon" target is enough; weaker targets need a back-reference.
+    return bool(strong_target or (weak_target and reference))
 
 
 def _asserts_known_entity_state(query, cognition):
@@ -245,7 +272,7 @@ def _build_system_instruction(active_instructions, modules=None):
         "Do not manually enumerate guessed cascade edits as deltas; the cognition transaction runtime loads connected cognition, "
         "performs semantic cascade planning with the LLM, applies it atomically, cleans references, and commits the new state. "
         "Use ordinary deltas only for simple isolated entity attribute state observations where no semantic cascade is requested."
-        "\n\nWhen the user's latest message approves applying previously discussed changes to cognition (for example, \"apply that to cognition\", \"save these changes\", or \"learn this chat\"), treat the ENTIRE supplied transcript as the working discussion. Extract only durable claims, decisions, state changes, relationships, events, or other cognition that the USER established or explicitly approved. Assistant text is context, not authority. Emit exactly one <STATE_UPDATE> block with semantic_changes containing the consolidated user-approved changes in plain language. Do not require the user to restate the earlier discussion. Do not emit a separate tool call merely to restate the approval."
+        "\n\nWhen the user's latest message approves applying previously discussed changes to cognition (for example, \"apply that to cognition\", \"save these changes\", or \"learn this chat\"), treat the ENTIRE supplied transcript as the working discussion. Extract only durable claims, decisions, state changes, relationships, events, or other cognition that the USER established or explicitly approved. Assistant text is context, not authority. Preserve the user-approved design at the level of concrete fields and capabilities, not merely a high-level summary: if the discussion specifies an entity profile, elemental affinity, traits, abilities, evolution path, mechanics, or other structured details, include those concrete details in semantic_changes so the merge engine can persist them. Include every explicitly discussed named entity that is being changed. Emit exactly one <STATE_UPDATE> block with semantic_changes containing the consolidated user-approved changes in plain language. Do not require the user to restate the earlier discussion. Do not emit a separate tool call merely to restate the approval."
     )
     module_lines = [str(x).strip() for x in (modules or []) if str(x).strip()]
     if module_lines:
@@ -296,124 +323,215 @@ def _split_state_deltas(deltas):
     return cascade, plain
 
 
+def _result_failed(result):
+    """A merge result that applied nothing and rejected something is a failure."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("error") or result.get("status") == "error":
+        return True
+    return bool(result.get("rejected")) and not result.get("applied")
+
+
 def _persist_state_updates(
     state_blocks,
     cognition,
     project_id,
     calls,
+    failures=None,
 ):
     """Apply STATE_UPDATE blocks to durable cognition.
-    Each block is passed to merge_deltas. Entity JSON files are never
-    rewritten directly here.
+
+    Returns the number of blocks that really applied. Every failure is appended to
+    ``failures`` (when given) so the caller can stop the model's reply from claiming
+    success - previously errors only appeared in the trace while the answer said
+    "updated".
     """
+    failures = failures if failures is not None else []
     if not state_blocks:
         return 0
     if cognition is None or not cognition.exists():
-        for state_raw in state_blocks:
-            _record_tool_call(
-                calls,
-                "cognition.merge_state_deltas",
-                {
-                    "error": (
-                        "cognition store does not exist"
-                    )
-                },
-                {
-                    "error": (
-                        "Cannot apply STATE_UPDATE: "
-                        "cognition store does not exist."
-                    )
-                },
-            )
+        for _ in state_blocks:
+            msg = "Cannot apply STATE_UPDATE: cognition store does not exist."
+            failures.append(msg)
+            _record_tool_call(calls, "cognition.merge_state_deltas", {"error": "cognition store does not exist"}, {"error": msg})
         return 0
-    from ragapp.cognition.merge import merge_deltas
+    from ragapp.cognition.merge import merge_deltas, apply_semantic_mutation
     applied = 0
     for state_raw in state_blocks:
+        payload = {}
         try:
             payload = json.loads(state_raw)
             if not isinstance(payload, dict):
-                raise ValueError(
-                    "STATE_UPDATE must contain a JSON object."
-                )
-            deltas = payload.get(
-                "deltas",
-                [],
-            )
-            events = payload.get(
-                "events",
-                [],
-            )
+                raise ValueError("STATE_UPDATE must contain a JSON object.")
+            deltas = payload.get("deltas", [])
+            events = payload.get("events", [])
             semantic_changes = payload.get("semantic_changes")
             if semantic_changes:
-                from ragapp.cognition.merge import apply_semantic_mutation
-                result = apply_semantic_mutation(
-                    cognition,
-                    semantic_changes,
-                    source_label=f"agent:{project_id}",
-                )
+                result = apply_semantic_mutation(cognition, semantic_changes, source_label=f"agent:{project_id}")
             else:
                 if not isinstance(deltas, list):
-                    raise ValueError(
-                        "STATE_UPDATE.deltas must be an array."
-                    )
+                    raise ValueError("STATE_UPDATE.deltas must be an array.")
                 # A durable attribute change can falsify connected relationships
                 # and descriptions, so it goes through the cascading semantic
                 # transaction instead of a bare attribute append.
                 cascade, plain = _split_state_deltas(deltas)
                 result = None
                 if plain or events:
-                    result = merge_deltas(
-                        cognition,
-                        plain,
-                        source_label=f"agent:{project_id}",
-                        events=events,
-                    )
+                    result = merge_deltas(cognition, plain, source_label=f"agent:{project_id}", events=events)
                 if cascade:
-                    from ragapp.cognition.merge import apply_semantic_mutation
-                    result = apply_semantic_mutation(
-                        cognition, cascade, source_label=f"agent:{project_id}",
-                    )
-            _record_tool_call(
-                calls,
-                "cognition.merge_state_deltas",
-                payload,
-                result,
-            )
-            applied += 1
-        except TypeError as exc:
-            # Compatibility fallback applies only to legacy ordinary deltas.
-            # Semantic transactions must fail closed rather than silently
-            # degrading into an empty/non-cascading state update.
-            try:
-                payload = json.loads(state_raw)
-                if payload.get("semantic_changes"):
-                    raise exc
-                deltas = payload.get("deltas", [])
-                result = merge_deltas(
-                    cognition,
-                    deltas,
-                    source_label=f"agent:{project_id}",
-                )
-                _record_tool_call(calls, "cognition.merge_state_deltas", payload, result)
+                    result = apply_semantic_mutation(cognition, cascade, source_label=f"agent:{project_id}")
+            _record_tool_call(calls, "cognition.merge_state_deltas", payload, result)
+            if _result_failed(result):
+                failures.append("the update was rejected: " + json.dumps(_json_safe(result.get("rejected") or result), ensure_ascii=False)[:600])
+            else:
                 applied += 1
-            except Exception as inner_exc:
-                _record_tool_call(calls, "cognition.merge_state_deltas", {}, {"error": str(inner_exc)})
         except Exception as exc:
-            try:
-                safe_payload = json.loads(
-                    state_raw
-                )
-            except Exception:
-                safe_payload = {}
-            _record_tool_call(
-                calls,
-                "cognition.merge_state_deltas",
-                safe_payload,
-                {
-                    "error": str(exc)
-                },
-            )
+            LOGGER.exception("STATE_UPDATE failed project=%s", project_id)
+            failures.append(str(exc))
+            _record_tool_call(calls, "cognition.merge_state_deltas", payload if isinstance(payload, dict) else {}, {"error": str(exc)})
     return applied
+
+
+# --------------------------------------------------------------------------
+# Runtime-owned "apply this chat to cognition"
+# --------------------------------------------------------------------------
+_EXTRACT_MAX_CHARS = 80000
+_EXTRACT_MAX_MESSAGE_CHARS = 12000
+
+
+def _transcript_for_extraction(transcript):
+    """Most recent messages first until the budget is used, returned oldest-first."""
+    picked, used = [], 0
+    for message in reversed(transcript or []):
+        if not isinstance(message, dict):
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > _EXTRACT_MAX_MESSAGE_CHARS:
+            content = content[:_EXTRACT_MAX_MESSAGE_CHARS] + " [...truncated]"
+        line = f"[{str(message.get('role') or 'user').upper()}] {content}"
+        if used + len(line) > _EXTRACT_MAX_CHARS and picked:
+            break
+        picked.append(line)
+        used += len(line)
+    return "\n\n".join(reversed(picked))
+
+
+def _chat_extraction_prompt(transcript, query):
+    schema = {
+        "semantic_changes": ["one self-contained plain-language change per item"],
+        "skipped": [{"item": "...", "reason": "..."}],
+    }
+    rules = (
+        "You turn an approved chat discussion into changes for a persistent canonical knowledge store.\n"
+        "Rules:\n"
+        "1. SCOPE: the LATEST USER REQUEST decides what is saved. If it names a part (for example 'the healing mechanic'), save only that part. "
+        "If it asks to apply the changes discussed, save everything the user established or approved.\n"
+        "2. AUTHORITY: only content the USER established, corrected or explicitly accepted. Assistant text is a proposal until the user adopted it; "
+        "when the user later corrected it, use the corrected version and drop what they rejected.\n"
+        "3. DETAIL: keep concrete detail - entity names, tiers, elements, traits, abilities, mechanics, relationships, rules - not a vague summary. "
+        "Each item must stand alone: name the entities it concerns and state the full new current truth.\n"
+        "4. RECORD TYPE: if the request says to save something 'as concept' (or fact, definition, rule), phrase the item as creating or updating that "
+        "kind of record, with its name and a complete definition.\n"
+        "5. STYLE: obey any writing rules the user stated in the discussion about how canonical descriptions must be worded "
+        "(for example describing only what something is or can do).\n"
+        "6. Do not mention the chat itself ('the user said'), and do not invent anything that was not discussed.\n"
+        "7. If nothing in the discussion matches the request, return an empty semantic_changes array and explain in skipped.\n"
+        "Return ONLY JSON matching the schema."
+    )
+    return (
+        rules
+        + "\n\nSCHEMA:\n" + json.dumps(schema, ensure_ascii=False)
+        + "\n\nLATEST USER REQUEST:\n" + str(query)
+        + "\n\nDISCUSSION TRANSCRIPT:\n" + _transcript_for_extraction(transcript)
+    )
+
+
+def _extract_chat_changes(cognition, transcript, query):
+    from ragapp.cognition.merge import _semantic_generator, _loads_json
+    raw = _semantic_generator(cognition)(_chat_extraction_prompt(transcript, query))
+    data = _loads_json(raw)
+    changes = [str(x).strip() for x in (data.get("semantic_changes") or []) if str(x).strip()] if isinstance(data, dict) else []
+    skipped = data.get("skipped") if isinstance(data, dict) else []
+    return changes, skipped
+
+
+def _describe_applied_op(op):
+    operation = str(op.get("operation") or "change")
+    kind = str(op.get("kind") or ("entity" if operation in {"state_update", "upsert_entity"} else ""))
+    target = str(op.get("id") or op.get("entity") or "")
+    field = f".{op['field']}" if op.get("field") else ""
+    reason = str(op.get("reason") or "").strip()
+    text = f"{operation}: {kind} {target}{field}".replace("  ", " ").strip()
+    return text + (f" - {reason}" if reason else "")
+
+
+def _format_chat_approval_answer(changes, result):
+    applied = [op for op in (result.get("applied") or []) if isinstance(op, dict)]
+    lines = [f"Saved to canonical cognition: {len(applied)} operation(s) applied and committed.", "", "What was saved:"]
+    lines += [f"- {c}" for c in changes]
+    if applied:
+        lines += ["", "Cognition operations performed:"]
+        lines += [f"- {_describe_applied_op(op)}" for op in applied[:30]]
+        if len(applied) > 30:
+            lines.append(f"- ...and {len(applied) - 30} more (see the execution trace).")
+    warnings = result.get("warnings") or []
+    if warnings:
+        lines += ["", "Warnings from the consistency check:"]
+        lines += [f"- {json.dumps(_json_safe(w), ensure_ascii=False)[:400]}" for w in warnings]
+    return "\n".join(lines)
+
+
+def _apply_chat_approval(cognition, transcript, query, project_id, calls):
+    """Extract the approved changes from the transcript and apply them for real.
+
+    Returns {"ok": bool, "answer": str}. The answer is built from the actual result,
+    never from model prose, so it cannot claim a save that did not happen.
+    """
+    trace_event("chat_cognition_approval_started", query=query, transcript_messages=len(transcript or []))
+    if cognition is None or not cognition.exists():
+        msg = "I could not save this to cognition because this project's cognition store does not exist yet."
+        _record_tool_call(calls, "cognition.chat_approval", {"request": query}, {"error": msg})
+        return {"ok": False, "answer": msg}
+    changes, skipped = [], []
+    try:
+        changes, skipped = _extract_chat_changes(cognition, transcript, query)
+    except Exception as exc:
+        LOGGER.exception("Chat approval extraction failed project=%s", project_id)
+        _record_tool_call(calls, "cognition.chat_extraction", {"request": query}, {"error": str(exc)})
+        return {"ok": False, "answer": f"I could not work out what to save from this chat, so nothing was changed. Reason: {exc}"}
+    _record_tool_call(calls, "cognition.chat_extraction", {"request": query}, {"semantic_changes": changes, "skipped": _json_safe(skipped)})
+    if not changes:
+        why = "; ".join(str(x.get("reason") if isinstance(x, dict) else x) for x in (skipped or []))
+        return {"ok": False, "answer": "I found nothing in this chat that matches what you asked me to save, so nothing was changed." + (f" ({why})" if why else "")}
+    try:
+        from ragapp.cognition.merge import apply_semantic_mutation
+        result = apply_semantic_mutation(cognition, changes, source_label=f"chat:{project_id}")
+    except Exception as exc:
+        LOGGER.exception("Chat approval mutation failed project=%s", project_id)
+        _record_tool_call(calls, "cognition.semantic_mutation", {"requested_changes": changes}, {"error": str(exc)})
+        return {"ok": False, "answer": (
+            "I could not apply this to cognition, and nothing was changed (the transaction was rolled back).\n\n"
+            f"Reason: {exc}\n\nThe changes I tried to save were:\n" + "\n".join(f"- {c}" for c in changes))}
+    _record_tool_call(calls, "cognition.semantic_mutation", {"requested_changes": changes}, result)
+    if not isinstance(result, dict) or result.get("status") != "applied":
+        return {"ok": False, "answer": f"The cognition update did not apply: {json.dumps(_json_safe(result), ensure_ascii=False)[:600]}"}
+    return {"ok": True, "answer": _format_chat_approval_answer(changes, result)}
+
+
+def _fallback_answer(calls):
+    """Never return an empty reply: describe what actually happened."""
+    if not calls:
+        return "⚠️ The model returned no text for this turn. Please try again."
+    lines = ["The model finished without a written reply. This is what actually ran:"]
+    for call in calls[-8:]:
+        result = call.get("result")
+        failed = isinstance(result, dict) and (result.get("error") or result.get("status") == "error")
+        lines.append(f"- {call.get('tool')}: {'FAILED - ' + str(result.get('error'))[:200] if failed else 'ok'}")
+    return "\n".join(lines)
+
+
 def _persist_drafts(
     metadata_blocks,
     text,
@@ -709,10 +827,28 @@ def _run_agent_impl(context: AgentRunContext):
     if chat_cognition_approval:
         trace_event("chat_cognition_approval_detected", query=query, transcript_messages=len(transcript))
         LOGGER.info(
-            "Chat cognition approval detected project=%s session=%s; deferring mutation to transcript-aware model turn",
+            "Chat cognition approval detected project=%s session=%s; applying via runtime extraction + semantic mutation",
             project_id, session_id or "none",
         )
-    explicit_recompile = _requests_recompile(query)
+        approval = _apply_chat_approval(cognition, transcript, query, project_id, calls)
+        if cycle:
+            cycle.advance("persist", drafts=0, state_updates=1 if approval["ok"] else 0)
+        try:
+            if cognition is not None and cognition.exists():
+                SessionMemory(cognition).distill(
+                    session_id or "unknown",
+                    transcript + [{"role": "assistant", "content": approval["answer"], "turn_id": turn_id}],
+                    turn_id=turn_id,
+                    active_turn_ids=active_turn_ids or None,
+                )
+        except Exception:
+            pass
+        LOGGER.info("Agent completed via chat approval project=%s ok=%s tool_calls=%d", project_id, approval["ok"], len(calls))
+        return (approval["answer"], calls, [])
+    # "compile that part into cognition" inside an approval means "save it", not
+    # "re-extract every source document" (which takes minutes and would re-introduce
+    # the stale source version of what the user just changed).
+    explicit_recompile = _requests_recompile(query) and not chat_cognition_approval
     cognition_mutation_result = None
     recompile_result = None
     if explicit_cognition_mutation:
@@ -1030,14 +1166,29 @@ def _run_agent_impl(context: AgentRunContext):
             # No source DOCX needs to be rewritten merely because
             # cognition changed.
             # ------------------------------------------------------
+            state_failures = []
             state_update_count = (
                 _persist_state_updates(
                     state_blocks,
                     cognition,
                     project_id,
                     calls,
+                    failures=state_failures,
                 )
             )
+            if state_blocks and state_failures:
+                reasons = "; ".join(state_failures)
+                if not state_update_count:
+                    # The model's own wording ("successfully updated ...") is withheld:
+                    # it described a change that did not persist.
+                    text = (
+                        "⚠️ I could not apply the cognition update, so nothing was changed.\n\n"
+                        f"Reason: {reasons}"
+                    )
+                else:
+                    text += "\n\n---\n⚠️ Some cognition updates were NOT applied: " + reasons
+            elif state_blocks and not text.strip():
+                text = f"Applied {state_update_count} cognition update(s)."
             # ------------------------------------------------------
             # Workspace-backed drafts
             #
@@ -1060,6 +1211,8 @@ def _run_agent_impl(context: AgentRunContext):
                     "but never actually written to the "
                     "workspace with a file tool."
                 )
+            if not text.strip():
+                text = _fallback_answer(calls)
             if cycle:
                 cycle.advance(
                     "persist",

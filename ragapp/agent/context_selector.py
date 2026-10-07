@@ -128,6 +128,15 @@ def _module_records():
     ]
 
 
+def _is_about_cognition(query: str) -> bool:
+    """Request targets canonical cognition, not project files ('...into cognition files')."""
+    q = str(query or "").lower()
+    if not re.search(r"\b(cognition|canon|canonical)\b", q):
+        return False
+    # An explicit source/workspace/code reference keeps it a project-file request.
+    return not re.search(r"\b(source|workspace|code|codebase|repo|repository|draft|pdf|docx|pptx|xlsx)\b", q)
+
+
 def _looks_like_project_mutation(query: str) -> bool:
     """Cheap execution-intent backstop for imperative project changes.
 
@@ -136,7 +145,7 @@ def _looks_like_project_mutation(query: str) -> bool:
     because it omits words like "file" or "code".
     """
     q = str(query or "").strip().lower()
-    if not q:
+    if not q or _is_about_cognition(q):
         return False
     action = re.search(
         r"\b(add|implement|create|make|build|change|modify|update|edit|fix|remove|delete|"
@@ -165,7 +174,7 @@ def _looks_like_project_inspection(query: str) -> bool:
     query is terse (for example, "get full schema of invoice").
     """
     q = str(query or "").strip().lower()
-    if not q:
+    if not q or _is_about_cognition(q):
         return False
 
     inspection = re.search(
