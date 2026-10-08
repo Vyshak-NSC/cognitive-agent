@@ -507,6 +507,21 @@ with st.sidebar:
         username
     )
 
+    # Chat display controls live at the top of the sidebar so they are
+    # available regardless of where the user is working in the app.
+    preview_enabled = st.toggle(
+        "Show preview",
+        value=st.session_state.get("chat_preview_enabled", False),
+        key="chat_preview_enabled",
+        help="Open the optional file preview dialog.",
+    )
+    show_execution = st.toggle(
+        "Show execution",
+        value=st.session_state.get("execution_trace_enabled", True),
+        key="execution_trace_enabled",
+        help="Show execution trace and legacy tool-call details under assistant messages.",
+    )
+
     st.markdown(
         "### Navigate"
     )
@@ -1297,13 +1312,9 @@ def _render_tool_calls(tool_calls):
 if nav_section == "chat":
     from ragapp.core.vcs import VCSManager
 
-    preview_enabled = st.toggle("Show file preview", value=False, key="chat_preview_enabled", help="Show or hide the optional file preview panel.")
-    trace_enabled = st.toggle(
-        "Execution trace",
-        value=st.session_state.get("execution_trace_enabled", True),
-        key="execution_trace_enabled",
-        help="Development instrumentation. Shows retrieval, model/API, tool, and final-turn events. Disable for normal use.",
-    )
+    # These controls are rendered in the sidebar. The execution switch is a
+    # display preference, not an instrumentation switch: execution traces are
+    # recorded for the turn and this preference decides whether they are shown.
     chat_col = st.container()
 
     def _activate_turn(target_turn_id):
@@ -1344,7 +1355,7 @@ if nav_section == "chat":
         active_ids=sessions.lineage_ids_data(current,parent_id) if parent_id else []
         active_ids=active_ids+[turn_id]
         calls=[]; drafts=[]; answer=""; tool_calls=[]
-        execution_trace = ExecutionTrace(enabled=trace_enabled) if trace_enabled else None
+        execution_trace = ExecutionTrace(enabled=True)
         placeholder=st.empty()
         stream_state={"rendered":"","plan":None,"done":[]}
         def _render_plan():
@@ -1368,18 +1379,20 @@ if nav_section == "chat":
             answer=(answer or "").strip() or stream_state["rendered"] or "⚠️ The agent produced no response for this turn. Try again."
             tool_calls=_serialise_tool_calls(calls)
             placeholder.markdown(answer)
-            if execution_trace is not None:
-                _render_execution_trace(execution_trace.as_dict())
-            else:
-                _render_tool_calls(tool_calls)
+            if show_execution:
+                if execution_trace is not None:
+                    _render_execution_trace(execution_trace.as_dict())
+                else:
+                    _render_tool_calls(tool_calls)
         except Exception as exc:
             answer=(stream_state["rendered"]+"\n\n" if stream_state["rendered"] else "")+"The agent encountered an error while executing this request."
             tool_calls=_serialise_tool_calls(calls)+[{"tool":"agent_error","args":{},"result":str(exc)}]
             placeholder.markdown(answer)
-            if execution_trace is not None:
-                _render_execution_trace(execution_trace.as_dict())
-            else:
-                _render_tool_calls(tool_calls)
+            if show_execution:
+                if execution_trace is not None:
+                    _render_execution_trace(execution_trace.as_dict())
+                else:
+                    _render_tool_calls(tool_calls)
         state_after=vcs.checkpoint(f"After chat turn: {user_text[:48]}")
         assistant_message={"role":"assistant","content":answer,"tool_calls":tool_calls,"turn_id":turn_id}
         if execution_trace is not None:
@@ -1416,7 +1429,7 @@ if nav_section == "chat":
         st.session_state.messages=refreshed.get("messages",[])
 
     with chat_col:
-        chat_box=st.container(height=300,border=False)
+        chat_box=st.container(height=390,border=False)
         current_session=sessions.load(st.session_state.chat_session_id) or session
         active_ids=current_session and sessions.lineage_ids_data(current_session) or []
         with chat_box:
@@ -1443,10 +1456,11 @@ if nav_section == "chat":
                             st.session_state[f"editing_{tid}"]=False; st.rerun()
                 with st.chat_message("assistant"):
                     a=turn.get("assistant") or {}; st.markdown(a.get("content",""))
-                    if a.get("execution_trace"):
-                        _render_execution_trace(a.get("execution_trace"))
-                    else:
-                        _render_tool_calls(a.get("tool_calls",[]))
+                    if show_execution:
+                        if a.get("execution_trace"):
+                            _render_execution_trace(a.get("execution_trace"))
+                        else:
+                            _render_tool_calls(a.get("tool_calls",[]))
                     # Switch among sibling branches without deleting either branch.
                     siblings=[x for x in (current_session.get("turns") or {}).values() if x.get("parent_id")==turn.get("parent_id")]
                     if len(siblings)>1:
