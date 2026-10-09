@@ -13,7 +13,7 @@ from typing import Iterable
 
 from ragapp.cognition.document_index import DocumentIndex
 from ragapp.document_parser import parse_document
-from ragapp.settings import MAX_CONTEXT_CHARS, COMPILER_MODEL, CHAT_MODEL, DEFAULT_CHAT_MODEL
+from ragapp.settings import MAX_CONTEXT_CHARS, COMPILER_SEGMENT_CHARS, COMPILER_MODEL, CHAT_MODEL, DEFAULT_CHAT_MODEL
 from ragapp.config import resolve_model
 from ragapp.core.metadata_sync import sync_store
 from ragapp.core.retrieval import RetrievalStore, CANONICAL_KINDS
@@ -32,7 +32,7 @@ Return ONLY valid JSON with this shape:
     "stable_entity_id": {
       "type": "character|organization|object|artifact|rule|other",
       "name": "",
-      "description_addition": "Detailed facts and characterization newly supported by this segment. Do not replace or summarize away earlier knowledge.",
+      "description_addition": "Everything this segment establishes about the entity, as full explanatory prose (see DEPTH AND FIDELITY). Never a summary. Additive: do not repeat earlier knowledge.",
       "tags": [],
       "knowledge_additions": {
         "identity": [],
@@ -74,7 +74,7 @@ Return ONLY valid JSON with this shape:
       "source_kind": "entity|location|concept|event|definition|knowledge",
       "target_kind": "entity|location|concept|event|definition|knowledge",
       "state": "current or newly observed state",
-      "description_addition": "Detailed explanation of how the two things are related and how this segment adds to that understanding.",
+      "description_addition": "Full explanation of the connection: what it is, its direction, the mechanism or reason behind it, the conditions it holds under, its consequences, and the source's concrete details (names, numbers, examples). Never a one-line label.",
       "event_ids": [],
       "timeline": "",
       "sequence": 1,
@@ -86,7 +86,7 @@ Return ONLY valid JSON with this shape:
       "id": "stable_event_id",
       "type": "event|decision|change|discovery|conflict|resolution|arrival|departure|other",
       "title": "",
-      "description_addition": "Detailed description of what happened and why it matters.",
+      "description_addition": "What happened, who/what was involved, the cause, the outcome and its consequences, with the source's concrete details.",
       "entities": [],
       "location_ids": [],
       "concept_ids": [],
@@ -113,7 +113,7 @@ Return ONLY valid JSON with this shape:
       "id": "stable_location_id",
       "name": "",
       "type": "place|region|building|other",
-      "description_addition": "Durable knowledge about this location.",
+      "description_addition": "Everything the source says about this location: its nature, features, rules, inhabitants and history.",
       "attributes": {},
       "entity_ids": [],
       "event_ids": [],
@@ -126,7 +126,7 @@ Return ONLY valid JSON with this shape:
       "id": "stable_concept_id",
       "name": "",
       "type": "concept|rule|mechanism|other",
-      "description_addition": "Durable definition and properties of the concept.",
+      "description_addition": "Complete explanation of the concept: how it works, its rules, criteria, components, properties, exceptions and examples.",
       "related_entity_ids": [],
       "related_event_ids": [],
       "related_concept_ids": [],
@@ -137,7 +137,7 @@ Return ONLY valid JSON with this shape:
     {
       "id": "stable_definition_id",
       "term": "",
-      "definition_addition": "The durable definition supported by the source.",
+      "definition_addition": "The complete definition: what it is, the criteria or test that decide whether something qualifies, its properties, examples and exceptions, in the source's own terms. As long as the source is. Never a one-line gloss.",
       "related_ids": [],
       "source_node_ids": []
     }
@@ -146,16 +146,40 @@ Return ONLY valid JSON with this shape:
     {
       "id": "stable_knowledge_id",
       "title": "",
-      "description_addition": "Cross-object derived knowledge that does not belong inside a single entity/event/relationship.",
+      "description_addition": "Complete cross-object knowledge that does not belong inside a single entity/event/relationship, including the facts it rests on.",
       "subject_ids": [],
       "source_node_ids": []
     }
   ]
 }
 
+DEPTH AND FIDELITY (the most important part of your job):
+- These records are read directly by people and by an agent that must answer from them WITHOUT
+  the source. Whatever you leave out is lost; whatever you leave vague will be guessed. Write
+  explanations, not summaries.
+- Every description is self-contained: say what the thing is, how it works, why, under what
+  conditions, with what exceptions, and what it affects. Use the source's own terms, names,
+  numbers, thresholds, formulas, lists and examples.
+- Length follows the source, not a template. Several paragraphs of source about one thing become
+  several paragraphs of description. One sentence is acceptable only if the source has one sentence.
+- Enumerations stay enumerated. If the source lists 16 items, stages, tiers or table rows, every
+  one appears by name with its stated properties. Never write "various", "several", "etc.",
+  "and more" or "among others" in place of the items.
+- Rules, tests and criteria are kept exactly: if the source gives a two-question test, write both
+  questions and what each answer decides. Keep every "if/then", "because" and "unless", and every
+  exception or exclusion. Treat callout or note paragraphs as rules and keep them.
+- Quote load-bearing phrases verbatim in double quotes when exact wording matters (definitions,
+  rules, named mechanisms, named thresholds).
+- Tables: carry every row and column value that is knowledge, as sentences or "name: value" lines.
+- Do not merge distinct facts into one abstract sentence. Do not interpret, generalise or add
+  anything the source does not say. No meta-commentary ("the text describes", "this section covers").
+- Before answering, check each object twice: could a reader who never saw the source answer
+  detailed questions from your text alone? Could they learn anything that is NOT in the source?
+  Fix both problems.
+
 Rules:
 1. NEVER replace previous knowledge. Every description_addition is an additive contribution.
-2. Do not write a generic one-line summary when detailed source facts are available.
+2. Never write a one-line summary when the source supports more; follow DEPTH AND FIDELITY above.
 3. Preserve all durable facts that would help a later agent reconstruct the entity,
    event, relationship, location, concept or definition without rereading the source.
 4. Reuse KNOWN IDs when the same object is clearly being described again.
@@ -180,21 +204,24 @@ Rules:
 
 
 def _provider_generator(store):
+    """(generate_json(prompt), provider id, model) for the project's configured provider.
+
+    Dispatch goes through the provider registry, so every registered provider (Gemini, OpenRouter,
+    OpenAI, Anthropic, Azure OpenAI, Azure Anthropic, and any added later) works for compilation
+    without another branch being added here.
+    """
+    import importlib
     from ragapp.config import get_api_key, load_project_config
-    provider = load_project_config(store).get("provider", {}).get("name", "gemini").lower()
-    key = get_api_key(store, provider)
-    if not key:
-        raise RuntimeError(f"No {provider.title()} API key configured. Add it in Settings or set the matching environment variable.")
+    from ragapp.llm.registry import PROVIDER_SPECS
+    provider = str(load_project_config(store).get("provider", {}).get("name", "gemini")).strip().lower()
+    provider = {"azure": "azure_openai"}.get(provider, provider)  # legacy alias from older project configs
+    if provider not in PROVIDER_SPECS:
+        raise RuntimeError(f"Unsupported cognition compiler provider: {provider}. Choose one of: {', '.join(PROVIDER_SPECS)}.")
+    if not get_api_key(store, provider):
+        raise RuntimeError(f"No {PROVIDER_SPECS[provider].get('label', provider)} API key configured. Add it in Settings or set the matching environment variable.")
     model = resolve_model(store, COMPILER_MODEL or CHAT_MODEL, DEFAULT_CHAT_MODEL, provider=provider)
-    if provider == "openrouter":
-        from ragapp.llm.tool_calling.openrouter import generate_json
-    elif provider == "gemini":
-        from ragapp.llm.tool_calling.gemini import generate_json
-    elif provider in {"azure", "azure_openai"}:
-        from ragapp.llm.tool_calling.azure_openai import generate_json
-    else:
-        raise RuntimeError(f"Unsupported cognition compiler provider: {provider}")
-    return lambda prompt: generate_json(store, prompt, model=model), provider, model
+    adapter = importlib.import_module(f"ragapp.llm.tool_calling.{PROVIDER_SPECS[provider]['adapter']}")
+    return lambda prompt: adapter.generate_json(store, prompt, model=model), provider, model
 
 
 def _ref_id(value):
@@ -455,6 +482,103 @@ def _provenance(segment, parsed, artifact_id, evidence_ids):
     }
 
 
+# ---------------------------------------------------------------------------
+# Depth enforcement
+# ---------------------------------------------------------------------------
+# The prompt asks for explanations, but a model asked to emit many objects in one answer still
+# tends to compress each of them. So the host checks mechanically, by length only and never by
+# meaning: a description that is tiny next to the source passage it cites is sent back together
+# with that passage to be rewritten at full depth. A rewrite is accepted only if it is longer than
+# what it replaces, so this pass can add detail but never remove any.
+THIN_MIN_SOURCE_CHARS = 500   # do not police citations of a sentence or two
+THIN_SOURCE_RATIO = 0.25      # a description should carry at least this share of what it cites...
+THIN_FLOOR_CAP = 1200         # ...but never needs to exceed this many characters
+EXPAND_BATCH_CHARS = 18000
+
+_DESCRIPTION_FIELDS = {
+    "entities": "description_addition", "relationships": "description_addition",
+    "events": "description_addition", "locations": "description_addition",
+    "concepts": "description_addition", "definitions": "definition_addition",
+    "knowledge": "description_addition",
+}
+
+EXPAND_PROMPT = """You are the semantic compiler for a persistent cognition system.
+Each item below has a CURRENT description that is far too thin for the SOURCE passage it cites.
+Rewrite every description as a complete, self-contained explanation of what the passage says
+about that item, so a reader who never sees the source can answer detailed questions from it.
+
+Rules:
+- Use only the passage. Add no facts, interpretation or outside knowledge.
+- Keep every name, number, threshold, condition, exception, list item, table value, rule and
+  example that bears on the item. Never replace items with "several", "various" or "etc.".
+- Keep tests and criteria complete (each question and what each answer decides) and keep causal
+  and conditional statements.
+- Quote load-bearing phrases verbatim in double quotes when exact wording matters.
+- Plain explanatory prose in short paragraphs, or "name: value" lines. No meta-commentary.
+- The new description must contain everything the CURRENT one says.
+
+Return ONLY JSON: {"items": {"<key>": "<full description>"}}
+"""
+
+
+def _description_items(data):
+    for kind, field in _DESCRIPTION_FIELDS.items():
+        block = data.get(kind)
+        pairs = list(block.items()) if isinstance(block, dict) else [(None, v) for v in block] if isinstance(block, list) else []
+        for key, item in pairs:
+            if isinstance(item, dict):
+                yield kind, key, item, field
+
+
+def _thin_descriptions(data, doc, segment):
+    allowed = set(segment.node_ids)
+    thin = []
+    for kind, key, item, field in _description_items(data):
+        ids = _valid_evidence(item.get("source_node_ids"), allowed)
+        if not ids:
+            continue
+        source = "\n\n".join(doc.nodes[n].text for n in ids if n in doc.nodes and doc.nodes[n].text)
+        if len(source) < THIN_MIN_SOURCE_CHARS:
+            continue
+        current = str(item.get(field) or item.get("description") or "").strip()
+        if len(current) < min(THIN_SOURCE_RATIO * len(source), THIN_FLOOR_CAP):
+            label = item.get("id") or key or item.get("name") or item.get("title") or item.get("term") or kind
+            thin.append({"kind": kind, "label": str(label), "item": item, "field": field, "current": current, "source": source})
+    return thin
+
+
+def _expand_thin_descriptions(generator, data, doc, segment):
+    """Rewrite too-thin descriptions in `data` in place. Returns counts; never raises."""
+    stats = {"thin": 0, "expanded": 0, "still_thin": 0}
+    thin = _thin_descriptions(data, doc, segment)
+    stats["thin"] = len(thin)
+    batches, batch, size = [], [], 0
+    for entry in thin:
+        cost = len(entry["source"]) + len(entry["current"])
+        if batch and size + cost > EXPAND_BATCH_CHARS:
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(entry)
+        size += cost
+    if batch:
+        batches.append(batch)
+    for batch in batches:
+        payload = {f"k{i}": {"kind": e["kind"], "item": e["label"], "current": e["current"], "source": e["source"]} for i, e in enumerate(batch)}
+        try:
+            reply = json.loads(generator(EXPAND_PROMPT + "\n\nITEMS:\n" + json.dumps(payload, ensure_ascii=False)))
+            rewritten = (reply.get("items") if isinstance(reply, dict) else None) or {}
+        except Exception:
+            rewritten = {}
+        for i, entry in enumerate(batch):
+            new = rewritten.get(f"k{i}")
+            if isinstance(new, str) and len(new.strip()) > 1.2 * len(entry["current"]):
+                entry["item"][entry["field"]] = new.strip()
+                stats["expanded"] += 1
+            else:
+                stats["still_thin"] += 1
+    return stats
+
+
 class DocumentCognitionCompiler:
     def __init__(self, store):
         self.store = store
@@ -466,7 +590,7 @@ class DocumentCognitionCompiler:
         generator, provider, model = _provider_generator(self.store)
         parsed_docs = []
         failures = []
-        per_segment_budget = max(5000, int(MAX_CONTEXT_CHARS * 0.48))
+        per_segment_budget = COMPILER_SEGMENT_CHARS
 
         for area, path in files:
             rel = path.relative_to(self.store.source if area == "source" else self.store.workspace).as_posix()
@@ -487,6 +611,7 @@ class DocumentCognitionCompiler:
         skipped = []
         processed = 0
         touched_refs = set()
+        depth = {"thin": 0, "expanded": 0, "still_thin": 0}
 
         for i, (doc, seg) in enumerate(segments, 1):
             structure = {
@@ -546,6 +671,9 @@ class DocumentCognitionCompiler:
                 if progress_callback:
                     progress_callback(i, len(segments))
                 continue
+
+            for key, value in _expand_thin_descriptions(generator, data, doc, seg).items():
+                depth[key] += value
 
             artifact_id = doc.artifact_id
             timeline_label = (seg.title or doc.title or "document")
@@ -722,4 +850,5 @@ class DocumentCognitionCompiler:
             "definitions": len(self.store._all_kind_records("definition")),
             "knowledge": len(self.store._all_kind_records("knowledge")),
             "verification": verification,
+            "depth": depth,
         }

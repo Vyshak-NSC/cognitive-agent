@@ -282,6 +282,18 @@ button { cursor: pointer; }
 .empty-state h3 { margin: 0 0 5px; color: #cdd1d8; }
 .empty-state p { max-width: 460px; margin: 0 0 16px; font-size: 12px; line-height: 1.6; }
 
+/* ---- upload dialog ---------------------------------------------------------- */
+.dropzone { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 4px 0 14px; padding: 26px 16px; border: 1.5px dashed #34456a; border-radius: 12px; background: #11151e; color: #8fb4ee; text-align: center; cursor: pointer; transition: .15s; }
+.dropzone:hover, .dropzone:focus-visible, .dropzone.active { border-color: var(--accent); background: #142038; outline: none; }
+.dropzone strong { color: #e2e9f6; font-size: 13px; }
+.upload-list { max-height: 180px; margin-bottom: 12px; overflow-y: auto; border: 1px solid var(--line-2); border-radius: 9px; }
+.upload-list > div { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid #1d212b; font-size: 12px; }
+.upload-list > div:last-child { border-bottom: 0; }
+.upload-list span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-list small { color: var(--text-3); }
+.check-line { display: flex; align-items: center; gap: 8px; margin-top: 4px; color: var(--text-2); font-size: 12px; }
+.check-line input { width: auto; margin: 0; }
+
 /* ---- overlays ------------------------------------------------------------- */
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: rgba(3,5,9,.7); backdrop-filter: blur(7px); }
 .modal { width: min(560px, 95vw); max-height: 88vh; display: flex; flex-direction: column; overflow: hidden; border: 1px solid #303541; border-radius: 14px; background: #151820; box-shadow: 0 30px 100px rgba(0,0,0,.5); }

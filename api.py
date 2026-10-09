@@ -8,7 +8,8 @@ import uuid
 from pathlib import Path as FsPath
 from typing import Any, Iterator
 
-from fastapi import FastAPI, HTTPException, Query as FastAPIQuery
+from fastapi import FastAPI, File, Form, HTTPException, Query as FastAPIQuery, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -933,6 +934,68 @@ def cognition_compile(
         raise HTTPException(400, str(exc))
 
 
+@app.post("/cognition/{username}/{project_id}/compile/stream")
+def cognition_compile_stream(
+    username: str,
+    project_id: str,
+    body: CompileRequest,
+):
+    """
+    Server-Sent Events compile, mirroring the live progress the Streamlit UI shows.
+
+    Events:
+      start     -> {"counts": {...}, "state": {...}}
+      progress  -> {"done": n, "total": m, "counts": {...}, "state": {...}}
+      complete  -> {"result": {...}, "counts": {...}, "state": {...}}
+      error     -> {"detail": "..."}
+    """
+    import queue
+    import threading
+
+    store = store_for(username, project_id)
+    events: queue.Queue = queue.Queue()
+
+    def snapshot() -> dict:
+        return {"counts": store.cognition_counts(), "state": store.state_map()}
+
+    def on_progress(done, total):
+        payload = {"done": done, "total": total}
+        try:
+            payload.update(snapshot())
+        except Exception:
+            pass
+        events.put(("progress", payload))
+
+    def worker():
+        try:
+            events.put(("start", snapshot()))
+            result = compile_project(
+                store,
+                selected_files=body.files or None,
+                progress_callback=on_progress,
+            )
+            events.put(("complete", {"result": result, **snapshot()}))
+        except Exception as exc:
+            events.put(("error", {"detail": str(exc)}))
+        finally:
+            events.put(("done", None))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def event_stream() -> Iterator[str]:
+        while True:
+            kind, payload = events.get()
+            if kind == "done":
+                break
+            yield f"event: {kind}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # Preserve the original ingest endpoint.
 @app.post("/ingest/{username}/{project_id}")
 def ingest(username: str, project_id: str):
@@ -1014,6 +1077,66 @@ def file_download(
         filename=target.name,
         media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
     )
+
+
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
+
+
+@app.post("/projects/{username}/{project_id}/files/{area}/upload")
+async def file_upload(
+    username: str,
+    project_id: str,
+    area: str,
+    files: list[UploadFile] = File(...),
+    folder: str = Form(""),
+    overwrite: bool = Form(False),
+):
+    """Upload one or more files into `area`/`folder` as a single recoverable commit."""
+    prefix = folder.replace("\\", "/").strip().strip("/")
+    batch, total = [], 0
+    for up in files:
+        name = FsPath(up.filename or "").name  # a client-supplied filename is never trusted as a path
+        if not name:
+            raise HTTPException(400, "An uploaded file has no name.")
+        if up.size and total + up.size > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+        data = await up.read()
+        total += len(data)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+        batch.append((f"{prefix}/{name}" if prefix else name, data))
+    try:
+        service = ProjectFileService(store_for(username, project_id))
+        result = await run_in_threadpool(
+            service.write_many, area, batch,
+            overwrite=overwrite, description=f"Upload {len(batch)} file(s) to {area}",
+        )
+        return {**result, "files": [p for p, _ in batch]}
+    except FileExistsError as exc:
+        raise HTTPException(409, f"File already exists: {exc}. Enable overwrite to replace it.")
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/projects/{username}/{project_id}/files/{area}/raw/{file_path:path}")
+def file_raw(username: str, project_id: str, area: str, file_path: str):
+    """
+    Serve a project file inline with its real MIME type.
+
+    The path is part of the URL (not a query parameter) so relative references inside an HTML
+    file (./style.css, ../img/logo.png) resolve to sibling files through this same route. Active
+    content (html/svg) is served with a CSP sandbox: scripts may run, but in an opaque origin
+    with no access to the app, cookies or storage.
+    """
+    store = store_for(username, project_id)
+    target = _safe_project_file(store, area, file_path)
+    if not target.is_file():
+        raise HTTPException(404, "file not found")
+    mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    headers = {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"}
+    if target.suffix.lower() in {".html", ".htm", ".svg", ".xml"}:
+        headers["Content-Security-Policy"] = "sandbox allow-scripts allow-popups allow-forms"
+    return FileResponse(target, media_type=mime, headers=headers)
 
 
 @app.get("/projects/{username}/{project_id}/files/{area}/preview")

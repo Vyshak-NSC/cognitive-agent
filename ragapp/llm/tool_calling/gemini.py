@@ -1,6 +1,6 @@
 import os
 from google.genai import types
-from ragapp.settings import CHAT_MODEL, DEFAULT_CHAT_MODEL
+from ragapp.settings import CHAT_MODEL, DEFAULT_CHAT_MODEL, COMPILER_MAX_OUTPUT_TOKENS
 from ragapp.config import get_api_keys, resolve_model
 
 # A hung request used to leave the UI spinning forever with no reply. Bound every call.
@@ -142,7 +142,7 @@ def generate_json(store, prompt, model=None):
             role="user",
             parts=[types.Part.from_text(text=prompt)]
         )],
-        config=_config(response_mime_type="application/json"),
+        config=_config(response_mime_type="application/json", max_output_tokens=COMPILER_MAX_OUTPUT_TOKENS),
     ))
     text = response.text or ""
     if not text.strip():

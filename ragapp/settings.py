@@ -18,3 +18,10 @@ MAX_AGENT_STEPS=int(os.getenv('MAX_AGENT_STEPS','8'))
 MAX_CONTEXT_CHARS=int(os.getenv('MAX_CONTEXT_CHARS','50000'))
 
 COMPILER_MODEL=os.getenv('COMPILER_MODEL') or None
+
+# Document cognition compiler.
+# Segment size is deliberately NOT derived from MAX_CONTEXT_CHARS: one LLM call must return every
+# entity, relationship, definition and event found in its segment, so a large segment forces the
+# model to compress each description to fit. Smaller segments give each object room to be explained.
+COMPILER_SEGMENT_CHARS=int(os.getenv('COMPILER_SEGMENT_CHARS','6000'))
+COMPILER_MAX_OUTPUT_TOKENS=int(os.getenv('COMPILER_MAX_OUTPUT_TOKENS','16000'))

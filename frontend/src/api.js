@@ -5,15 +5,32 @@ export function apiUrl(path) { return `${BASE}${path}`; }
 async function request(path, options = {}) {
   const res = await fetch(apiUrl(path), {
     ...options,
-    headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },
+    headers: { ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },
   });
   const type = res.headers.get('content-type') || '';
   const payload = type.includes('application/json') ? await res.json() : await res.text();
   if (!res.ok) {
     const detail = typeof payload === 'object' ? payload?.detail : payload;
-    throw new Error(detail || `${res.status} ${res.statusText}`);
+    throw new Error(formatDetail(detail) || `${res.status} ${res.statusText}`);
   }
   return payload;
+}
+
+// FastAPI returns `detail` as a string for HTTPException but as an array of objects for 422
+// validation errors; String(object) would render as "[object Object]".
+function formatDetail(detail) {
+  if (detail == null || detail === '') return '';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(d => {
+      if (typeof d === 'string') return d;
+      const where = Array.isArray(d?.loc) ? d.loc.filter(x => x !== 'body').join('.') : '';
+      const msg = d?.msg || d?.message || JSON.stringify(d);
+      return where ? `${where}: ${msg}` : msg;
+    }).join('; ');
+  }
+  if (typeof detail === 'object') return detail.message || detail.msg || JSON.stringify(detail);
+  return String(detail);
 }
 
 const enc = encodeURIComponent;
@@ -28,6 +45,13 @@ export const api = {
   base: BASE,
   // Streams the file with its real MIME type. Relative URLs inside an HTML file resolve against
   // this path, so sibling CSS/JS/images load without any server-side inlining.
+  uploadFiles: (u, p, area, { files, folder = '', overwrite = false }) => {
+    const form = new FormData();
+    files.forEach(f => form.append('files', f, f.name));
+    form.append('folder', folder);
+    form.append('overwrite', String(overwrite));
+    return request(`/projects/${enc(u)}/${enc(p)}/files/${enc(area)}/upload`, { method: 'POST', body: form });
+  },
   rawUrl: (u,p,a,path) => apiUrl(`/projects/${enc(u)}/${enc(p)}/files/${enc(a)}/raw/${seg(path)}`),
   downloadUrl: (u,p,a,path) => apiUrl(`/projects/${enc(u)}/${enc(p)}/files/${enc(a)}/download?path=${enc(path)}`),
   health: () => get('/health'),
@@ -62,7 +86,16 @@ export const api = {
 
   cognitionOverview: (u,p) => get(`/cognition/${encodeURIComponent(u)}/${encodeURIComponent(p)}/overview`),
   cognitionFiles: (u,p) => get(`/cognition/${encodeURIComponent(u)}/${encodeURIComponent(p)}/files`),
-  compile: (u,p,files) => post(`/cognition/${encodeURIComponent(u)}/${encodeURIComponent(p)}/compile`, { files }),
+  // Backend expects [area, path] pairs. Accepts either pairs or "area|path" keys.
+  compile: (u,p,files) => post(`/cognition/${encodeURIComponent(u)}/${encodeURIComponent(p)}/compile`, {
+    files: (files || []).map(f => {
+      if (Array.isArray(f)) return [f[0], f[1]];
+      const i = String(f).indexOf('|');
+      return [String(f).slice(0, i), String(f).slice(i + 1)];
+    }),
+  }),
+  // Live compile progress over SSE (same pattern as streamChat).
+  compileStream: (u, p, files, handlers = {}, signal) => streamCompile(u, p, files, handlers, signal),
   validate: (u,p) => get(`/cognition/${encodeURIComponent(u)}/${encodeURIComponent(p)}/validate`),
   impact: (u,p,element) => get(`/cognition/${encodeURIComponent(u)}/${encodeURIComponent(p)}/impact?element=${encodeURIComponent(element)}`),
 
@@ -136,4 +169,54 @@ export async function streamChat(body, handlers = {}, signal) {
       else if (event === 'error') handlers.onError?.(parsed);
     }
   }
+}
+
+function toPairs(files) {
+  return (files || []).map(f => {
+    if (Array.isArray(f)) return [f[0], f[1]];
+    const i = String(f).indexOf('|');
+    return [String(f).slice(0, i), String(f).slice(i + 1)];
+  });
+}
+
+async function streamCompile(u, p, files, handlers, signal) {
+  const res = await fetch(apiUrl(`/cognition/${enc(u)}/${enc(p)}/compile/stream`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+    body: JSON.stringify({ files: toPairs(files) }),
+    signal,
+  });
+  if (!res.ok) {
+    let payload = ''; try { payload = await res.json(); } catch { /* non-JSON body */ }
+    throw new Error(formatDetail(payload?.detail ?? payload) || `${res.status} ${res.statusText}`);
+  }
+  if (!res.body) throw new Error('Streaming is not supported by this browser.');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finished = false;
+  const dispatch = (event, parsed) => {
+    if (event === 'start') handlers.onStart?.(parsed);
+    else if (event === 'progress') handlers.onProgress?.(parsed);
+    else if (event === 'complete') { finished = true; handlers.onComplete?.(parsed); }
+    else if (event === 'error') { finished = true; handlers.onError?.(parsed); }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+    const chunks = buffer.split('\n\n');
+    buffer = chunks.pop() || '';
+    for (const chunk of chunks) {
+      let event = 'message', data = '';
+      for (const line of chunk.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).replace(/^ /, '');
+      }
+      if (!data) continue;
+      let parsed; try { parsed = JSON.parse(data); } catch { parsed = data; }
+      dispatch(event, parsed);
+    }
+  }
+  if (!finished) throw new Error('Connection closed before compilation finished.');
 }

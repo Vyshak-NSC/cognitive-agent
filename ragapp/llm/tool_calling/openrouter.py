@@ -24,6 +24,7 @@ from openrouter import OpenRouter
 from openrouter.utils import BackoffStrategy, RetryConfig
 
 from ragapp.config import get_api_keys, load_project_config
+from ragapp.settings import COMPILER_MAX_OUTPUT_TOKENS
 from ragapp.llm.registry import PROVIDER_SPECS
 
 DEFAULT_OPENROUTER_MODEL = PROVIDER_SPECS["openrouter"]["default_model"]
@@ -483,7 +484,7 @@ def generate_json(store, prompt, model=None):
     model = model or configured
     request = {
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 8000,
+        "max_tokens": COMPILER_MAX_OUTPUT_TOKENS,
         **_target(model, pcfg),
     }
 

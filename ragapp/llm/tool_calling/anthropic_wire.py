@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from ragapp.llm.registry import DEFAULT_MAX_TOKENS
+from ragapp.settings import COMPILER_MAX_OUTPUT_TOKENS
 from ragapp.llm.tool_calling.common import (
     EmptyResponseError,
     build_assistant_message,
@@ -141,15 +142,26 @@ def generate_step(client, model, pcfg, contents, function_declarations, system_i
 
 
 def generate_json(client, model, prompt, pcfg, label):
-    try:
-        response = client.messages.create(
-            model=model,
-            system=JSON_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=_max_tokens(pcfg),
-        )
-    except Exception as exc:
-        raise RuntimeError(f"{label} JSON request failed for model '{model}': {exc}") from exc
+    configured = _max_tokens(pcfg)
+    # Compilation needs far more room than the 8192 chat default, otherwise the model compresses.
+    # A model with a lower output ceiling rejects the larger value, so fall back to the configured one.
+    caps = [max(configured, COMPILER_MAX_OUTPUT_TOKENS)]
+    if caps[0] != configured:
+        caps.append(configured)
+    last_exc = None
+    for cap in caps:
+        try:
+            response = client.messages.create(
+                model=model,
+                system=JSON_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=cap,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+    else:
+        raise RuntimeError(f"{label} JSON request failed for model '{model}': {last_exc}") from last_exc
 
     text = "".join(
         b.text for b in (response.content or []) if getattr(b, "type", None) == "text"

@@ -349,22 +349,39 @@ class CognitionStore:
         path = self._object_path(kind, str(ident))
         return self._read_json(path, {})
 
-    @staticmethod
-    def _append_text(existing: str, addition: str) -> str:
+    _STOP = frozenset("the a an and or of to in on at by for with from as is are was were be been this that these those it its into than then".split())
+
+    @classmethod
+    def _content_tokens(cls, text: str) -> frozenset:
+        """Lower-cased content words, crudely stemmed (first 5 letters) so rewordings compare equal."""
+        return frozenset(w[:5] for w in re.findall(r"[a-z0-9]+", str(text).casefold()) if len(w) > 2 and w not in cls._STOP)
+
+    @classmethod
+    def _append_text(cls, existing: str, addition: str) -> str:
         addition = str(addition or "").strip()
         existing = str(existing or "").strip()
         if not addition:
             return existing
-        # Treat paragraphs as atomic knowledge units. Exact repeats are ignored,
-        # but later source-derived additions are never allowed to replace earlier ones.
+        # Paragraphs are atomic knowledge units and later additions never replace earlier ones.
+        # Recompiling the same source restates the same facts in new words, so a paragraph that
+        # (nearly) restates one we already hold is dropped. If it restates it with clearly more
+        # detail it takes the place of the thinner version, which it fully contains.
         old = [x.strip() for x in existing.split("\n\n") if x.strip()]
         new = [x.strip() for x in addition.split("\n\n") if x.strip()]
-        seen = {re.sub(r"\s+", " ", x).casefold() for x in old}
         for paragraph in new:
-            key = re.sub(r"\s+", " ", paragraph).casefold()
-            if key not in seen:
+            toks = cls._content_tokens(paragraph)
+            for i, held in enumerate(old):
+                held_toks = cls._content_tokens(held)
+                shared = len(toks & held_toks)
+                union = len(toks | held_toks) or 1
+                if len(toks) >= 6 and len(held_toks) >= 6 and shared / union >= 0.8:
+                    if len(paragraph) > 1.25 * len(held) and shared / (len(held_toks) or 1) >= 0.85:
+                        old[i] = paragraph
+                    break
+                if paragraph.casefold() == held.casefold():
+                    break
+            else:
                 old.append(paragraph)
-                seen.add(key)
         return "\n\n".join(old)
 
     @staticmethod

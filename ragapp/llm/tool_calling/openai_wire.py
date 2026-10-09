@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ragapp.settings import COMPILER_MAX_OUTPUT_TOKENS
 from ragapp.llm.tool_calling.common import (
     EmptyResponseError,
     build_assistant_message,
@@ -99,29 +100,26 @@ def generate_step(client, model, pcfg, contents, function_declarations, system_i
 
 
 def generate_json(client, model, prompt, label):
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": JSON_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-    except Exception:
-        # Some deployments reject response_format; retry as a plain request.
+    messages = [
+        {"role": "system", "content": JSON_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    # Most specific request first; some deployments reject response_format or an explicit output
+    # cap (older models), so fall back one step at a time rather than dropping everything at once.
+    attempts = (
+        {"response_format": {"type": "json_object"}, "max_completion_tokens": COMPILER_MAX_OUTPUT_TOKENS},
+        {"response_format": {"type": "json_object"}},
+        {},
+    )
+    last_exc = None
+    for extra in attempts:
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": JSON_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            )
+            response = client.chat.completions.create(model=model, messages=messages, **extra)
+            break
         except Exception as exc:
-            raise RuntimeError(
-                f"{label} JSON request failed for model '{model}': {exc}"
-            ) from exc
+            last_exc = exc
+    else:
+        raise RuntimeError(f"{label} JSON request failed for model '{model}': {last_exc}") from last_exc
 
     if not response.choices:
         raise RuntimeError(f"{label} returned no choices for JSON request '{model}'.")
