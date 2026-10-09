@@ -31,7 +31,7 @@ function Rendered({ blob, kind }) {
   const ref = useRef(null);
   const [state, setState] = useState({ loading: true, error: '' });
   useEffect(() => {
-    let live = true;
+    let live = true, ro = null;
     const el = ref.current;
     setState({ loading: true, error: '' });
     (async () => {
@@ -40,6 +40,17 @@ function Rendered({ blob, kind }) {
         if (kind === 'docx') {
           const { renderAsync } = await import('docx-preview');
           await renderAsync(buf, el, undefined, { inWrapper: true, ignoreLastRenderedPageBreak: true });
+          // Pages render at their real width (~816px) and are centred, so a narrower pane clips the
+          // left edge unreachably. Scale the wrapper to the pane instead, and refit on resize.
+          const fit = () => {
+            const wrap = el.querySelector('.docx-wrapper'), page = wrap?.querySelector('section.docx');
+            if (!wrap || !page) return;
+            wrap.style.zoom = '';
+            const need = page.offsetWidth + 32, have = el.clientWidth - 24;
+            if (need > have && have > 0) wrap.style.zoom = String(have / need);
+          };
+          fit();
+          ro = new ResizeObserver(fit); ro.observe(el);
         } else {
           const { init } = await import('pptx-preview');
           const width = Math.max(480, el.clientWidth - 32);
@@ -48,7 +59,7 @@ function Rendered({ blob, kind }) {
         if (live) setState({ loading: false, error: '' });
       } catch (e) { if (live) setState({ loading: false, error: e?.message || String(e) }); }
     })();
-    return () => { live = false; el.innerHTML = ''; };
+    return () => { live = false; ro?.disconnect(); el.innerHTML = ''; };
   }, [blob, kind]);
   return <>{state.loading && <div className="loading"><span className="spinner"/>Rendering…</div>}{state.error && <pre className="preview-error">{state.error}</pre>}<div ref={ref} className={`office-${kind}`} /></>;
 }

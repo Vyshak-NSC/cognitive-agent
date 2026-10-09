@@ -10,6 +10,9 @@ import {
 } from 'lucide-react';
 import { api, streamChat } from './api';
 
+// Formats the text editor cannot round-trip: shown in the preview pane only.
+const PREVIEW_ONLY = /\.(docx|pptx|xlsx|xls|pdf|png|jpe?g|gif|webp|bmp|ico)$/i;
+
 const NAV = [
   ['chat', 'Chat', MessageCircle],
   ['files', 'Files', Folder],
@@ -38,11 +41,11 @@ function Toast({ message, kind = 'info', onClose }) {
   if (!message) return null;
   return <div className={`toast ${kind}`} onClick={onClose}><span>{message}</span><X size={15}/></div>;
 }
-function Modal({ title, children, onClose, wide = false, flush = false }) {
+function Modal({ title, children, onClose, wide = false }) {
   useEffect(() => { const h = e => e.key === 'Escape' && onClose(); window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h); }, [onClose]);
   return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}>
-    <div className={`modal ${wide ? 'wide' : ''} ${flush ? 'flush' : ''}`} role="dialog" aria-modal="true">
-      <div className="modal-head"><h3>{title}</h3><button className="icon-btn" onClick={onClose}><X size={17}/></button></div>
+    <div className={`modal ${wide ? 'wide' : ''}`} role="dialog" aria-modal="true">
+      <div className="modal-head"><h3>{title}</h3><button className="icon-btn" onClick={onClose} data-tip="Close" data-tip-align="end" aria-label="Close"><X size={17}/></button></div>
       <div className="modal-body">{children}</div>
     </div>
   </div>;
@@ -77,7 +80,6 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [projectModal, setProjectModal] = useState(null);
   const [sessionModal, setSessionModal] = useState(null);
-  const [preview, setPreview] = useState(null);
 
   const notify = (message, kind = 'info') => { setToast({ message, kind }); setTimeout(() => setToast(null), 3600); };
   const onError = e => notify(e?.message || String(e), 'error');
@@ -108,7 +110,7 @@ export default function App() {
   const logout = () => {
     setUsername(''); setProject(''); setSessionId(''); setAgentId(''); setSection('chat');
     setProjects([]); setSessions([]); setAgents([]); setProjectStatus(null); setPendingDrafts(0);
-    setProjectModal(null); setSessionModal(null); setPreview(null);
+    setProjectModal(null); setSessionModal(null);
   };
   const chooseProject = async p => { setProject(p); setSessionId(''); setSection('chat'); };
   const createProject = async name => {
@@ -134,29 +136,26 @@ export default function App() {
 
   if (!username) return <Login onLogin={setUsername}/>;
 
-  if (!project) return <div className="app"><Topbar username={username} onLogout={logout} project="" projects={projects} onProject={chooseProject} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/><main className="main"><EmptyState icon={FolderOpen} title="No project selected" text="Create a project or choose one from the top bar to begin."/><Button variant="primary" icon={Plus} onClick={() => setProjectModal('create')}>Create project</Button></main>{projectModal && <ProjectModal mode={projectModal} project={project} onClose={() => setProjectModal(null)} onCreate={createProject} onRename={renameProject} onDelete={deleteProject} busy={busy}/>}<Toast {...toast} onClose={() => setToast(null)}/></div>;
+  if (!project) return <div className="app"><Topbar username={username} onLogout={logout} project="" projects={projects} onProject={chooseProject} onProjectAction={setProjectModal} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/><main className="main"><EmptyState icon={FolderOpen} title="No project selected" text="Create a project or choose one from the top bar to begin."/><Button variant="primary" icon={Plus} onClick={() => setProjectModal('create')}>Create project</Button></main>{projectModal && <ProjectModal mode={projectModal} project={project} onClose={() => setProjectModal(null)} onCreate={createProject} onRename={renameProject} onDelete={deleteProject} busy={busy}/>}<Toast {...toast} onClose={() => setToast(null)}/></div>;
 
   return <div className="app">
-    <Topbar username={username} onLogout={logout} project={project} projects={projects} onProject={chooseProject} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/>
+    <Topbar username={username} onLogout={logout} project={project} projects={projects} onProject={chooseProject} onProjectAction={setProjectModal} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/>
     <div className="utilitybar">
       <div className="utility-left">
         <Toggle value={previewEnabled === 'true'} onChange={v => setPreviewEnabled(String(v))} label="Show preview"/>
         <Toggle value={showExecution === 'true'} onChange={v => setShowExecution(String(v))} label="Show execution"/>
         <span className="dot-divider"/>
-        <span className="muted">Project</span>
-        <span className="pill">{project}</span>
         <span className="muted">Agent</span>
         <select className="compact-select" value={agentId} onChange={e => setAgentId(e.target.value)}><option value="">Default agent</option>{agents.filter(a => a.enabled !== false).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select>
       </div>
       <div className="utility-right">
         <span className="status-dot"/> <span className="muted">{projectStatus?.source_file_count + projectStatus?.workspace_file_count || 0} files</span>
         <span className="muted">{projectStatus?.counts?.entities || 0} entities</span>
-        <ProjectMenu onAction={setProjectModal}/>
       </div>
     </div>
     <main className={`main ${section === 'chat' || section === 'files' ? 'fill' : ''}`}>
       {section === 'chat' && <ChatView username={username} project={project} sessionId={sessionId} sessions={sessions} agentId={agentId} showExecution={showExecution === 'true'} previewEnabled={previewEnabled === 'true'} setSessionId={setSessionId} refreshProject={refreshProject} onError={onError} notify={notify} setSessionModal={setSessionModal}/>} 
-      {section === 'files' && <FilesView username={username} project={project} notify={notify} onError={onError} setPreview={setPreview}/>} 
+      {section === 'files' && <FilesView username={username} project={project} notify={notify} onError={onError}/>} 
       {section === 'cognition' && <CognitionView username={username} project={project} notify={notify} onError={onError}/>} 
       {section === 'review' && <ReviewView username={username} project={project} notify={notify} onError={onError}/>} 
       {section === 'instructions' && <InstructionsView username={username} project={project} notify={notify} onError={onError}/>} 
@@ -165,18 +164,18 @@ export default function App() {
     </main>
     {projectModal && <ProjectModal mode={projectModal} project={project} onClose={() => setProjectModal(null)} onCreate={createProject} onRename={renameProject} onDelete={deleteProject} busy={busy}/>} 
     {sessionModal && <SessionModal mode={sessionModal} onClose={() => setSessionModal(null)} onCreate={createSession} onRename={renameSession} onDelete={deleteSession} busy={busy}/>} 
-    {preview && <PreviewModal data={preview} username={username} project={project} onClose={() => setPreview(null)}/>} 
     <Toast {...toast} onClose={() => setToast(null)}/>
   </div>;
 }
 
-function Topbar({ username, onLogout, project, projects, onProject, section, setSection, pendingDrafts }) {
+function Topbar({ username, onLogout, project, projects, onProject, onProjectAction, section, setSection, pendingDrafts }) {
   return <header className="topbar">
     <div className="brand"><div className="brand-mark"><Brain size={20}/></div><div><strong>Cognitive Persistence</strong><small>Persistent project cognition</small></div></div>
-    <nav className="navtabs">{NAV.map(([id,label,Icon]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}><Icon size={16}/><span>{label}</span>{id === 'review' && pendingDrafts > 0 && <b className="badge">{pendingDrafts}</b>}</button>)}</nav>
+    <nav className="navtabs">{NAV.map(([id,label,Icon]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)} data-tip={label} aria-label={label}><Icon size={16}/><span>{label}</span>{id === 'review' && pendingDrafts > 0 && <b className="badge">{pendingDrafts}</b>}</button>)}</nav>
     <div className="top-actions">
       <select className="top-select" value={project} onChange={e => onProject(e.target.value)} aria-label="Project">{projects.map(p => <option key={p}>{p}</option>)}</select>
-      <div className="user-chip"><span className="avatar">{username[0].toUpperCase()}</span><span>{username}</span><button className="icon-btn" onClick={onLogout} title="Log out" aria-label="Log out"><LogOut size={16}/></button></div>
+      <ProjectMenu hasProject={!!project} onAction={onProjectAction}/>
+      <div className="user-chip"><span className="avatar">{username[0].toUpperCase()}</span><span>{username}</span><button className="icon-btn" onClick={onLogout} data-tip="Log out" data-tip-align="end" aria-label="Log out"><LogOut size={16}/></button></div>
     </div>
   </header>;
 }
@@ -191,7 +190,7 @@ function Login({ onLogin }) {
   </form></div>;
 }
 
-function ProjectMenu({ onAction }) {
+function ProjectMenu({ onAction, hasProject }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   useEffect(() => {
@@ -202,12 +201,12 @@ function ProjectMenu({ onAction }) {
   }, [open]);
   const pick = mode => { setOpen(false); onAction(mode); };
   return <div className="menu-wrap" ref={ref}>
-    <Button icon={MoreHorizontal} onClick={() => setOpen(o => !o)} aria-haspopup="menu" aria-expanded={open}>Project actions</Button>
+    <button className="btn icon-only" onClick={() => setOpen(o => !o)} aria-haspopup="menu" aria-expanded={open} aria-label="Project actions" data-tip={open ? undefined : 'Project actions'}><MoreHorizontal size={16}/></button>
     {open && <div className="menu" role="menu">
       <button role="menuitem" onClick={() => pick('create')}><Plus size={15}/>New project</button>
-      <button role="menuitem" onClick={() => pick('rename')}><Pencil size={15}/>Rename project</button>
+      <button role="menuitem" disabled={!hasProject} onClick={() => pick('rename')}><Pencil size={15}/>Rename project</button>
       <hr/>
-      <button role="menuitem" className="danger" onClick={() => pick('delete')}><Trash2 size={15}/>Delete project</button>
+      <button role="menuitem" className="danger" disabled={!hasProject} onClick={() => pick('delete')}><Trash2 size={15}/>Delete project</button>
     </div>}
   </div>;
 }
@@ -272,7 +271,7 @@ function ChatView({ username, project, sessionId, sessions, agentId, showExecuti
   // Follow new output only while the reader is at the bottom; never yank them back up.
   const onScroll = () => { const el = scrollRef.current; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96; };
   useLayoutEffect(() => { const el = scrollRef.current; if (el && stick.current) el.scrollTop = el.scrollHeight; }, [visible.length, liveText, sending, data]);
-  useLayoutEffect(() => { const el = inputRef.current; if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 200)}px`; }, [input]);
+  useLayoutEffect(() => { const el = inputRef.current; if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight + 2, Math.min(220, window.innerHeight * 0.3))}px`; }, [input]);
 
   const send = async (text, replacingTurnId = null) => {
     if (!text.trim() || sending || !sessionId) return;
@@ -309,7 +308,7 @@ function ChatView({ username, project, sessionId, sessions, agentId, showExecuti
             {sending && <div className="msg agent"><div className="msg-avatar"><Bot size={15}/></div><div className="bubble"><div className="live-label"><span className="spinner"/>Executing…</div>{plan && <div className="plan"><strong>Planned sections</strong>{plan.map((x, i) => <div key={i} className={i < done ? 'done' : ''}><span>{i < done ? '✓' : '•'}</span> {x}</div>)}</div>}<MarkdownContent>{liveText || 'Preparing the agent…'}</MarkdownContent></div></div>}
         </div>
         {editing && <div className="edit-dock"><textarea value={editing.text} onChange={e => setEditing({ ...editing, text: e.target.value })}/><div><Button onClick={() => setEditing(null)}>Cancel</Button><Button variant="primary" onClick={() => send(editing.text, editing.id)}>Submit edit</Button></div></div>}
-        <form className="chat-input" onSubmit={e => { e.preventDefault(); send(input); }}><textarea ref={inputRef} rows={1} value={input} onChange={e => setInput(e.target.value)} placeholder="Ask a question or give the agent a task…" onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(input); } }}/><button disabled={sending || !input.trim()} aria-label="Send"><ArrowUp size={18}/></button></form>
+        <form className="chat-input" onSubmit={e => { e.preventDefault(); send(input); }}><textarea ref={inputRef} rows={1} value={input} onChange={e => setInput(e.target.value)} placeholder="Ask a question or give the agent a task…" onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(input); } }}/><button disabled={sending || !input.trim()} aria-label="Send" data-tip="Send" data-tip-pos="top" data-tip-align="end"><ArrowUp size={18}/></button></form>
       </div>
       {previewEnabled && <PreviewPane username={username} project={project}/>}
     </div>
@@ -321,17 +320,23 @@ function Turn({ turn, allTurns, showExecution, onEdit, onActivate }) {
   const siblings = Object.values(allTurns || {}).filter(x => x.parent_id === turn.parent_id);
   const index = siblings.findIndex(x => x.id === turn.id);
   return <div>
-    <div className="msg user"><div className="bubble"><div className="msg-role">You</div><MarkdownContent>{turn.user?.content}</MarkdownContent><div className="turn-actions">{siblings.length > 1 && <span className="branch-count"><GitBranch size={13}/>{index + 1}/{siblings.length}</span>}<Button icon={Edit3} onClick={onEdit}>Edit</Button></div></div></div>
+    <div className="msg user"><div className="bubble"><div className="bubble-head"><span className="msg-role">You</span>{siblings.length > 1 && <span className="branch-count"><GitBranch size={13}/>{index + 1}/{siblings.length}</span>}<button className="icon-btn" onClick={onEdit} data-tip="Edit message" data-tip-align="end" aria-label="Edit message"><Edit3 size={14}/></button></div><MarkdownContent>{turn.user?.content}</MarkdownContent></div></div>
     <div className="msg agent"><div className="msg-avatar"><Bot size={15}/></div><div className="bubble"><div className="msg-role">Agent</div><MarkdownContent>{turn.assistant?.content || ''}</MarkdownContent>{showExecution && (turn.assistant?.execution_trace || turn.assistant?.tool_calls?.length > 0) && <div className="trace-box"><button className="trace-head" onClick={() => setTraceOpen(!traceOpen)}>{traceOpen ? <ChevronDown size={15}/> : <ChevronRight size={15}/>} Execution trace {turn.assistant?.execution_trace?.events ? `· ${turn.assistant.execution_trace.events.length} events` : `· ${turn.assistant?.tool_calls?.length || 0} tool calls`}</button>{traceOpen && <div className="trace-body">{turn.assistant?.execution_trace ? safeArray(turn.assistant.execution_trace.events).map((e,i)=><div className="trace-event" key={i}><strong>{e.seq ?? i+1}. {String(e.type || 'event').replaceAll('_',' ')}</strong>{e.elapsed_ms != null && <span>{e.elapsed_ms} ms</span>}<JsonBlock value={e.data || {}}/></div>) : safeArray(turn.assistant?.tool_calls).map((c,i)=><div className="trace-event" key={i}><strong>Tool call {i+1}: {c.tool || 'unknown'}</strong><JsonBlock value={c.args}/>{c.result != null && <JsonBlock value={c.result}/>}</div>)}</div>}</div>}{siblings.length > 1 && <select className="branch-select" value={turn.id} onChange={e => onActivate(e.target.value)}>{siblings.map(x => <option key={x.id} value={x.id}>{(x.user?.content || x.id).slice(0, 50)}</option>)}</select>}</div></div>
   </div>;
 }
 
-function FilesView({ username, project, notify, onError, setPreview }) {
+function FilesView({ username, project, notify, onError }) {
   const [files, setFiles] = useState([]); const [area, setArea] = useState('all'); const [query, setQuery] = useState(''); const [selected, setSelected] = useState(null); const [content, setContent] = useState(''); const [dirty, setDirty] = useState(false); const [modal, setModal] = useState(null); const [history, setHistory] = useState([]);
+  const [mode, setMode] = useState('edit');
+  const [editable, setEditable] = useState(true);
   const load = async () => { try { const f = await api.files(username, project, area === 'all' ? undefined : area); setFiles(f || []); } catch(e) { onError(e); } };
   useEffect(() => { load(); }, [username, project, area]);
   const filtered = files.filter(f => `${f.area}/${f.path}`.toLowerCase().includes(query.toLowerCase()));
-  const open = async f => { setSelected(f); try { const r = await api.fileText(username, project, f.area, f.path); setContent(r.content); setDirty(false); } catch(e) { setPreview({ area: f.area, path: f.path }); } };
+  const open = async f => {
+    setSelected(f); setContent(''); setDirty(false);
+    if (PREVIEW_ONLY.test(f.path)) { setEditable(false); setMode('preview'); return; }
+    setEditable(true); setMode('edit');
+    try { const r = await api.fileText(username, project, f.area, f.path); setContent(r.content); setDirty(false); } catch(e) { setEditable(false); setMode('preview'); } };
   const save = async () => { if (!selected) return; try { await api.writeFile(username, project, selected.area, selected.path, { content, overwrite: true, message: `Edit ${selected.path}` }); setDirty(false); await load(); notify('File saved', 'success'); } catch(e) { onError(e); } };
   const newFile = async ({ area: a, path, content: c }) => { try { await api.writeFile(username, project, a, path, { content: c || '', overwrite: false, message: `Create ${path}` }); await load(); setModal(null); notify('File created', 'success'); } catch(e) { onError(e); } };
   const remove = async f => { if (!confirm(`Delete ${f.area}/${f.path}?`)) return; try { await api.deleteFile(username, project, f.area, f.path); if (selected?.path === f.path && selected?.area === f.area) { setSelected(null); setContent(''); } await load(); notify('File deleted', 'success'); } catch(e) { onError(e); } };
@@ -339,17 +344,15 @@ function FilesView({ username, project, notify, onError, setPreview }) {
   const moveCopy = async (f, copy) => setModal({ type: copy ? 'copy' : 'move', file:f });
   const performMoveCopy = async (body, copy) => { try { await (copy ? api.copyFile(username, project, body) : api.moveFile(username, project, body)); await load(); setModal(null); notify(copy ? 'File copied' : 'File moved', 'success'); } catch(e) { onError(e); } };
   return <div className="page"><div className="page-head"><div><h2>Files</h2><p>General-purpose project file management across Source and Workspace.</p></div><div className="row-actions"><Button icon={RefreshCw} onClick={load}>Refresh</Button><Button variant="primary" icon={FilePlus2} onClick={() => setModal({type:'new'})}>New file</Button></div></div>
-    <div className="files-layout"><aside className="file-sidebar"><div className="segmented"><button className={area==='all'?'active':''} onClick={()=>setArea('all')}>All</button><button className={area==='source'?'active':''} onClick={()=>setArea('source')}>Source</button><button className={area==='workspace'?'active':''} onClick={()=>setArea('workspace')}>Workspace</button></div><div className="search"><Search size={15}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter files…"/></div><div className="file-list">{filtered.map(f=><button key={`${f.area}/${f.path}`} className={`file-row ${selected?.path===f.path&&selected?.area===f.area?'selected':''}`} onClick={()=>open(f)}><FileIcon suffix={f.suffix}/><span><b>{f.path.split('/').pop()}</b><small>{f.area} · {fmtBytes(f.size)}</small></span></button>)}{!filtered.length&&<div className="muted pad">No files found.</div>}</div></aside><section className="editor-panel">{selected ? <><div className="editor-head"><div><strong>{selected.path}</strong><span>{selected.area} · {fmtBytes(selected.size)}</span></div><div className="row-actions"><Button icon={Eye} onClick={()=>setPreview({area:selected.area,path:selected.path})}>Preview</Button><Button icon={History} onClick={()=>loadHistory(selected)}>History</Button><Button icon={Copy} onClick={()=>moveCopy(selected,true)}>Copy</Button><Button icon={ArrowDownToLine} onClick={()=>moveCopy(selected,false)}>Move</Button><Button variant="danger" icon={Trash2} onClick={()=>remove(selected)}>Delete</Button><Button variant="primary" icon={Save} disabled={!dirty} onClick={save}>Save</Button></div></div><textarea className="code-editor" value={content} onChange={e=>{setContent(e.target.value);setDirty(true)}} spellCheck="false"/></> : <EmptyState icon={FileText} title="Select a file" text="Choose a Source or Workspace file to inspect and edit it."/>}</section></div>
-    {modal?.type==='new' && <FileModal title="New file" onClose={()=>setModal(null)} onSubmit={newFile}/>} {modal?.type==='history' && <HistoryModal file={modal.file} history={history} onClose={()=>setModal(null)} onRevision={async c=>{try{const r=await api.fileRevision(username,project,modal.file.area,modal.file.path,c);setContent(r.content);setDirty(true);setModal(null);notify('Revision loaded into editor')}catch(e){onError(e)}}}/>} {modal?.type==='move'||modal?.type==='copy' ? <MoveModal file={modal.file} copy={modal.type==='copy'} onClose={()=>setModal(null)} onSubmit={b=>performMoveCopy(b,modal.type==='copy')}/>:null}
+    <div className="files-layout"><aside className="file-sidebar"><div className="segmented"><button className={area==='all'?'active':''} onClick={()=>setArea('all')}>All</button><button className={area==='source'?'active':''} onClick={()=>setArea('source')}>Source</button><button className={area==='workspace'?'active':''} onClick={()=>setArea('workspace')}>Workspace</button></div><div className="search"><Search size={15}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter files…"/></div><div className="file-list">{filtered.map(f=><button key={`${f.area}/${f.path}`} className={`file-row ${selected?.path===f.path&&selected?.area===f.area?'selected':''}`} onClick={()=>open(f)}><FileIcon suffix={f.suffix}/><span><b>{f.path.split('/').pop()}</b><small>{f.area} · {fmtBytes(f.size)}</small></span></button>)}{!filtered.length&&<div className="muted pad">No files found.</div>}</div></aside><section className="editor-panel">{selected ? <><div className="editor-head"><div><strong>{selected.path}</strong><span>{selected.area} · {fmtBytes(selected.size)}</span></div><div className="row-actions">{mode==='preview'?<Button icon={Pencil} disabled={!editable} onClick={()=>setMode('edit')}>Edit</Button>:<Button icon={Eye} onClick={()=>setMode('preview')}>Preview</Button>}<Button icon={History} onClick={()=>loadHistory(selected)}>History</Button><Button icon={Copy} onClick={()=>moveCopy(selected,true)}>Copy</Button><Button icon={ArrowDownToLine} onClick={()=>moveCopy(selected,false)}>Move</Button><Button variant="danger" icon={Trash2} onClick={()=>remove(selected)}>Delete</Button><Button variant="primary" icon={Save} disabled={!dirty} onClick={save}>Save</Button></div></div>{mode==='preview'?<FilePreview username={username} project={project} area={selected.area} path={selected.path} text={dirty?content:undefined}/>:<textarea className="code-editor" value={content} onChange={e=>{setContent(e.target.value);setDirty(true)}} spellCheck="false"/>}</> : <EmptyState icon={FileText} title="Select a file" text="Choose a Source or Workspace file to inspect and edit it."/>}</section></div>
+    {modal?.type==='new' && <FileModal title="New file" onClose={()=>setModal(null)} onSubmit={newFile}/>} {modal?.type==='history' && <HistoryModal file={modal.file} history={history} onClose={()=>setModal(null)} onRevision={async c=>{try{const r=await api.fileRevision(username,project,modal.file.area,modal.file.path,c);setContent(r.content);setDirty(true);setMode('edit');setModal(null);notify('Revision loaded into editor')}catch(e){onError(e)}}}/>} {modal?.type==='move'||modal?.type==='copy' ? <MoveModal file={modal.file} copy={modal.type==='copy'} onClose={()=>setModal(null)} onSubmit={b=>performMoveCopy(b,modal.type==='copy')}/>:null}
   </div>;
 }
 function FileIcon({suffix}) { return suffix === '.py' || suffix === '.js' || suffix === '.ts' ? <FileCode2 size={16}/> : <FileText size={16}/>; }
 function FileModal({ title, onClose, onSubmit }) { const [area,setArea]=useState('source');const[path,setPath]=useState('');const[content,setContent]=useState('');return <Modal title={title} onClose={onClose}><div className="two"><label>Area<select value={area} onChange={e=>setArea(e.target.value)}><option>source</option><option>workspace</option></select></label><label>Path<input value={path} onChange={e=>setPath(e.target.value)} placeholder="folder/file.txt"/></label></div><label>Initial content<textarea value={content} onChange={e=>setContent(e.target.value)} rows={12}/></label><div className="modal-actions"><Button onClick={onClose}>Cancel</Button><Button variant="primary" disabled={!path.trim()} onClick={()=>onSubmit({area,path,content})}>Create</Button></div></Modal>; }
 function MoveModal({ file, copy, onClose, onSubmit }) { const [area,setArea]=useState(file.area);const[path,setPath]=useState(file.path);return <Modal title={copy?'Copy file':'Move file'} onClose={onClose}><p className="muted">{file.area}/{file.path}</p><div className="two"><label>Destination area<select value={area} onChange={e=>setArea(e.target.value)}><option>source</option><option>workspace</option></select></label><label>Destination path<input value={path} onChange={e=>setPath(e.target.value)}/></label></div><div className="modal-actions"><Button onClick={onClose}>Cancel</Button><Button variant="primary" onClick={()=>onSubmit({source_area:file.area,source_path:file.path,destination_area:area,destination_path:path,message:`${copy?'Copy':'Move'} ${file.path}`})}>{copy?'Copy':'Move'}</Button></div></Modal>; }
 function HistoryModal({ file, history, onClose, onRevision }) { return <Modal title={`History · ${file.path}`} wide onClose={onClose}><div className="history-list">{safeArray(history).map((h,i)=><div className="history-item" key={i}><div><strong>{h.commit || h.id || `Revision ${i+1}`}</strong><small>{h.message || h.description || ''}</small></div>{h.commit && <Button onClick={()=>onRevision(h.commit)}>Load</Button>}</div>)}{!history.length&&<div className="muted">No history available.</div>}</div></Modal>; }
-function PreviewModal({ data, username, project, onClose }) { return <Modal title={`${data.area}/${data.path}`} wide flush onClose={onClose}><FilePreview username={username} project={project} area={data.area} path={data.path}/></Modal>; }
-
-function CognitionView({ username, project, notify, onError }) { const [o,setO]=useState(null);const[chosen,setChosen]=useState([]);const[compiling,setCompiling]=useState(false);const[element,setElement]=useState('');const[impact,setImpact]=useState(null);const load=async()=>{try{setO(await api.cognitionOverview(username,project))}catch(e){onError(e)}};useEffect(()=>{load()},[username,project]);const files=o?.available_files||[];const metrics=[['entities','Entities'],['relationships','Relationships'],['events','Events'],['locations','Locations'],['concepts','Concepts'],['definitions','Definitions'],['knowledge','Knowledge']];const compile=async()=>{setCompiling(true);try{const r=await api.compile(username,project,chosen);setO(x=>({...x,...r,state:r.state,counts:r.counts}));notify('Cognition compilation complete','success')}catch(e){onError(e)}finally{setCompiling(false)}};return <div className="page"><div className="page-head"><div><h2>Persistent cognition</h2><p>Project-scoped world model compiled from Source and Workspace artifacts.</p></div><Button icon={RefreshCw} onClick={load}>Refresh</Button></div><div className="metric-grid">{metrics.map(([k,l])=><div className="metric" key={k}><span>{l}</span><strong>{o?.counts?.[k] ?? 0}</strong></div>)}<div className="metric"><span>Version</span><strong>{o?.state?.current_version ?? 0}</strong></div></div>{o?.state?.compiled?<div className="alert success">Cognition has been compiled from project artifacts.</div>:<div className="alert info">Cognition is ready but has not been compiled from project artifacts. This does not block chat or file work.</div>}<section className="card"><div className="card-head"><div><h3>Compile selected files</h3><p>Select the artifacts that should participate in this cognition build.</p></div><Button variant="primary" icon={Play} disabled={!chosen.length||compiling} onClick={compile}>{compiling?'Compiling…':'Compile selected files'}</Button></div><div className="check-grid">{files.map(f=>{const key=`${f.area}|${f.path}`;return <label className="check-item" key={key}><input type="checkbox" checked={chosen.includes(key)} onChange={e=>setChosen(v=>e.target.checked?[...v,key]:v.filter(x=>x!==key))}/><span><b>[{f.area}] {f.path}</b><small>{f.size || ''}</small></span></label>})}</div></section><JsonDisclosure title="Ledger" value={o?.ledger}/><JsonDisclosure title="Relationships" value={o?.relationships}/><JsonDisclosure title="State map" value={o?.state}/><section className="card"><div className="card-head"><div><h3>Impact analysis</h3><p>Inspect how a cognition element affects the project.</p></div><div className="impact-row"><input value={element} onChange={e=>setElement(e.target.value)} placeholder="Entity / element"/><Button onClick={async()=>{try{setImpact(await api.impact(username,project,element))}catch(e){onError(e)}}}>Analyze</Button></div></div>{impact&&<JsonBlock value={impact}/>}</section></div>; }
+function CognitionView({ username, project, notify, onError }) { const [o,setO]=useState(null);const[chosen,setChosen]=useState([]);const[compiling,setCompiling]=useState(false);const[element,setElement]=useState('');const[impact,setImpact]=useState(null);const[result,setResult]=useState(null);useEffect(()=>{if(!result)return;const t=setTimeout(()=>setResult(null),6000);return()=>clearTimeout(t)},[result]);const load=async()=>{try{setO(await api.cognitionOverview(username,project))}catch(e){onError(e)}};useEffect(()=>{load()},[username,project]);const files=o?.available_files||[];const metrics=[['entities','Entities'],['relationships','Relationships'],['events','Events'],['locations','Locations'],['concepts','Concepts'],['definitions','Definitions'],['knowledge','Knowledge']];const compile=async()=>{setCompiling(true);setResult(null);try{const r=await api.compile(username,project,chosen);setO(x=>({...x,...r,state:r.state,counts:r.counts}));setResult({kind:'success',text:'Cognition compiled from the selected files.'})}catch(e){setResult({kind:'error',text:e.message||String(e)})}finally{setCompiling(false)}};return <div className="page"><div className="page-head"><div><h2>Persistent cognition</h2><p>Project-scoped world model compiled from Source and Workspace artifacts.</p></div><Button icon={RefreshCw} onClick={load}>Refresh</Button></div><div className="metric-grid">{metrics.map(([k,l])=><div className="metric" key={k}><span>{l}</span><strong>{o?.counts?.[k] ?? 0}</strong></div>)}<div className="metric"><span>Version</span><strong>{o?.state?.current_version ?? 0}</strong></div></div>{result?<div className={`alert ${result.kind}`} role="status">{result.text}</div>:!o?.state?.compiled&&<div className="alert info">Cognition is ready but has not been compiled from project artifacts. This does not block chat or file work.</div>}<section className="card"><div className="card-head"><div><h3>Compile selected files</h3><p>Select the artifacts that should participate in this cognition build.</p></div><Button variant="primary" icon={Play} disabled={!chosen.length||compiling} onClick={compile}>{compiling?'Compiling…':'Compile selected files'}</Button></div><div className="check-grid">{files.map(f=>{const key=`${f.area}|${f.path}`;return <label className="check-item" key={key}><input type="checkbox" checked={chosen.includes(key)} onChange={e=>setChosen(v=>e.target.checked?[...v,key]:v.filter(x=>x!==key))}/><span><b>[{f.area}] {f.path}</b><small>{f.size || ''}</small></span></label>})}</div></section><JsonDisclosure title="Ledger" value={o?.ledger}/><JsonDisclosure title="Relationships" value={o?.relationships}/><JsonDisclosure title="State map" value={o?.state}/><section className="card"><div className="card-head"><div><h3>Impact analysis</h3><p>Inspect how a cognition element affects the project.</p></div><div className="impact-row"><input value={element} onChange={e=>setElement(e.target.value)} placeholder="Entity / element"/><Button onClick={async()=>{try{setImpact(await api.impact(username,project,element))}catch(e){onError(e)}}}>Analyze</Button></div></div>{impact&&<JsonBlock value={impact}/>}</section></div>; }
 function JsonDisclosure({title,value}) { const[open,setOpen]=useState(false);return <div className="disclosure"><button onClick={()=>setOpen(!open)}>{open?<ChevronDown/>:<ChevronRight/>}<span>{title}</span></button>{open&&<JsonBlock value={value ?? {}}/>}</div>; }
 
 function ReviewView({ username, project, notify, onError }) { const[drafts,setDrafts]=useState([]);const[open,setOpen]=useState({});const[reason,setReason]=useState({});const load=async()=>{try{setDrafts(await api.drafts(username,project))}catch(e){onError(e)}};useEffect(()=>{load()},[username,project]);const save=async d=>{try{await api.saveDraft(username,project,d.id,{content:d.content,metadata:d.metadata||{}});notify('Draft saved','success');load()}catch(e){onError(e)}};return <div className="page"><div className="page-head"><div><h2>Draft review</h2><p>AI output is persisted in the workspace. Approval is the only path that writes an agent-generated change into /source.</p></div><Button icon={RefreshCw} onClick={load}>Refresh</Button></div>{!drafts.length?<EmptyState icon={ClipboardList} title="No drafts yet" text="Agent-generated drafts will appear here when a task creates one."/>:<div className="stack">{drafts.map(d=>{const meta=d.metadata||{};return <section className="draft card" key={d.id}><button className="draft-head" onClick={()=>setOpen(v=>({...v,[d.id]:!v[d.id]}))}><span className={`status ${d.status}`}>{String(d.status||'pending').toUpperCase()}</span><strong>{shortId(d.id)}</strong><span>{meta.target_file || 'conversation response'}</span>{open[d.id]?<ChevronDown/>:<ChevronRight/>}</button>{(open[d.id]||d.status==='pending')&&<div className="draft-body"><label>Draft content<textarea value={d.content||''} onChange={e=>setDrafts(v=>v.map(x=>x.id===d.id?{...x,content:e.target.value}:x))} rows={14}/></label><div className="two"><label>Target file<input value={meta.target_file||''} onChange={e=>setDrafts(v=>v.map(x=>x.id===d.id?{...x,metadata:{...meta,target_file:e.target.value}}:x))}/></label><label>Change description<input value={meta.change_description||''} onChange={e=>setDrafts(v=>v.map(x=>x.id===d.id?{...x,metadata:{...meta,change_description:e.target.value}}:x))}/></label></div>{d.status==='pending'&&<div className="row-actions"><Button icon={Save} onClick={()=>save(d)}>Save edits</Button><Button variant="primary" icon={ShieldCheck} onClick={async()=>{try{await api.approveDraft(username,project,d.id);notify('Approved and committed to source','success');load()}catch(e){onError(e)}}}>Approve</Button><Button icon={X} onClick={()=>setReason(v=>({...v,[d.id]:v[d.id]!==undefined?undefined:''}))}>Reject</Button>{reason[d.id]!==undefined&&<div className="reject-box"><textarea value={reason[d.id]} onChange={e=>setReason(v=>({...v,[d.id]:e.target.value}))} placeholder="Why was this rejected?"/><Button variant="danger" onClick={async()=>{try{await api.rejectDraft(username,project,d.id,reason[d.id]);notify('Draft rejected','success');load()}catch(e){onError(e)}}}>Confirm rejection</Button></div>}</div>}</div>}</section>})}</div>}</div>; }
