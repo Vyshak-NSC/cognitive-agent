@@ -2,13 +2,13 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import MarkdownContent from './components/Markdown';
 import FilePreview from './components/FilePreview';
 import {
-  Activity, Archive, ArrowDownToLine, ArrowUp, Bot, Brain, ChevronDown, ChevronRight,
-  ClipboardList, Clock3, Copy, Download, Edit3, Eye, FileCode2, FilePlus2, FileText,
-  Folder, FolderOpen, GitBranch, History, LayoutDashboard, Menu, MessageCircle, MoreHorizontal,
+  Archive, ArrowDownToLine, ArrowUp, Bot, Brain, ChevronDown, ChevronRight,
+  ClipboardList, Copy, Edit3, Eye, FileCode2, FilePlus2, FileText, LogOut,
+  Folder, FolderOpen, GitBranch, History, MessageCircle, MoreHorizontal,
   Pencil, Play, Plus, RefreshCw, Save, Search, Settings as SettingsIcon, ShieldCheck, Trash2,
-  Upload, X, Zap
+  X, Zap
 } from 'lucide-react';
-import { api, apiUrl, streamChat } from './api';
+import { api, streamChat } from './api';
 
 const NAV = [
   ['chat', 'Chat', MessageCircle],
@@ -61,7 +61,7 @@ function Toggle({ value, onChange, label }) {
 }
 
 export default function App() {
-  const [username, setUsername] = usePersisted('cpa.username', import.meta.env.VITE_DEFAULT_USERNAME || 'test');
+  const [username, setUsername] = usePersisted('cpa.username', import.meta.env.VITE_DEFAULT_USERNAME || '');
   const [project, setProject] = usePersisted('cpa.project', '');
   const [sessionId, setSessionId] = usePersisted('cpa.session', '');
   const [section, setSection] = usePersisted('cpa.section', 'chat');
@@ -105,6 +105,11 @@ export default function App() {
   useEffect(() => { if (project) refreshProject(project); }, [project]);
   useEffect(() => { document.title = project ? `CPA · ${project}` : 'Cognitive Persistence Agent'; }, [project]);
 
+  const logout = () => {
+    setUsername(''); setProject(''); setSessionId(''); setAgentId(''); setSection('chat');
+    setProjects([]); setSessions([]); setAgents([]); setProjectStatus(null); setPendingDrafts(0);
+    setProjectModal(null); setSessionModal(null); setPreview(null);
+  };
   const chooseProject = async p => { setProject(p); setSessionId(''); setSection('chat'); };
   const createProject = async name => {
     if (!name.trim()) return;
@@ -127,10 +132,12 @@ export default function App() {
     setBusy(true); try { const r = await api.deleteSession(username, project, sessionId); setSessions(r.sessions || []); setSessionId(r.sessions?.[0]?.id || ''); notify('Chat deleted', 'success'); setSessionModal(null); } catch (e) { onError(e); } finally { setBusy(false); }
   };
 
-  if (!project) return <div className="app"><Topbar username={username} setUsername={setUsername} project="" projects={projects} onProject={chooseProject} onCreate={() => setProjectModal('create')} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/><main className="main"><EmptyState icon={FolderOpen} title="No project selected" text="Create a project or choose one from the top bar to begin."/><Button variant="primary" icon={Plus} onClick={() => setProjectModal('create')}>Create project</Button></main>{projectModal && <ProjectModal mode={projectModal} project={project} onClose={() => setProjectModal(null)} onCreate={createProject} onRename={renameProject} onDelete={deleteProject} busy={busy}/>}<Toast {...toast} onClose={() => setToast(null)}/></div>;
+  if (!username) return <Login onLogin={setUsername}/>;
+
+  if (!project) return <div className="app"><Topbar username={username} onLogout={logout} project="" projects={projects} onProject={chooseProject} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/><main className="main"><EmptyState icon={FolderOpen} title="No project selected" text="Create a project or choose one from the top bar to begin."/><Button variant="primary" icon={Plus} onClick={() => setProjectModal('create')}>Create project</Button></main>{projectModal && <ProjectModal mode={projectModal} project={project} onClose={() => setProjectModal(null)} onCreate={createProject} onRename={renameProject} onDelete={deleteProject} busy={busy}/>}<Toast {...toast} onClose={() => setToast(null)}/></div>;
 
   return <div className="app">
-    <Topbar username={username} setUsername={setUsername} project={project} projects={projects} onProject={chooseProject} onCreate={() => setProjectModal('create')} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/>
+    <Topbar username={username} onLogout={logout} project={project} projects={projects} onProject={chooseProject} section={section} setSection={setSection} pendingDrafts={pendingDrafts}/>
     <div className="utilitybar">
       <div className="utility-left">
         <Toggle value={previewEnabled === 'true'} onChange={v => setPreviewEnabled(String(v))} label="Show preview"/>
@@ -144,12 +151,12 @@ export default function App() {
       <div className="utility-right">
         <span className="status-dot"/> <span className="muted">{projectStatus?.source_file_count + projectStatus?.workspace_file_count || 0} files</span>
         <span className="muted">{projectStatus?.counts?.entities || 0} entities</span>
-        <Button onClick={() => setProjectModal('actions')}><MoreHorizontal size={15}/>Project actions</Button>
+        <ProjectMenu onAction={setProjectModal}/>
       </div>
     </div>
-    <main className={`main ${section === 'chat' ? 'main-chat' : ''}`}>
+    <main className={`main ${section === 'chat' || section === 'files' ? 'fill' : ''}`}>
       {section === 'chat' && <ChatView username={username} project={project} sessionId={sessionId} sessions={sessions} agentId={agentId} showExecution={showExecution === 'true'} previewEnabled={previewEnabled === 'true'} setSessionId={setSessionId} refreshProject={refreshProject} onError={onError} notify={notify} setSessionModal={setSessionModal}/>} 
-      {section === 'files' && <FilesView username={username} project={project} notify={notify} onError={onError} previewEnabled={previewEnabled === 'true'} setPreview={setPreview}/>} 
+      {section === 'files' && <FilesView username={username} project={project} notify={notify} onError={onError} setPreview={setPreview}/>} 
       {section === 'cognition' && <CognitionView username={username} project={project} notify={notify} onError={onError}/>} 
       {section === 'review' && <ReviewView username={username} project={project} notify={notify} onError={onError}/>} 
       {section === 'instructions' && <InstructionsView username={username} project={project} notify={notify} onError={onError}/>} 
@@ -163,29 +170,59 @@ export default function App() {
   </div>;
 }
 
-function Topbar({ username, setUsername, project, projects, onProject, onCreate, section, setSection, pendingDrafts }) {
+function Topbar({ username, onLogout, project, projects, onProject, section, setSection, pendingDrafts }) {
   return <header className="topbar">
     <div className="brand"><div className="brand-mark"><Brain size={20}/></div><div><strong>Cognitive Persistence</strong><small>Persistent project cognition</small></div></div>
     <nav className="navtabs">{NAV.map(([id,label,Icon]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}><Icon size={16}/><span>{label}</span>{id === 'review' && pendingDrafts > 0 && <b className="badge">{pendingDrafts}</b>}</button>)}</nav>
     <div className="top-actions">
-      <select className="top-select" value={project} onChange={e => onProject(e.target.value)}>{projects.map(p => <option key={p}>{p}</option>)}</select>
-      <Button icon={Plus} onClick={onCreate}>New</Button>
-      <div className="user-chip"><span className="avatar">{(username || 'U')[0].toUpperCase()}</span><input value={username} onChange={e => setUsername(e.target.value)} aria-label="Username"/></div>
+      <select className="top-select" value={project} onChange={e => onProject(e.target.value)} aria-label="Project">{projects.map(p => <option key={p}>{p}</option>)}</select>
+      <div className="user-chip"><span className="avatar">{username[0].toUpperCase()}</span><span>{username}</span><button className="icon-btn" onClick={onLogout} title="Log out" aria-label="Log out"><LogOut size={16}/></button></div>
     </div>
   </header>;
 }
 
+function Login({ onLogin }) {
+  const [name, setName] = useState('');
+  return <div className="login"><form onSubmit={e => { e.preventDefault(); name.trim() && onLogin(name.trim()); }}>
+    <div className="brand"><div className="brand-mark"><Brain size={20}/></div><div><strong>Cognitive Persistence</strong><small>Persistent project cognition</small></div></div>
+    <h1>Sign in</h1>
+    <label className="muted">Username<input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Your username"/></label>
+    <Button variant="primary" type="submit" disabled={!name.trim()}>Continue</Button>
+  </form></div>;
+}
+
+function ProjectMenu({ onAction }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = e => { if (!ref.current?.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+  const pick = mode => { setOpen(false); onAction(mode); };
+  return <div className="menu-wrap" ref={ref}>
+    <Button icon={MoreHorizontal} onClick={() => setOpen(o => !o)} aria-haspopup="menu" aria-expanded={open}>Project actions</Button>
+    {open && <div className="menu" role="menu">
+      <button role="menuitem" onClick={() => pick('create')}><Plus size={15}/>New project</button>
+      <button role="menuitem" onClick={() => pick('rename')}><Pencil size={15}/>Rename project</button>
+      <hr/>
+      <button role="menuitem" className="danger" onClick={() => pick('delete')}><Trash2 size={15}/>Delete project</button>
+    </div>}
+  </div>;
+}
+
 function ProjectModal({ mode, project, onClose, onCreate, onRename, onDelete, busy }) {
-  const [name, setName] = useState(mode === 'rename' || mode === 'actions' ? project : '');
-  if (mode === 'actions') return <Modal title="Project actions" onClose={onClose}>
-    <div className="action-grid"><Button icon={Plus} variant="primary" onClick={() => onClose() || null}>Use New in top bar</Button></div>
-    <label>Rename current project<input value={name} onChange={e => setName(e.target.value)}/></label>
-    <div className="row-actions"><Button variant="primary" disabled={busy} onClick={() => onRename(name)}><Save size={15}/>Rename project</Button><Button variant="danger" disabled={busy} onClick={() => { if (confirm(`Delete project '${project}' permanently?`)) onDelete(); }}>Delete project</Button></div>
+  const [name, setName] = useState(mode === 'rename' ? project : '');
+  if (mode === 'delete') return <Modal title="Delete project" onClose={onClose}>
+    <p>Delete <strong>{project}</strong> permanently? Its files, chats and cognition are removed and this cannot be undone.</p>
+    <div className="modal-actions"><Button onClick={onClose}>Cancel</Button><Button variant="danger" icon={Trash2} disabled={busy} onClick={onDelete}>Delete project</Button></div>
   </Modal>;
-  return <Modal title={mode === 'create' ? 'Create new project' : 'Rename project'} onClose={onClose}>
-    <p className="muted">{mode === 'create' ? 'Create a project and configure its provider later from Settings.' : `Rename ${project}. Existing cognition, files and sessions stay with the project.`}</p>
-    <label>Project name<input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="e.g. invoice_pipeline"/></label>
-    <div className="modal-actions"><Button onClick={onClose}>Cancel</Button><Button variant="primary" disabled={busy || !name.trim()} onClick={() => mode === 'create' ? onCreate(name) : onRename(name)}>{mode === 'create' ? 'Create project' : 'Save name'}</Button></div>
+  const creating = mode === 'create';
+  return <Modal title={creating ? 'Create new project' : 'Rename project'} onClose={onClose}>
+    <p className="muted">{creating ? 'Create a project and configure its provider later from Settings.' : `Rename ${project}. Existing cognition, files and sessions stay with the project.`}</p>
+    <label>Project name<input autoFocus value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && name.trim() && (creating ? onCreate(name) : onRename(name))} placeholder="e.g. invoice_pipeline"/></label>
+    <div className="modal-actions"><Button onClick={onClose}>Cancel</Button><Button variant="primary" disabled={busy || !name.trim()} onClick={() => creating ? onCreate(name) : onRename(name)}>{creating ? 'Create project' : 'Save name'}</Button></div>
   </Modal>;
 }
 function SessionModal({ mode, onClose, onCreate, onRename, onDelete, busy }) {
@@ -267,11 +304,9 @@ function ChatView({ username, project, sessionId, sessions, agentId, showExecuti
     <div className="chat-split">
       <div className="chat-shell">
         <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
-          <div className="chat-thread">
             {!visible.length && !sending && <div className="chat-empty"><Zap size={24}/><div><strong>Start a task.</strong><p>You can ask the agent to create, inspect, edit, move, copy, or delete project files without uploading anything first.</p></div></div>}
             {visible.map((turn, idx) => <Turn key={turn.id || idx} turn={turn} allTurns={turns} showExecution={showExecution} onEdit={() => setEditing({ id: turn.id, text: turn.user?.content || '' })} onActivate={activate}/>)}
-            {sending && <div className="assistant-message live"><div className="message-avatar"><Bot size={15}/></div><div className="message-content"><div className="live-label"><span className="spinner"/>Executing…</div>{plan && <div className="plan"><strong>Planned sections</strong>{plan.map((x, i) => <div key={i} className={i < done ? 'done' : ''}><span>{i < done ? '✓' : '•'}</span> {x}</div>)}</div>}<MarkdownContent>{liveText || 'Preparing the agent…'}</MarkdownContent></div></div>}
-          </div>
+            {sending && <div className="msg agent"><div className="msg-avatar"><Bot size={15}/></div><div className="bubble"><div className="live-label"><span className="spinner"/>Executing…</div>{plan && <div className="plan"><strong>Planned sections</strong>{plan.map((x, i) => <div key={i} className={i < done ? 'done' : ''}><span>{i < done ? '✓' : '•'}</span> {x}</div>)}</div>}<MarkdownContent>{liveText || 'Preparing the agent…'}</MarkdownContent></div></div>}
         </div>
         {editing && <div className="edit-dock"><textarea value={editing.text} onChange={e => setEditing({ ...editing, text: e.target.value })}/><div><Button onClick={() => setEditing(null)}>Cancel</Button><Button variant="primary" onClick={() => send(editing.text, editing.id)}>Submit edit</Button></div></div>}
         <form className="chat-input" onSubmit={e => { e.preventDefault(); send(input); }}><textarea ref={inputRef} rows={1} value={input} onChange={e => setInput(e.target.value)} placeholder="Ask a question or give the agent a task…" onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(input); } }}/><button disabled={sending || !input.trim()} aria-label="Send"><ArrowUp size={18}/></button></form>
@@ -285,9 +320,9 @@ function Turn({ turn, allTurns, showExecution, onEdit, onActivate }) {
   const [traceOpen, setTraceOpen] = useState(false);
   const siblings = Object.values(allTurns || {}).filter(x => x.parent_id === turn.parent_id);
   const index = siblings.findIndex(x => x.id === turn.id);
-  return <div className="turn-pair">
-    <div className="user-message"><div className="message-avatar user">U</div><div className="message-content"><div className="message-role">You</div><MarkdownContent>{turn.user?.content}</MarkdownContent><div className="turn-actions"><Button icon={Edit3} onClick={onEdit}>Edit</Button>{siblings.length > 1 && <span className="branch-count"><GitBranch size={13}/>{index + 1}/{siblings.length}</span>}</div></div></div>
-    <div className="assistant-message"><div className="message-avatar"><Bot size={15}/></div><div className="message-content"><div className="message-role">Agent</div><MarkdownContent>{turn.assistant?.content || ''}</MarkdownContent>{showExecution && (turn.assistant?.execution_trace || turn.assistant?.tool_calls?.length > 0) && <div className="trace-box"><button className="trace-head" onClick={() => setTraceOpen(!traceOpen)}>{traceOpen ? <ChevronDown size={15}/> : <ChevronRight size={15}/>} Execution trace {turn.assistant?.execution_trace?.events ? `· ${turn.assistant.execution_trace.events.length} events` : `· ${turn.assistant?.tool_calls?.length || 0} tool calls`}</button>{traceOpen && <div className="trace-body">{turn.assistant?.execution_trace ? safeArray(turn.assistant.execution_trace.events).map((e,i)=><div className="trace-event" key={i}><strong>{e.seq ?? i+1}. {String(e.type || 'event').replaceAll('_',' ')}</strong>{e.elapsed_ms != null && <span>{e.elapsed_ms} ms</span>}<JsonBlock value={e.data || {}}/></div>) : safeArray(turn.assistant?.tool_calls).map((c,i)=><div className="trace-event" key={i}><strong>Tool call {i+1}: {c.tool || 'unknown'}</strong><JsonBlock value={c.args}/>{c.result != null && <JsonBlock value={c.result}/>}</div>)}</div>}</div>}{siblings.length > 1 && <select className="branch-select" value={turn.id} onChange={e => onActivate(e.target.value)}>{siblings.map(x => <option key={x.id} value={x.id}>{(x.user?.content || x.id).slice(0, 50)}</option>)}</select>}</div></div>
+  return <div>
+    <div className="msg user"><div className="bubble"><div className="msg-role">You</div><MarkdownContent>{turn.user?.content}</MarkdownContent><div className="turn-actions">{siblings.length > 1 && <span className="branch-count"><GitBranch size={13}/>{index + 1}/{siblings.length}</span>}<Button icon={Edit3} onClick={onEdit}>Edit</Button></div></div></div>
+    <div className="msg agent"><div className="msg-avatar"><Bot size={15}/></div><div className="bubble"><div className="msg-role">Agent</div><MarkdownContent>{turn.assistant?.content || ''}</MarkdownContent>{showExecution && (turn.assistant?.execution_trace || turn.assistant?.tool_calls?.length > 0) && <div className="trace-box"><button className="trace-head" onClick={() => setTraceOpen(!traceOpen)}>{traceOpen ? <ChevronDown size={15}/> : <ChevronRight size={15}/>} Execution trace {turn.assistant?.execution_trace?.events ? `· ${turn.assistant.execution_trace.events.length} events` : `· ${turn.assistant?.tool_calls?.length || 0} tool calls`}</button>{traceOpen && <div className="trace-body">{turn.assistant?.execution_trace ? safeArray(turn.assistant.execution_trace.events).map((e,i)=><div className="trace-event" key={i}><strong>{e.seq ?? i+1}. {String(e.type || 'event').replaceAll('_',' ')}</strong>{e.elapsed_ms != null && <span>{e.elapsed_ms} ms</span>}<JsonBlock value={e.data || {}}/></div>) : safeArray(turn.assistant?.tool_calls).map((c,i)=><div className="trace-event" key={i}><strong>Tool call {i+1}: {c.tool || 'unknown'}</strong><JsonBlock value={c.args}/>{c.result != null && <JsonBlock value={c.result}/>}</div>)}</div>}</div>}{siblings.length > 1 && <select className="branch-select" value={turn.id} onChange={e => onActivate(e.target.value)}>{siblings.map(x => <option key={x.id} value={x.id}>{(x.user?.content || x.id).slice(0, 50)}</option>)}</select>}</div></div>
   </div>;
 }
 

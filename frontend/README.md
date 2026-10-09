@@ -14,7 +14,7 @@ If your backend module is named differently, use that module name instead.
 
 ### Required backend change (file previews)
 
-Apply `api-raw-endpoint.patch` (adds `GET /projects/{u}/{p}/files/{area}/raw/{path}`). HTML previews load from
+Apply `api-raw-endpoint.patch` (shipped next to this folder, it modifies the backend, not this project) (adds `GET /projects/{u}/{p}/files/{area}/raw/{path}`). HTML previews load from
 this route inside a sandboxed iframe so relative CSS/JS/images resolve; without it HTML and PDF previews show a 404.
 
 ```bash
@@ -64,3 +64,5 @@ The frontend intentionally does not reimplement business logic. All persistence 
 - The shell is a single bounded flex column (`100dvh`). Only the chat thread, the file lists and the preview body scroll; the page itself never does.
 - Markdown (chat and `.md` files) goes through one component: GFM + sanitised raw HTML + syntax highlighting + copy buttons.
 - File preview by type: `.md` rendered, `.html` sandboxed iframe, images/PDF native, `.mmd` Mermaid (lazy-loaded), everything else highlighted source.
+
+- Sign-in is a username only (the API has no auth). Log out clears the stored user, project and chat selection.

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Download, ExternalLink, FileText } from 'lucide-react';
+import { Download, FileText } from 'lucide-react';
 import { api, fetchBlob } from '../api';
 import Office from './Office';
 import Markdown from './Markdown';
