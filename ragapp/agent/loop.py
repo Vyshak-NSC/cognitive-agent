@@ -943,6 +943,13 @@ def _run_agent_impl(context: AgentRunContext):
             "\n\nRELEVANT CANONICAL COGNITION (locally selected candidates; current project state):\n"
             + json.dumps(prefetched.get("requests", []), ensure_ascii=False)
         )
+        if prefetched.get("retrieval") == "exhaustive_inventory":
+            system_instruction += (
+                "\n\nEXHAUSTIVE INVENTORY CONTRACT: The supplied canonical entity inventory is complete. "
+                "For an all/every/list-every request, enumerate every matching entity from this inventory; "
+                "do not apply top-k ranking, omit items for relevance, or invent names. If the user asks for "
+                "names only, output only the names."
+            )
     allowed_tool_names = list(selection.get("tool_names") or [])
     # Existing-document artifact transformations are an execution contract.
     # Do not expose generic write_pptx/write_pdf tools for these requests: those

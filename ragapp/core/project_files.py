@@ -33,6 +33,17 @@ class ProjectFileService:
             value = value[2:]
         if value.startswith("/"):
             raise ValueError("Path must be relative to the selected area.")
+        # Paths are relative to the selected area. Strip an accidental duplicate prefix,
+        # preventing workspace/file.mmd from creating workspace/workspace/file.mmd.
+        if value == area:
+            value = ""
+        elif value.startswith(f"{area}/"):
+            value = value[len(area) + 1:]
+        parts = Path(value).parts
+        if any(part in {"", ".", ".."} for part in parts):
+            raise ValueError("Path contains an invalid path segment.")
+        if parts and parts[0] in {"source", "workspace", "cognition"}:
+            raise ValueError("Path must be relative to the selected area; do not include an area prefix.")
         p = (root / value).resolve()
         p.relative_to(root)
         return p

@@ -192,6 +192,15 @@ def _looks_like_project_inspection(query: str) -> bool:
     return bool(inspection and project_target)
 
 
+def _is_exhaustive_enumeration(query: str) -> bool:
+    """Identify requests that require a complete inventory, not relevance-ranked RAG."""
+    q = str(query or "").casefold()
+    exhaustive = re.search(r"\b(all|every|each|entire|complete|full)\b", q)
+    enumeration = re.search(r"\b(list|enumerate|name|names|show|give|identify|find)\b", q)
+    subject = re.search(r"\b(beast|beasts|creature|creatures|entity|entities|compendium|species|character|characters)\b", q)
+    return bool(exhaustive and enumeration and subject)
+
+
 def _looks_like_cognition_mutation(query: str) -> bool:
     """Deterministic backstop for explicit canonical/cognition state changes."""
     q = str(query or "").strip().lower()
@@ -355,54 +364,95 @@ class ContextSelector:
             candidates = []
             prefetched = None
             if retrieval:
-                hybrid = retrieval.search_metadata_candidates(query, limit=cognition_limit)
-                trace_event(
-                    "retrieval_candidates",
-                    query=query,
-                    retrieval=hybrid.get("retrieval"),
-                    semantic_attempted=hybrid.get("semantic_attempted"),
-                    lexical_candidates=hybrid.get("lexical_count"),
-                    candidate_count=len(hybrid.get("candidates") or []),
-                    candidates=[
-                        {
-                            "kind": item.get("kind"),
-                            "id": item.get("id"),
-                            "match": item.get("match"),
-                            "lexical_score": item.get("lexical_score"),
-                            "semantic_score": item.get("semantic_score"),
+                exhaustive = _is_exhaustive_enumeration(query)
+                if exhaustive:
+                    # Exhaustive inventories must not pass through top-k lexical or
+                    # semantic ranking. Read the canonical entity collection directly
+                    # and pass every entity's compact identity to the model. This
+                    # avoids both candidate-count limits and detail hydration budgets.
+                    records = self.store._all_kind_records("entity")
+                    seen_ids = set()
+                    inventory = []
+                    for record in records:
+                        ident = str(record.get("id") or "").strip()
+                        if not ident or ident in seen_ids:
+                            continue
+                        seen_ids.add(ident)
+                        item = {
+                            "kind": "entity",
+                            "id": ident,
+                            "name": str(record.get("name") or record.get("title") or ident),
+                            "type": record.get("type"),
+                            "tags": record.get("tags") or [],
+                            "summary": str(record.get("summary") or record.get("description") or "")[:240],
                         }
-                        for item in (hybrid.get("candidates") or [])
-                    ],
-                )
-                for item in hybrid.get("candidates", []):
-                    candidates.append({
-                        "kind": item.get("kind"),
-                        "id": item.get("id"),
-                        "score": item.get("semantic_score"),
-                        "lexical_score": item.get("lexical_score"),
-                        "match": item.get("match"),
-                    })
-                if candidates:
-                    candidates = retrieval.expand_candidates(candidates, max_depth=2, max_items=24)
-                    budget = min(12000, 4000 + 500 * max(0, len(candidates) - cognition_limit))
-                    prefetched = retrieval.retrieve_candidates(candidates, detail="compact", max_chars=budget)
-                    prefetched["query"] = query
-                    prefetched["candidates"] = candidates
-                    prefetched["retrieval"] = "hybrid"
+                        inventory.append(item)
+                    candidates = [{"kind": "entity", "id": item["id"], "match": "exhaustive_inventory"}
+                                  for item in inventory]
+                    prefetched = {
+                        "requests": inventory,
+                        "query": query,
+                        "candidates": candidates,
+                        "retrieval": "exhaustive_inventory",
+                        "truncated": False,
+                        "used_chars": sum(len(json.dumps(item, ensure_ascii=False)) for item in inventory),
+                        "next_requests": [],
+                    }
                     trace_event(
-                        "retrieval_hydrated",
+                        "retrieval_exhaustive_inventory",
                         query=query,
-                        request_count=len(prefetched.get("requests") or []),
-                        chars=prefetched.get("used_chars"),
-                        truncated=prefetched.get("truncated"),
-                        next_requests=len(prefetched.get("next_requests") or []),
+                        entity_count=len(inventory),
+                        unique_entity_count=len(seen_ids),
                     )
                 else:
+                    hybrid = retrieval.search_metadata_candidates(query, limit=cognition_limit)
                     trace_event(
-                        "retrieval_hydration_skipped",
+                        "retrieval_candidates",
                         query=query,
-                        reason="no_candidates",
+                        retrieval=hybrid.get("retrieval"),
+                        semantic_attempted=hybrid.get("semantic_attempted"),
+                        lexical_candidates=hybrid.get("lexical_count"),
+                        candidate_count=len(hybrid.get("candidates") or []),
+                        candidates=[
+                            {
+                                "kind": item.get("kind"),
+                                "id": item.get("id"),
+                                "match": item.get("match"),
+                                "lexical_score": item.get("lexical_score"),
+                                "semantic_score": item.get("semantic_score"),
+                            }
+                            for item in (hybrid.get("candidates") or [])
+                        ],
                     )
+                    for item in hybrid.get("candidates", []):
+                        candidates.append({
+                            "kind": item.get("kind"),
+                            "id": item.get("id"),
+                            "score": item.get("semantic_score"),
+                            "lexical_score": item.get("lexical_score"),
+                            "match": item.get("match"),
+                        })
+                    if candidates:
+                        candidates = retrieval.expand_candidates(candidates, max_depth=2, max_items=24)
+                        budget = min(12000, 4000 + 500 * max(0, len(candidates) - cognition_limit))
+                        prefetched = retrieval.retrieve_candidates(candidates, detail="compact", max_chars=budget)
+                        prefetched["query"] = query
+                        prefetched["candidates"] = candidates
+                        prefetched["retrieval"] = "hybrid"
+                        trace_event(
+                            "retrieval_hydrated",
+                            query=query,
+                            request_count=len(prefetched.get("requests") or []),
+                            chars=prefetched.get("used_chars"),
+                            truncated=prefetched.get("truncated"),
+                            next_requests=len(prefetched.get("next_requests") or []),
+                        )
+                    else:
+                        trace_event(
+                            "retrieval_hydration_skipped",
+                            query=query,
+                            reason="no_candidates",
+                        )
 
             return {
                 "tool_names": selected_tools,
