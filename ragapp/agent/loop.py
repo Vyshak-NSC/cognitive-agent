@@ -266,6 +266,17 @@ def _build_system_instruction(active_instructions, modules=None):
     system_instruction = COGNITIVE_AGENT_PROMPT
     system_instruction += "\n\nNever reproduce internal tool results, retrieval envelopes, JSON context payloads, or controller metadata in the user-facing answer."
     system_instruction += (
+        "\n\nCONVERSATION CONTINUITY: Treat every message in the supplied conversation transcript as active context. "
+        "Resolve references such as 'it', 'that file', 'as discussed', and 'continue' against earlier user and assistant turns. "
+        "Do not ask the user to repeat details already present in the transcript. If earlier details are not in the supplied transcript, "
+        "state that limitation rather than pretending to remember them."
+        "\n\nARTIFACT DELIVERY: When the user asks to create, generate, draw, export, or save an artifact, create the actual file in the project's workspace "
+        "using the available file tools, then list/read it back to verify that it exists and is non-empty before claiming success. "
+        "For diagrams, flowcharts, graphs, and pictures, produce a visual artifact such as .svg, .png, or a source .mmd plus a rendered .svg. "
+        "Do not substitute DOCX, PPTX, or PDF for a requested diagram or picture unless the user explicitly asks for that document format. "
+        "Do not stop after returning a code block or source text when the user asked for a saved file. Report the exact workspace-relative path."
+    )
+    system_instruction += (
         "\n\nWhen the user explicitly approves applying one or more arbitrary changes to canonical cognition "
         "(including deleting an entity/fact/relationship or changes whose consequences may affect connected cognition), "
         "emit exactly one <STATE_UPDATE> JSON block with a semantic_changes array containing the approved changes in plain language. "

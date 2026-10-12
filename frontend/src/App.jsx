@@ -254,8 +254,8 @@ function ChatView({ username, project, sessionId, sessions, agentId, showExecuti
   const [editing, setEditing] = useState(null);
   const scrollRef = useRef(null), inputRef = useRef(null), stick = useRef(true), abortRef = useRef(null);
 
-  const load = async () => { if (!sessionId) return; try { setData(await api.session(username, project, sessionId)); } catch (e) { onError(e); } };
-  useEffect(() => { stick.current = true; load(); }, [username, project, sessionId]);
+  const load = async (signal) => { if (!sessionId) { setData(null); return; } try { const next = await api.session(username, project, sessionId); if (!signal?.aborted) setData(next); } catch (e) { if (!signal?.aborted) onError(e); } };
+  useEffect(() => { const controller = new AbortController(); stick.current = true; setData(null); load(controller.signal); return () => controller.abort(); }, [username, project, sessionId]);
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const turns = data?.turns || {};
