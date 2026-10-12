@@ -8,12 +8,17 @@ copying the same description into multiple files.
 from __future__ import annotations
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Iterable
 
 from ragapp.cognition.document_index import DocumentIndex
 from ragapp.document_parser import parse_document
-from ragapp.settings import MAX_CONTEXT_CHARS, COMPILER_SEGMENT_CHARS, COMPILER_MODEL, CHAT_MODEL, DEFAULT_CHAT_MODEL
+from ragapp.settings import (
+    MAX_CONTEXT_CHARS, COMPILER_MODEL, CHAT_MODEL, DEFAULT_CHAT_MODEL,
+    COMPILER_SEGMENT_CHARS, COMPILER_SEGMENT_CHARS_GEMINI, COMPILER_GAP_FILL,
+)
 from ragapp.config import resolve_model
 from ragapp.core.metadata_sync import sync_store
 from ragapp.core.retrieval import RetrievalStore, CANONICAL_KINDS
@@ -21,34 +26,32 @@ from ragapp.core.retrieval import RetrievalStore, CANONICAL_KINDS
 SCHEMA = r'''
 You are the semantic compiler for a persistent cognition system.
 
-Your output is NOT a one-line summary. It is durable knowledge that will be
-used later without reopening the source document. Extract all materially useful
-information present in this segment and make every contribution additive.
+WHY THIS MATTERS
+The text you write in description_addition, definition_addition, knowledge_additions and
+attribute values is the ONLY thing a later reader will see. That reader (a person or an AI
+agent) will not reopen the source. Anything you leave out will later be guessed or invented.
+Your job is therefore to TRANSCRIBE what the source states into structured, self-contained
+records. It is NOT to summarize, abstract, or describe "what the passage is about".
 
-Return ONLY valid JSON with this shape:
+Return ONLY valid JSON with this shape. Omit any key whose value would be empty
+(a missing key means empty). Spend your output on facts, not on padding:
 {
   "project_type": "fiction|business|research|software|other",
   "entities": {
     "stable_entity_id": {
       "type": "character|organization|object|artifact|rule|other",
       "name": "",
-      "description_addition": "Everything this segment establishes about the entity, as full explanatory prose (see DEPTH AND FIDELITY). Never a summary. Additive: do not repeat earlier knowledge.",
+      "gist": "1-2 plain sentences (about 50 words max) saying what this is, so a human can skim the file. NOT a substitute for the description.",
+      "description_addition": "Full-detail, self-contained account of everything this segment states about the entity (see FIDELITY CONTRACT). Separate distinct topics with a blank line.",
       "tags": [],
       "knowledge_additions": {
-        "identity": [],
-        "background": [],
-        "appearance": [],
-        "personality": [],
-        "behavior": [],
-        "motivations": [],
-        "capabilities": [],
-        "preferences": [],
-        "other": []
+        "identity": [], "background": [], "appearance": [], "personality": [], "behavior": [],
+        "motivations": [], "capabilities": [], "preferences": [], "other": []
       },
       "attributes": {
         "field": {
-          "value": "",
-          "summary": "why this state matters",
+          "value": "exact value as written in the source, with units and qualifiers",
+          "summary": "what this value means, as the source states it",
           "timeline": "Chapter/section/version/date label or null",
           "sequence": 1,
           "valid_from": "",
@@ -74,7 +77,8 @@ Return ONLY valid JSON with this shape:
       "source_kind": "entity|location|concept|event|definition|knowledge",
       "target_kind": "entity|location|concept|event|definition|knowledge",
       "state": "current or newly observed state",
-      "description_addition": "Full explanation of the connection: what it is, its direction, the mechanism or reason behind it, the conditions it holds under, its consequences, and the source's concrete details (names, numbers, examples). Never a one-line label.",
+      "gist": "1-2 plain sentences naming both sides and the link.",
+      "description_addition": "Full-detail account of the link: both sides by name, kind/direction, what passes between them or what changes, conditions, quantities, reasons and consequences, exactly as the source gives them.",
       "event_ids": [],
       "timeline": "",
       "sequence": 1,
@@ -86,7 +90,8 @@ Return ONLY valid JSON with this shape:
       "id": "stable_event_id",
       "type": "event|decision|change|discovery|conflict|resolution|arrival|departure|other",
       "title": "",
-      "description_addition": "What happened, who/what was involved, the cause, the outcome and its consequences, with the source's concrete details.",
+      "gist": "1-2 plain sentences saying what happened.",
+      "description_addition": "Full-detail account: who/what took part, trigger, steps in order, outcome, every state change, quantities, stated consequences.",
       "entities": [],
       "location_ids": [],
       "concept_ids": [],
@@ -101,7 +106,7 @@ Return ONLY valid JSON with this shape:
           "attribute": "",
           "previous_value": null,
           "new_value": null,
-          "description": "what changed",
+          "description": "what changed, with the source's specifics",
           "source_node_ids": []
         }
       ],
@@ -113,7 +118,8 @@ Return ONLY valid JSON with this shape:
       "id": "stable_location_id",
       "name": "",
       "type": "place|region|building|other",
-      "description_addition": "Everything the source says about this location: its nature, features, rules, inhabitants and history.",
+      "gist": "1-2 plain sentences.",
+      "description_addition": "Full-detail account of the location: features, contents, rules, inhabitants, exactly as stated.",
       "attributes": {},
       "entity_ids": [],
       "event_ids": [],
@@ -126,7 +132,8 @@ Return ONLY valid JSON with this shape:
       "id": "stable_concept_id",
       "name": "",
       "type": "concept|rule|mechanism|other",
-      "description_addition": "Complete explanation of the concept: how it works, its rules, criteria, components, properties, exceptions and examples.",
+      "gist": "1-2 plain sentences.",
+      "description_addition": "Full-detail account: the definition in the source's wording, how it works step by step, variants/parameters, conditions, limits, exceptions, every example the source gives, and what it interacts with (by name).",
       "related_entity_ids": [],
       "related_event_ids": [],
       "related_concept_ids": [],
@@ -137,7 +144,8 @@ Return ONLY valid JSON with this shape:
     {
       "id": "stable_definition_id",
       "term": "",
-      "definition_addition": "The complete definition: what it is, the criteria or test that decide whether something qualifies, its properties, examples and exceptions, in the source's own terms. As long as the source is. Never a one-line gloss.",
+      "gist": "1 plain sentence.",
+      "definition_addition": "The source's definition, essentially verbatim, plus its qualifiers.",
       "related_ids": [],
       "source_node_ids": []
     }
@@ -146,82 +154,326 @@ Return ONLY valid JSON with this shape:
     {
       "id": "stable_knowledge_id",
       "title": "",
-      "description_addition": "Complete cross-object knowledge that does not belong inside a single entity/event/relationship, including the facts it rests on.",
+      "gist": "1-2 plain sentences.",
+      "description_addition": "A cross-cutting fact that belongs to no single entity/event/relationship/concept, stated in full with every qualifier.",
       "subject_ids": [],
       "source_node_ids": []
     }
   ]
 }
 
-DEPTH AND FIDELITY (the most important part of your job):
-- These records are read directly by people and by an agent that must answer from them WITHOUT
-  the source. Whatever you leave out is lost; whatever you leave vague will be guessed. Write
-  explanations, not summaries.
-- Every description is self-contained: say what the thing is, how it works, why, under what
-  conditions, with what exceptions, and what it affects. Use the source's own terms, names,
-  numbers, thresholds, formulas, lists and examples.
-- Length follows the source, not a template. Several paragraphs of source about one thing become
-  several paragraphs of description. One sentence is acceptable only if the source has one sentence.
-- Enumerations stay enumerated. If the source lists 16 items, stages, tiers or table rows, every
-  one appears by name with its stated properties. Never write "various", "several", "etc.",
-  "and more" or "among others" in place of the items.
-- Rules, tests and criteria are kept exactly: if the source gives a two-question test, write both
-  questions and what each answer decides. Keep every "if/then", "because" and "unless", and every
-  exception or exclusion. Treat callout or note paragraphs as rules and keep them.
-- Quote load-bearing phrases verbatim in double quotes when exact wording matters (definitions,
-  rules, named mechanisms, named thresholds).
-- Tables: carry every row and column value that is knowledge, as sentences or "name: value" lines.
-- Do not merge distinct facts into one abstract sentence. Do not interpret, generalise or add
-  anything the source does not say. No meta-commentary ("the text describes", "this section covers").
-- Before answering, check each object twice: could a reader who never saw the source answer
-  detailed questions from your text alone? Could they learn anything that is NOT in the source?
-  Fix both problems.
+FIDELITY CONTRACT (these rules outrank brevity and style)
+1. TRANSCRIBE, DON'T SUMMARIZE. Re-state every distinct fact the segment gives about an object.
+   Keep: names; numbers, percentages, thresholds, limits, dates, quantities; EVERY item of every
+   list or enumeration, in the source's order; conditions ("only if", "unless", "once", "when");
+   causes and reasons ("because", "so that"); consequences and outcomes; exceptions and edge
+   cases; contrasts; and worked examples with their specifics.
+2. USE THE SOURCE'S OWN WORDS. Keep the source's exact terms for named things, mechanisms and
+   rules. When the precise wording of a definition, rule, limit or distinction matters, quote it
+   verbatim in double quotes instead of rephrasing it.
+3. NO LOSSY WORDS. Never replace specifics with "various", "several", "multiple", "etc.",
+   "and more", "a range of", "key", "important", "significant", "plays a crucial role" or similar.
+   Never replace a list with a category name. Never drop an example because the rule was already
+   stated. Never merge two different points into one generalization.
+4. SELF-CONTAINED. Every description must be understandable on its own. Name the things referred
+   to; do not write "this", "it", "the above", "one of the six...", "as described earlier". If the
+   source says "one of six items", list all six.
+5. NO INTERPRETATION. State only what the source states: no inference, speculation, evaluation or
+   significance ("suggests", "implies", "likely", "highlights", "underscores"). If the source is
+   ambiguous, incomplete or contradicts itself, record exactly what it says and say that it is
+   ambiguous/incomplete/contradictory. Do not resolve it.
+6. LENGTH FOLLOWS THE SOURCE, NOT A TARGET. There is no maximum. If the segment spends a paragraph
+   on an object, its description must carry that paragraph's facts at comparable density. One
+   sentence about a multi-sentence passage is a failure. When choosing between shorter and more
+   complete, choose more complete.
+7. STRUCTURED SOURCES. For tables, spreadsheets, forms and lists keep the column/field name with
+   each value ("Column: value"), keep row identifiers, and keep every row that concerns the
+   object. Never describe a table's shape in place of its contents.
+8. COVERAGE. Before answering, walk the SOURCE NODES in order. Every node that states a fact must be
+   reflected in at least one object. A fact that fits no single entity/event/relationship/concept
+   goes into `knowledge` with all its details. Do not drop it.
+9. FORMAT. Plain declarative sentences. Separate distinct topics with a blank line (each paragraph
+   is stored as its own unit). No bullets or markdown headings inside descriptions.
 
-Rules:
+PER-OBJECT REQUIREMENTS
+- Entity: what it is, then every stated property (origin, structure, appearance, behaviour,
+  abilities, limits, rules it follows, quantities). Put each separate fact in knowledge_additions
+  as its own atomic item with full qualifiers. List every ability/trait/part individually with the
+  source's own description of it.
+- Relationship: name both sides; state the kind and direction of the link; what passes between
+  them / what changes / what depends on what; the conditions under which it holds; the
+  quantities, tiers, elements, roles or limits involved; and the source's stated reason or
+  consequence. For a lineage/derivation link, state what the derived thing KEEPS and what it
+  CHANGES (traits, abilities, tier, element, requirements) as the source gives them.
+  "A is related to B" or "A evolved from B" on its own is never enough.
+- Event: what happened, who/what took part, what triggered it and at what stage, the steps or
+  mechanism in order, the outcome and every state change, quantities, stated consequences.
+- Concept/rule/mechanism: see the concepts description above.
+- Definition: the source's definition, essentially verbatim, plus qualifiers.
+- Knowledge: the cross-cutting statement in full, with every qualifier.
+
+GIST
+`gist` is a separate short label for human skimming. Never shorten a description because a gist exists.
+
+EXAMPLES OF THE DIFFERENCE (illustrative only; never reuse these facts)
+Source: "The report covers six regions: North, South, East, West, Central, Overseas. Overseas figures are excluded because of currency issues."
+  BAD : "Overseas is one of the regions and is excluded for currency reasons."
+  GOOD: "Overseas is region 6 of the 6 regions covered by the report (North, South, East, West, Central, Overseas). Its figures are excluded from the report because of currency issues."
+Source: "The nightly job exports orders. Orders above 500 USD are flagged for manual review unless the customer is on the trusted list. Flagged orders stay on hold for up to 48 hours, then are released automatically."
+  BAD : "The nightly job exports orders and flags some for review."
+  GOOD: "The nightly job exports orders. Any order above 500 USD is flagged for manual review, except orders from customers on the trusted list. A flagged order stays on hold for up to 48 hours, after which it is released automatically."
+Source: "The Ridgeback Hound (Tier 2) evolves from the Plains Hound (Tier 1) after feeding on rock-ore. It keeps the Earth element and gains armoured spine plates; its bite changes from 'crushing bite' to 'shatter bite'."
+  BAD relationship: "Ridgeback Hound evolved from Plains Hound."
+  GOOD relationship: "The Ridgeback Hound (Tier 2) evolves from the Plains Hound (Tier 1) after feeding on rock-ore. It keeps the Earth element. What changes: it gains armoured spine plates, and its bite changes from 'crushing bite' to 'shatter bite'."
+
+OTHER RULES
 1. NEVER replace previous knowledge. Every description_addition is an additive contribution.
-2. Never write a one-line summary when the source supports more; follow DEPTH AND FIDELITY above.
-3. Preserve all durable facts that would help a later agent reconstruct the entity,
-   event, relationship, location, concept or definition without rereading the source.
-4. Reuse KNOWN IDs when the same object is clearly being described again.
-5. Do not invent facts, chronology, locations, relationships, motivations or states.
-6. Relationships are first-class objects. Do not copy their detailed description into entities.
-7. Events are first-class objects. Do not copy their detailed description into entities.
-8. Entities contain intrinsic characterization/knowledge plus references to relationships,
-   events, locations, concepts and definitions.
-9. A source location is provenance, not cognition. Exact locators are attached by the compiler.
-10. Distinguish document order from story time. Use sequence for source/document order and
-    story_time only when the source supports it.
-11. If a later segment adds a new fact about an existing entity, output ONLY the new contribution
-    needed to append to that entity. Do not repeat the entire old profile.
-12. State changes must be attached to the event that caused/records them whenever possible.
-13. For fiction, preserve personality, habits, behavior, motivations, family history, capabilities,
-    important relationships, meaningful events, and durable state transitions.
-14. For code/business/research documents, apply the same canonical/additive principle to the
-    appropriate objects rather than forcing everything into characters.
-15. source_node_ids MUST contain only IDs from SOURCE NODES.
-16. Return empty arrays when a category has no supported content.
+2. Compare with RELATED EXISTING COGNITION. If it already records a fact with the same specifics,
+   do not repeat it. If it records a fact only vaguely or partially, add the missing specifics as
+   new text (do not restate the vague version and do not ask for it to be replaced).
+3. Reuse KNOWN IDs when the same object is clearly being described again.
+4. Do not invent facts, chronology, locations, relationships, motivations or states.
+5. Relationships and events are first-class objects. Do not copy their detailed description into
+   entities; entities hold their own intrinsic facts plus references (relationship_ids, event_ids,
+   location_ids, concept_ids...).
+6. A source location is provenance, not cognition. Exact locators are attached by the compiler.
+7. Distinguish document order from story time. Use sequence for source/document order and
+   story_time only when the source supports it.
+8. If a later segment adds a new fact about an existing entity, output ONLY the new contribution.
+   Do not repeat the entire old profile.
+9. State changes must be attached to the event that caused/records them whenever possible.
+10. For fiction, preserve personality, habits, behavior, motivations, family history, capabilities,
+    important relationships, meaningful events and durable state transitions. For code, business
+    or research documents apply the same principle to the appropriate objects.
+11. source_node_ids MUST contain only IDs from SOURCE NODES, and only the nodes that directly
+    support that object (not the whole segment).
 '''
 
 
-def _provider_generator(store):
-    """(generate_json(prompt), provider id, model) for the project's configured provider.
+# ---------------------------------------------------------------------------
+# Deterministic fidelity check.
+#
+# The host does not interpret meaning. It only finds source sentences whose
+# distinctive terms/numbers are (almost) absent from everything the model
+# returned, so those sentences can be handed back for one completion call.
+# ---------------------------------------------------------------------------
+_STOPWORDS = frozenset("""
+about above after again against all also although always among and any are because been before
+being below between both but can could did does doing down during each either else even ever
+every few for from further had has have having her here hers him his how however into its itself
+just more most much must neither nor not now off once only onto other our out over own same she
+should since some such than that the their them then there these they this those through thus too
+under until upon very was were what when where which while who whom whose why will with within
+without would you your
+""".split())
+_TERM_RE = re.compile(r"[0-9]+(?:[.,][0-9]+)*|[^\W\d_]+", re.UNICODE)
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+_GAP_MIN_TERMS = 4           # ignore labels / headings with fewer distinctive terms
+_GAP_MAX_SENTENCES = 60
+_GAP_MAX_CHARS = 9000
 
-    Dispatch goes through the provider registry, so every registered provider (Gemini, OpenRouter,
-    OpenAI, Anthropic, Azure OpenAI, Azure Anthropic, and any added later) works for compilation
-    without another branch being added here.
+
+def _term_map(text):
+    """{stem: original word} for the distinctive terms of a text (numbers kept whole).
+
+    Stems are the first 6 letters of words with 4+ letters, which tolerates
+    inflection ("compress"/"compressed"/"compression") without any NLP library.
     """
-    import importlib
+    out = {}
+    for tok in _TERM_RE.findall(str(text or "")):
+        low = tok.lower()
+        if low in _STOPWORDS:
+            continue
+        if low[0].isdigit():
+            out.setdefault(low, low)
+        elif len(low) >= 4:
+            out.setdefault(low[:6], low)
+    return out
+
+
+def _stems(text):
+    return set(_term_map(text))
+
+
+def _flatten_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            if isinstance(k, str):
+                yield k
+            yield from _flatten_strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _flatten_strings(v)
+
+
+def _uncovered_sentences(doc, seg, data, known=None, max_sentences=None, max_chars=None):
+    """Source sentences that contain distinctive terms absent from everything recorded.
+
+    "Recorded" = what the model just returned for this segment plus the existing
+    cognition supplied as context. Returns [(node_id, sentence, [missing words])]
+    in document order, limited to the sentences with the most missing terms.
+    This is a literal-term check only; it never interprets meaning.
+    """
+    recorded = _stems(" ".join(_flatten_strings([data, known or {}])))
+    flagged = []
+    for nid in seg.node_ids:
+        node = doc.nodes.get(nid)
+        text = getattr(node, "text", "") if node is not None else ""
+        if not text:
+            continue
+        for sentence in _SENT_SPLIT_RE.split(text):
+            sentence = sentence.strip()
+            terms = _term_map(sentence)
+            if len(terms) < _GAP_MIN_TERMS:
+                continue
+            missing = [word for stem, word in terms.items() if stem not in recorded]
+            if missing:
+                flagged.append((len(missing), len(flagged), nid, sentence, missing))
+    # keep the sentences with the most missing detail, within the prompt budget
+    max_sentences = max_sentences or _GAP_MAX_SENTENCES
+    max_chars = max_chars or _GAP_MAX_CHARS
+    chosen, used = [], 0
+    for n_missing, order, nid, sentence, missing in sorted(flagged, key=lambda x: (-x[0], x[1])):
+        if len(chosen) >= max_sentences or used + len(sentence) > max_chars:
+            continue
+        chosen.append((order, nid, sentence, missing))
+        used += len(sentence)
+    chosen.sort(key=lambda x: x[0])
+    return [(nid, sentence, missing) for _, nid, sentence, missing in chosen]
+
+
+_GAP_FILL_NOTE = """
+
+GAP-FILL MODE
+A first pass over this segment produced the objects listed under ALREADY EXTRACTED, but the
+source sentences listed under UNREPRESENTED SOURCE SENTENCES contain specific terms, numbers,
+examples or conditions that appear nowhere in that output (each sentence lists the missing terms).
+Return JSON in the SAME shape and under the SAME FIDELITY CONTRACT as above, containing ONLY the
+facts those sentences state. Attach each fact to the right object (reuse the IDs under ALREADY
+EXTRACTED or KNOWN IDs when it belongs to one of them; create a new object only when none fits;
+use `knowledge` when no object fits). Write each fact out in full, with every detail the
+sentence contains. Do not repeat anything the sentences do not state. source_node_ids must come
+from the node IDs shown next to the sentences.
+"""
+
+
+def _extracted_index(data):
+    """Compact id/name index of a generation, so a follow-up call can reuse ids."""
+    idx = {"entities": [], "relationships": [], "events": [], "locations": [], "concepts": [],
+           "definitions": [], "knowledge": []}
+    for sid, item in (data.get("entities") or {}).items():
+        if isinstance(item, dict):
+            idx["entities"].append({"id": str(item.get("id") or sid), "name": item.get("name")})
+    for key in ("relationships", "events", "locations", "concepts", "definitions", "knowledge"):
+        for item in data.get(key) or []:
+            if isinstance(item, dict) and item.get("id"):
+                label = item.get("name") or item.get("title") or item.get("term")
+                idx[key].append({"id": str(item["id"]), "name": label} if label else {"id": str(item["id"])})
+    return {k: v for k, v in idx.items() if v}
+
+
+def _merge_generation(base, extra):
+    """Fold a gap-fill generation into the first-pass generation (purely additive)."""
+    if not isinstance(extra, dict):
+        return base
+    out = dict(base)
+    entities = dict(out.get("entities") or {})
+    for sid, item in (extra.get("entities") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        cur = entities.get(sid)
+        if not isinstance(cur, dict):
+            entities[sid] = item
+            continue
+        cur = dict(cur)
+        add = item.get("description_addition") or item.get("description")
+        if add:
+            prev = cur.get("description_addition") or cur.get("description") or ""
+            cur["description_addition"] = (prev + "\n\n" + add).strip()
+        buckets = {k: list(v) for k, v in (cur.get("knowledge_additions") or {}).items() if isinstance(v, list)}
+        for k, v in (item.get("knowledge_additions") or {}).items():
+            if isinstance(v, list):
+                buckets.setdefault(k, []).extend(v)
+        if buckets:
+            cur["knowledge_additions"] = buckets
+        attrs = dict(cur.get("attributes") or {})
+        for k, v in (item.get("attributes") or {}).items():
+            attrs.setdefault(k, v)
+        if attrs:
+            cur["attributes"] = attrs
+        for key in ("tags", "relationship_ids", "event_ids", "location_ids", "concept_ids",
+                    "definition_ids", "knowledge_ids", "source_node_ids"):
+            merged = list(cur.get(key) or [])
+            merged += [x for x in (item.get(key) or []) if x not in merged]
+            if merged:
+                cur[key] = merged
+        entities[sid] = cur
+    if entities:
+        out["entities"] = entities
+    for key in ("relationships", "events", "locations", "concepts", "definitions", "knowledge"):
+        combined = list(out.get(key) or []) + [x for x in (extra.get(key) or []) if isinstance(x, dict)]
+        if combined:
+            out[key] = combined
+    return out
+
+
+def _gist(item):
+    value = item.get("gist") if isinstance(item, dict) else None
+    value = str(value).strip() if value else ""
+    return value[:500] or None
+
+
+_RATE_LIMIT_TERMS = ("429", "resource_exhausted", "rate limit", "ratelimit", "too many requests", "quota")
+_DAILY_TERMS = ("per day", "perday", "daily", "per_day")
+_RATE_LIMIT_RETRIES = 3
+
+
+def _retry_wait_seconds(error_text, attempt):
+    """Honour a 'retry in 12.3s' hint when the API gives one, else back off 15s/30s/60s."""
+    m = re.search(r"retry(?:delay)?\D{0,12}(\d+(?:\.\d+)?)\s*s", error_text)
+    if m:
+        return min(90.0, float(m.group(1)) + 2.0)
+    return float((15, 30, 60)[min(attempt, 2)])
+
+
+def _paced_generate(store, provider, call):
+    """Run one compiler LLM call inside the project's requests-per-minute budget.
+
+    Compiler calls used to bypass the limiter that chat uses, so a many-segment compile
+    burst past the provider's RPM, got 429s, and silently skipped segments. Per-minute rate
+    limits are retried after a wait; daily-quota exhaustion is not (waiting cannot fix it).
+    """
+    from ragapp.llm.provider import throttle_requests
+    for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        throttle_requests(store, provider)
+        try:
+            return call()
+        except Exception as exc:
+            text = str(exc).lower()
+            limited = any(term in text for term in _RATE_LIMIT_TERMS)
+            if not limited or any(term in text for term in _DAILY_TERMS) or attempt >= _RATE_LIMIT_RETRIES:
+                raise
+            time.sleep(_retry_wait_seconds(text, attempt))
+
+
+def _provider_generator(store):
     from ragapp.config import get_api_key, load_project_config
-    from ragapp.llm.registry import PROVIDER_SPECS
-    provider = str(load_project_config(store).get("provider", {}).get("name", "gemini")).strip().lower()
-    provider = {"azure": "azure_openai"}.get(provider, provider)  # legacy alias from older project configs
-    if provider not in PROVIDER_SPECS:
-        raise RuntimeError(f"Unsupported cognition compiler provider: {provider}. Choose one of: {', '.join(PROVIDER_SPECS)}.")
-    if not get_api_key(store, provider):
-        raise RuntimeError(f"No {PROVIDER_SPECS[provider].get('label', provider)} API key configured. Add it in Settings or set the matching environment variable.")
+    provider = load_project_config(store).get("provider", {}).get("name", "gemini").lower()
+    key = get_api_key(store, provider)
+    if not key:
+        raise RuntimeError(f"No {provider.title()} API key configured. Add it in Settings or set the matching environment variable.")
     model = resolve_model(store, COMPILER_MODEL or CHAT_MODEL, DEFAULT_CHAT_MODEL, provider=provider)
-    adapter = importlib.import_module(f"ragapp.llm.tool_calling.{PROVIDER_SPECS[provider]['adapter']}")
-    return lambda prompt: adapter.generate_json(store, prompt, model=model), provider, model
+    if provider == "openrouter":
+        from ragapp.llm.tool_calling.openrouter import generate_json
+    elif provider == "gemini":
+        from ragapp.llm.tool_calling.gemini import generate_json
+    elif provider in {"azure", "azure_openai"}:
+        from ragapp.llm.tool_calling.azure_openai import generate_json
+    else:
+        raise RuntimeError(f"Unsupported cognition compiler provider: {provider}")
+    return (lambda prompt: _paced_generate(store, provider, lambda: generate_json(store, prompt, model=model))), provider, model
 
 
 def _ref_id(value):
@@ -482,103 +734,6 @@ def _provenance(segment, parsed, artifact_id, evidence_ids):
     }
 
 
-# ---------------------------------------------------------------------------
-# Depth enforcement
-# ---------------------------------------------------------------------------
-# The prompt asks for explanations, but a model asked to emit many objects in one answer still
-# tends to compress each of them. So the host checks mechanically, by length only and never by
-# meaning: a description that is tiny next to the source passage it cites is sent back together
-# with that passage to be rewritten at full depth. A rewrite is accepted only if it is longer than
-# what it replaces, so this pass can add detail but never remove any.
-THIN_MIN_SOURCE_CHARS = 500   # do not police citations of a sentence or two
-THIN_SOURCE_RATIO = 0.25      # a description should carry at least this share of what it cites...
-THIN_FLOOR_CAP = 1200         # ...but never needs to exceed this many characters
-EXPAND_BATCH_CHARS = 18000
-
-_DESCRIPTION_FIELDS = {
-    "entities": "description_addition", "relationships": "description_addition",
-    "events": "description_addition", "locations": "description_addition",
-    "concepts": "description_addition", "definitions": "definition_addition",
-    "knowledge": "description_addition",
-}
-
-EXPAND_PROMPT = """You are the semantic compiler for a persistent cognition system.
-Each item below has a CURRENT description that is far too thin for the SOURCE passage it cites.
-Rewrite every description as a complete, self-contained explanation of what the passage says
-about that item, so a reader who never sees the source can answer detailed questions from it.
-
-Rules:
-- Use only the passage. Add no facts, interpretation or outside knowledge.
-- Keep every name, number, threshold, condition, exception, list item, table value, rule and
-  example that bears on the item. Never replace items with "several", "various" or "etc.".
-- Keep tests and criteria complete (each question and what each answer decides) and keep causal
-  and conditional statements.
-- Quote load-bearing phrases verbatim in double quotes when exact wording matters.
-- Plain explanatory prose in short paragraphs, or "name: value" lines. No meta-commentary.
-- The new description must contain everything the CURRENT one says.
-
-Return ONLY JSON: {"items": {"<key>": "<full description>"}}
-"""
-
-
-def _description_items(data):
-    for kind, field in _DESCRIPTION_FIELDS.items():
-        block = data.get(kind)
-        pairs = list(block.items()) if isinstance(block, dict) else [(None, v) for v in block] if isinstance(block, list) else []
-        for key, item in pairs:
-            if isinstance(item, dict):
-                yield kind, key, item, field
-
-
-def _thin_descriptions(data, doc, segment):
-    allowed = set(segment.node_ids)
-    thin = []
-    for kind, key, item, field in _description_items(data):
-        ids = _valid_evidence(item.get("source_node_ids"), allowed)
-        if not ids:
-            continue
-        source = "\n\n".join(doc.nodes[n].text for n in ids if n in doc.nodes and doc.nodes[n].text)
-        if len(source) < THIN_MIN_SOURCE_CHARS:
-            continue
-        current = str(item.get(field) or item.get("description") or "").strip()
-        if len(current) < min(THIN_SOURCE_RATIO * len(source), THIN_FLOOR_CAP):
-            label = item.get("id") or key or item.get("name") or item.get("title") or item.get("term") or kind
-            thin.append({"kind": kind, "label": str(label), "item": item, "field": field, "current": current, "source": source})
-    return thin
-
-
-def _expand_thin_descriptions(generator, data, doc, segment):
-    """Rewrite too-thin descriptions in `data` in place. Returns counts; never raises."""
-    stats = {"thin": 0, "expanded": 0, "still_thin": 0}
-    thin = _thin_descriptions(data, doc, segment)
-    stats["thin"] = len(thin)
-    batches, batch, size = [], [], 0
-    for entry in thin:
-        cost = len(entry["source"]) + len(entry["current"])
-        if batch and size + cost > EXPAND_BATCH_CHARS:
-            batches.append(batch)
-            batch, size = [], 0
-        batch.append(entry)
-        size += cost
-    if batch:
-        batches.append(batch)
-    for batch in batches:
-        payload = {f"k{i}": {"kind": e["kind"], "item": e["label"], "current": e["current"], "source": e["source"]} for i, e in enumerate(batch)}
-        try:
-            reply = json.loads(generator(EXPAND_PROMPT + "\n\nITEMS:\n" + json.dumps(payload, ensure_ascii=False)))
-            rewritten = (reply.get("items") if isinstance(reply, dict) else None) or {}
-        except Exception:
-            rewritten = {}
-        for i, entry in enumerate(batch):
-            new = rewritten.get(f"k{i}")
-            if isinstance(new, str) and len(new.strip()) > 1.2 * len(entry["current"]):
-                entry["item"][entry["field"]] = new.strip()
-                stats["expanded"] += 1
-            else:
-                stats["still_thin"] += 1
-    return stats
-
-
 class DocumentCognitionCompiler:
     def __init__(self, store):
         self.store = store
@@ -590,7 +745,15 @@ class DocumentCognitionCompiler:
         generator, provider, model = _provider_generator(self.store)
         parsed_docs = []
         failures = []
-        per_segment_budget = COMPILER_SEGMENT_CHARS
+        # Small segments leave output room for full-detail transcription (a 24k-char
+        # chapter in one call forces the model to compress its answer).
+        segment_chars = COMPILER_SEGMENT_CHARS_GEMINI if provider == "gemini" else COMPILER_SEGMENT_CHARS
+        per_segment_budget = max(1500, min(max(5000, int(MAX_CONTEXT_CHARS * 0.48)), segment_chars))
+        # Follow-up (gap-fill) prompts shrink in step with the segment size.
+        gap_max_chars = max(2500, int(per_segment_budget * 1.1))
+        gap_max_sentences = max(15, per_segment_budget // 130)
+        gap_stats = {"enabled": bool(COMPILER_GAP_FILL), "segments_checked": 0, "segments_gap_filled": 0,
+                     "sentences_flagged": 0, "gap_fill_errors": 0}
 
         for area, path in files:
             rel = path.relative_to(self.store.source if area == "source" else self.store.workspace).as_posix()
@@ -611,7 +774,6 @@ class DocumentCognitionCompiler:
         skipped = []
         processed = 0
         touched_refs = set()
-        depth = {"thin": 0, "expanded": 0, "still_thin": 0}
 
         for i, (doc, seg) in enumerate(segments, 1):
             structure = {
@@ -672,8 +834,41 @@ class DocumentCognitionCompiler:
                     progress_callback(i, len(segments))
                 continue
 
-            for key, value in _expand_thin_descriptions(generator, data, doc, seg).items():
-                depth[key] += value
+            # Fidelity check: find source sentences whose terms are missing from the output
+            # and ask once for the facts they state (additive; failures are non-fatal).
+            if COMPILER_GAP_FILL:
+                # This step is an enhancement: whatever goes wrong inside it must never abort the
+                # compile (an exception here would make compile_project roll everything back).
+                try:
+                    gap_stats["segments_checked"] += 1
+                    missing = _uncovered_sentences(doc, seg, data, known, gap_max_sentences, gap_max_chars)
+                    if missing:
+                        gap_stats["sentences_flagged"] += len(missing)
+                        gap_prompt = (
+                            SCHEMA
+                            + "\n\nRELATED EXISTING COGNITION (bounded canonical context):\n"
+                            + json.dumps(known, ensure_ascii=False)
+                            + override_block
+                            + _GAP_FILL_NOTE
+                            + "\n\nALREADY EXTRACTED (ids/names only):\n"
+                            + json.dumps(_extracted_index(data), ensure_ascii=False)
+                            + "\n\nSTRUCTURE CONTEXT:\n"
+                            + json.dumps({k: v for k, v in structure.items() if k != "nodes"}, ensure_ascii=False)
+                            + "\n\nUNREPRESENTED SOURCE SENTENCES (node id, sentence, missing terms):\n"
+                            + "\n".join(
+                                f"[{nid}] {sentence}\n    (terms in this sentence that appear nowhere in the output: {', '.join(words)})"
+                                for nid, sentence, words in missing
+                            )
+                        )
+                        try:
+                            extra = json.loads(generator(gap_prompt))
+                            if isinstance(extra, dict):
+                                data = _merge_generation(data, extra)
+                                gap_stats["segments_gap_filled"] += 1
+                        except Exception:
+                            gap_stats["gap_fill_errors"] += 1
+                except Exception:
+                    gap_stats["gap_fill_errors"] += 1
 
             artifact_id = doc.artifact_id
             timeline_label = (seg.title or doc.title or "document")
@@ -695,6 +890,7 @@ class DocumentCognitionCompiler:
                     "name": item.get("name") or eid,
                     "description": item.get("description_addition") or item.get("description") or item.get("summary") or "",
                     "summary": (item.get("description_addition") or item.get("summary") or "").strip().split("\n", 1)[0][:500],
+                    "gist": _gist(item),
                     "tags": item.get("tags", []),
                     "knowledge": item.get("knowledge_additions", {}),
                     "attributes": item.get("attributes", {}),
@@ -721,6 +917,7 @@ class DocumentCognitionCompiler:
                 rec = {
                     "id": str(item["id"]), "name": item.get("name") or item["id"], "type": item.get("type", "place"),
                     "description": item.get("description_addition") or item.get("description") or "",
+                    "summary": _gist(item),
                     "attributes": item.get("attributes", {}),
                     "entity_ids": list(item.get("entity_ids") or []), "event_ids": list(item.get("event_ids") or []),
                     "concept_ids": list(item.get("concept_ids") or []), "source_locations": [prov],
@@ -737,7 +934,7 @@ class DocumentCognitionCompiler:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
                 prov = _provenance(seg, doc, artifact_id, item.get("source_node_ids"))
-                rec = {"id": str(item["id"]), "name": item.get("name") or item["id"], "type": item.get("type", "concept"), "description": item.get("description_addition") or item.get("description") or "", "related_entity_ids": item.get("related_entity_ids", []), "related_event_ids": item.get("related_event_ids", []), "related_concept_ids": item.get("related_concept_ids", []), "source_locations": [prov]}
+                rec = {"id": str(item["id"]), "name": item.get("name") or item["id"], "type": item.get("type", "concept"), "description": item.get("description_addition") or item.get("description") or "", "summary": _gist(item), "related_entity_ids": item.get("related_entity_ids", []), "related_event_ids": item.get("related_event_ids", []), "related_concept_ids": item.get("related_concept_ids", []), "source_locations": [prov]}
                 stored = self.store.upsert_canonical("concept", rec, source_artifact=artifact_id, timeline=timeline_label, location=prov["locator"])
                 touched_refs.add(("concept", str(stored["id"])))
                 for eid in rec.get("related_entity_ids", []):
@@ -749,7 +946,7 @@ class DocumentCognitionCompiler:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
                 prov = _provenance(seg, doc, artifact_id, item.get("source_node_ids"))
-                rec = {"id": str(item["id"]), "term": item.get("term") or item["id"], "description": item.get("definition_addition") or item.get("definition") or "", "related_ids": item.get("related_ids", []), "source_locations": [prov]}
+                rec = {"id": str(item["id"]), "term": item.get("term") or item["id"], "description": item.get("definition_addition") or item.get("definition") or "", "summary": _gist(item), "related_ids": item.get("related_ids", []), "source_locations": [prov]}
                 stored = self.store.upsert_canonical("definition", rec, source_artifact=artifact_id, timeline=timeline_label, location=prov["locator"])
                 touched_refs.add(("definition", str(stored["id"])))
                 self.index.attach("definition", stored["id"], artifact_id, node_ids=prov["node_ids"], segment_id=seg.id, locator=prov["locator"], section_ids=prov["section_ids"], chapter_id=prov["chapter_id"], scene_id=prov["scene_id"])
@@ -758,7 +955,7 @@ class DocumentCognitionCompiler:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
                 prov = _provenance(seg, doc, artifact_id, item.get("source_node_ids"))
-                rec = {"id": str(item["id"]), "title": item.get("title") or item["id"], "description": item.get("description_addition") or item.get("description") or "", "subject_ids": item.get("subject_ids", []), "source_locations": [prov]}
+                rec = {"id": str(item["id"]), "title": item.get("title") or item["id"], "description": item.get("description_addition") or item.get("description") or "", "summary": _gist(item), "subject_ids": item.get("subject_ids", []), "source_locations": [prov]}
                 stored = self.store.upsert_canonical("knowledge", rec, source_artifact=artifact_id, timeline=timeline_label, location=prov["locator"])
                 touched_refs.add(("knowledge", str(stored["id"])))
                 self.index.attach("knowledge", stored["id"], artifact_id, node_ids=prov["node_ids"], segment_id=seg.id, locator=prov["locator"], section_ids=prov["section_ids"], chapter_id=prov["chapter_id"], scene_id=prov["scene_id"])
@@ -774,6 +971,7 @@ class DocumentCognitionCompiler:
                     "id": str(item["id"]), "type": item.get("type", "related_to"), "source": item.get("source"), "target": item.get("target"),
                     "source_kind": item.get("source_kind", "entity"), "target_kind": item.get("target_kind", "entity"),
                     "state": item.get("state"), "description": item.get("description_addition") or item.get("description") or "",
+                    "summary": _gist(item),
                     "timeline": item.get("timeline") or timeline_label, "sequence": item.get("sequence") or timeline_sequence,
                     "event_ids": item.get("event_ids", []), "document_locations": [prov],
                 }
@@ -792,7 +990,7 @@ class DocumentCognitionCompiler:
                 pos = {"label": item.get("timeline") or timeline_label, "sequence": item.get("sequence") or timeline_sequence, "story_time": item.get("story_time")}
                 event = {
                     "id": str(item["id"]), "type": item.get("type", "event"), "title": item.get("title") or item["id"],
-                    "description": item.get("description_addition") or item.get("description") or "", "entities": item.get("entities", []),
+                    "description": item.get("description_addition") or item.get("description") or "", "summary": _gist(item), "entities": item.get("entities", []),
                     "location_ids": item.get("location_ids", []), "concept_ids": item.get("concept_ids", []), "narrative_position": pos,
                     "sequence": pos["sequence"], "previous_events": item.get("previous_event_ids", []), "next_events": item.get("next_event_ids", []),
                     "state_changes": item.get("state_changes", []), "source_locator": prov["locator"], "document_locations": [prov],
@@ -850,5 +1048,5 @@ class DocumentCognitionCompiler:
             "definitions": len(self.store._all_kind_records("definition")),
             "knowledge": len(self.store._all_kind_records("knowledge")),
             "verification": verification,
-            "depth": depth,
+            "fidelity": gap_stats,
         }

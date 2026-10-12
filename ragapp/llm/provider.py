@@ -19,6 +19,24 @@ _LAST_CALL = {}
 _THROTTLE_LOCK = threading.Lock()
 
 
+def throttle_requests(store, name, cfg=None):
+    """Block until the project's requests_per_minute budget allows another call.
+
+    Shared by chat (Provider.generate) and the cognition compiler, so both
+    draw from the same per-provider, per-project budget.
+    """
+    cfg = cfg if cfg is not None else load_project_config(store)
+    rpm = float(limit(cfg, "requests_per_minute"))
+    gap = 60.0 / max(rpm, 1.0)
+    key = (name, str(getattr(store, "root", id(store))))
+    with _THROTTLE_LOCK:
+        now = time.monotonic()
+        slot = max(now, _LAST_CALL.get(key, 0.0) + gap)
+        _LAST_CALL[key] = slot  # reserve the slot so concurrent calls queue up
+    if slot > now:
+        time.sleep(slot - now)
+
+
 def configured_name(store):
     """The project's provider id, validated against PROVIDER_SPECS."""
     if store is None:
@@ -53,15 +71,7 @@ class Provider:
         self.model = self.adapter.model_name(store)
 
     def throttle(self):
-        rpm = float(limit(self.cfg, "requests_per_minute"))
-        gap = 60.0 / max(rpm, 1.0)
-        key = (self.name, str(getattr(self.store, "root", id(self.store))))
-        with _THROTTLE_LOCK:
-            now = time.monotonic()
-            slot = max(now, _LAST_CALL.get(key, 0.0) + gap)
-            _LAST_CALL[key] = slot  # reserve the slot so concurrent calls queue up
-        if slot > now:
-            time.sleep(slot - now)
+        throttle_requests(self.store, self.name, self.cfg)
 
     def key(self):
         return get_api_key(self.store, self.spec["key_slot"])

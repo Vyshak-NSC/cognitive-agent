@@ -24,8 +24,8 @@ from openrouter import OpenRouter
 from openrouter.utils import BackoffStrategy, RetryConfig
 
 from ragapp.config import get_api_keys, load_project_config
-from ragapp.settings import COMPILER_MAX_OUTPUT_TOKENS
 from ragapp.llm.registry import PROVIDER_SPECS
+from ragapp.settings import COMPILER_MAX_OUTPUT_TOKENS
 
 DEFAULT_OPENROUTER_MODEL = PROVIDER_SPECS["openrouter"]["default_model"]
 DEFAULT_TIMEOUT_S = 120

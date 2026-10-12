@@ -7,7 +7,7 @@ import os
 import uuid
 from pathlib import Path as FsPath
 from typing import Any, Iterator
-
+import shutil
 from fastapi import FastAPI, File, Form, HTTPException, Query as FastAPIQuery, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -976,7 +976,10 @@ def cognition_compile_stream(
             )
             events.put(("complete", {"result": result, **snapshot()}))
         except Exception as exc:
-            events.put(("error", {"detail": str(exc)}))
+            import traceback; traceback.print_exc()
+            # compile_project() already rolls cognition/ back to its pre-compile
+            # snapshot. Do NOT delete it again here - that wiped the restored data.
+            events.put(("error", {"detail": f"{type(exc).__name__}: {exc}"}))
         finally:
             events.put(("done", None))
 

@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
+from ragapp.core.db_path import project_db_path, merge_legacy_dbs
 
 _DEFAULT_MODEL = os.getenv("CPA_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 _MODEL = None
@@ -50,10 +51,9 @@ class SemanticIndex:
     """Persistent project-local embedding index with incremental upserts."""
 
     def __init__(self, store):
-        root = Path(store.root) / ".system"
-        root.mkdir(parents=True, exist_ok=True)
-        self.path = root / "semantic_index.db"
+        self.path = project_db_path(store)
         self._init()
+        merge_legacy_dbs(self.path)
 
     def _connect(self):
         conn = sqlite3.connect(self.path)

@@ -4,6 +4,7 @@ import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from ragapp.core.db_path import project_db_path, merge_legacy_dbs
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -61,9 +62,9 @@ class MetadataDB:
     while the authoritative entity content remains in cognition/entities/*.json.
     No LLM calls are made by this class."""
     def __init__(self, store):
-        self.path = store.root / ".system" / "metadata.db"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = project_db_path(store)
         self.init()
+        merge_legacy_dbs(self.path)
     def conn(self):
         c = sqlite3.connect(self.path)
         c.row_factory = sqlite3.Row
@@ -123,6 +124,18 @@ class MetadataDB:
             -- Document cognition now stores locators, not source bodies.
             UPDATE source_chunks SET content='' WHERE content IS NOT NULL AND content != '';
             """)
+    @staticmethod
+    def _temporal_text(value):
+        """valid_from / valid_to are TEXT columns, but the LLM sometimes returns
+        a dict like {"label": "Chapter 3", "sequence": 3}. Flatten to text."""
+        if value is None or isinstance(value, (str, int, float)):
+            return value
+        if isinstance(value, dict):
+            for k in ("label", "timeline", "story_time", "value"):
+                if isinstance(value.get(k), (str, int, float)) and value.get(k) != "":
+                    return value[k]
+        return json.dumps(value, ensure_ascii=False, default=str)
+
     @staticmethod
     def _json(value):
         """Serialize structured values at the SQLite boundary.
@@ -222,7 +235,7 @@ class MetadataDB:
         ident=s.get("id") or uuid.uuid4().hex
         with self.conn() as c:
             c.execute("""INSERT OR REPLACE INTO attribute_states VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (ident,s["entity_id"],s["attribute"],self._json(s.get("value")),s.get("summary",""),s.get("valid_from"),s.get("valid_to"),
+            (ident,s["entity_id"],s["attribute"],self._json(s.get("value")),s.get("summary",""),self._temporal_text(s.get("valid_from")),self._temporal_text(s.get("valid_to")),
              s.get("sequence",0),s.get("source_artifact"),self._json(s.get("source_locator")),s.get("created_at",now())))
         return ident
     def add_relation(self,r):

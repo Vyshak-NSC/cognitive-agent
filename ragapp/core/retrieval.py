@@ -51,6 +51,25 @@ def cognition_index_records(store):
             })
     return records
 
+_LLM_DROP = {"schema_version", "provenance", "timeline", "temporal_position",
+             "last_update_temporal_position", "created_at", "updated_at",
+             "knowledge_links", "source_locations"}
+_ATTR_KEEP = ("value", "summary", "valid_from", "valid_to")
+
+def _llm_view(rec):
+    out = {k: v for k, v in rec.items()
+           if k not in _LLM_DROP and v not in (None, "", [], {})}
+    if out.get("description"):
+        out.pop("knowledge", None)      # restates description
+    elif isinstance(out.get("knowledge"), dict):
+        out["knowledge"] = {c: v for c, v in out["knowledge"].items() if v}
+    if isinstance(out.get("attributes"), dict):
+        out["attributes"] = {
+            a: [{f: s[f] for f in _ATTR_KEEP if s.get(f) not in (None, "")} for s in states]
+            for a, states in out["attributes"].items()
+        }
+    return out
+
 
 class RetrievalStore:
     def __init__(self, store):
@@ -375,7 +394,7 @@ class RetrievalStore:
             return out
 
         # full: canonical object plus computed current state for entities.
-        out = dict(rec)
+        out = _llm_view(rec)
         out["kind"] = kind
         if kind == "entity":
             out["current_state"] = self._current_state(rec)

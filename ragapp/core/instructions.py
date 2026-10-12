@@ -1,11 +1,12 @@
 from __future__ import annotations
 import sqlite3, uuid
+from ragapp.core.db_path import project_db_path, merge_legacy_dbs
 from datetime import datetime, timezone
 
 def now(): return datetime.now(timezone.utc).isoformat()
 class InstructionStore:
     def __init__(self,store):
-        self.path=store.root/'.system'/'instructions.db'; self.path.parent.mkdir(parents=True,exist_ok=True); self.init()
+        self.path=project_db_path(store); self.init(); merge_legacy_dbs(self.path)
     def conn(self): c=sqlite3.connect(self.path); c.row_factory=sqlite3.Row; return c
     def init(self):
         with self.conn() as c: c.execute('''CREATE TABLE IF NOT EXISTS instructions(id TEXT PRIMARY KEY,scope TEXT NOT NULL,tagged_entity_id TEXT,content TEXT NOT NULL,status TEXT NOT NULL,origin TEXT NOT NULL,created_at TEXT NOT NULL,deactivated_at TEXT)'''); c.execute('CREATE INDEX IF NOT EXISTS idx_instr_status ON instructions(status)')

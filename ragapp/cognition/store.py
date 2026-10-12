@@ -232,13 +232,20 @@ class CognitionStore:
 
     def ensure_initialized(self):
         if self.exists():
-            current = self._read_json(self.master_metadata_path, {})
-            if int(current.get("schema_version", 0) or 0) < self.SCHEMA_VERSION:
-                # v8.4 canonical cognition is incompatible with the previous
-                # scattered projections. Force a clean source-derived rebuild.
+            current = None
+            for attempt in range(6):                      # tolerate a file mid-replace
+                try:
+                    current = json.loads(self.master_metadata_path.read_text(encoding="utf-8"))
+                    break
+                except (OSError, json.JSONDecodeError):
+                    time.sleep(0.05 * (attempt + 1))
+            if current is None:
+                raise RuntimeError("Master metadata unreadable; refusing to reinitialize.")
+            if "schema_version" in current and int(current["schema_version"] or 0) < self.SCHEMA_VERSION:
                 self._migrate_legacy_cognition()
                 return True
             return False
+
         self._write_master({
             "schema_version": self.SCHEMA_VERSION,
             "temporal_model_version": self.TEMPORAL_MODEL_VERSION,
@@ -349,39 +356,61 @@ class CognitionStore:
         path = self._object_path(kind, str(ident))
         return self._read_json(path, {})
 
-    _STOP = frozenset("the a an and or of to in on at by for with from as is are was were be been this that these those it its into than then".split())
-
-    @classmethod
-    def _content_tokens(cls, text: str) -> frozenset:
-        """Lower-cased content words, crudely stemmed (first 5 letters) so rewordings compare equal."""
-        return frozenset(w[:5] for w in re.findall(r"[a-z0-9]+", str(text).casefold()) if len(w) > 2 and w not in cls._STOP)
-
-    @classmethod
-    def _append_text(cls, existing: str, addition: str) -> str:
+    @staticmethod
+    def _append_text(existing: str, addition: str) -> str:
         addition = str(addition or "").strip()
         existing = str(existing or "").strip()
         if not addition:
             return existing
-        # Paragraphs are atomic knowledge units and later additions never replace earlier ones.
-        # Recompiling the same source restates the same facts in new words, so a paragraph that
-        # (nearly) restates one we already hold is dropped. If it restates it with clearly more
-        # detail it takes the place of the thinner version, which it fully contains.
+        # Paragraphs are atomic knowledge units and later additions never
+        # *discard* earlier information. Beyond exact repeats we also handle
+        # near-verbatim repeats, which pile up when the same source is compiled
+        # more than once:
+        #   * new paragraph is (>=90%) contained in an existing one -> skipped
+        #   * existing paragraph is (>=90%) contained in a longer new one
+        #     (e.g. a shallow earlier note now stated in full) -> upgraded in place
+        # Only word overlap is used (no semantics). Every observation is also
+        # kept verbatim in the record's ``evolution`` history.
+        def _tokens(text):
+            return set(re.findall(r"\w+", text.casefold()))
+
         old = [x.strip() for x in existing.split("\n\n") if x.strip()]
         new = [x.strip() for x in addition.split("\n\n") if x.strip()]
+        seen = {re.sub(r"\s+", " ", x).casefold() for x in old}
+        old_tokens = [_tokens(x) for x in old]
         for paragraph in new:
-            toks = cls._content_tokens(paragraph)
-            for i, held in enumerate(old):
-                held_toks = cls._content_tokens(held)
-                shared = len(toks & held_toks)
-                union = len(toks | held_toks) or 1
-                if len(toks) >= 6 and len(held_toks) >= 6 and shared / union >= 0.8:
-                    if len(paragraph) > 1.25 * len(held) and shared / (len(held_toks) or 1) >= 0.85:
-                        old[i] = paragraph
-                    break
-                if paragraph.casefold() == held.casefold():
-                    break
-            else:
-                old.append(paragraph)
+            key = re.sub(r"\s+", " ", paragraph).casefold()
+            if key in seen:
+                continue
+            tokens = _tokens(paragraph)
+            if len(tokens) >= 6:
+                covered_by_old = False
+                superseded = []
+                for idx, ot in enumerate(old_tokens):
+                    if len(ot) < 6:
+                        continue
+                    shared = len(tokens & ot)
+                    if shared / len(tokens) >= 0.9:
+                        covered_by_old = True
+                        break
+                    if shared / len(ot) >= 0.9:
+                        superseded.append(idx)
+                if covered_by_old:
+                    continue
+                if superseded:
+                    first = superseded[0]
+                    seen.discard(re.sub(r"\s+", " ", old[first]).casefold())
+                    old[first] = paragraph
+                    old_tokens[first] = tokens
+                    for idx in reversed(superseded[1:]):
+                        seen.discard(re.sub(r"\s+", " ", old[idx]).casefold())
+                        del old[idx]
+                        del old_tokens[idx]
+                    seen.add(key)
+                    continue
+            old.append(paragraph)
+            old_tokens.append(tokens)
+            seen.add(key)
         return "\n\n".join(old)
 
     @staticmethod
@@ -803,8 +832,12 @@ class CognitionStore:
         # Never replace durable character/entity prose with the latest chunk.
         description_addition = update.get("description") or update.get("summary") or ""
         data["description"] = self._append_text(data.get("description", ""), description_addition)
-        if not data.get("summary") and description_addition:
-            data["summary"] = description_addition.strip().split("\n", 1)[0][:500]
+        if not data.get("summary"):
+            gist = str(update.get("gist") or "").strip()
+            if gist:
+                data["summary"] = gist[:500]
+            elif description_addition:
+                data["summary"] = description_addition.strip().split("\n", 1)[0][:500]
         for tag in update.get("tags") or []:
             if str(tag) not in data["tags"]:
                 data["tags"].append(str(tag))
@@ -940,6 +973,10 @@ class CognitionStore:
                 rec[key] = merged
             else:
                 rec[key] = value
+        if existing.get("summary"):
+            # The first gist is the file's skim-label; later additions describe
+            # only their own segment and must not overwrite it.
+            rec["summary"] = existing["summary"]
         rec["schema_version"] = self.SCHEMA_VERSION
         rec["id"] = ident
         rec["created_at"] = existing.get("created_at", now_iso())
@@ -1142,6 +1179,8 @@ class CognitionStore:
             rec["evolution"].append(observation)
         if source_artifact:
             self._record_provenance(rec, [{"artifact_id": source_artifact, "locator": (rel.get("document_locations") or [])}])
+        if not rec.get("summary") and rel.get("summary"):
+            rec["summary"] = str(rel["summary"]).strip()[:500]
         self._write_json(self._object_path("relationship", rid), rec)
 
         # SQLite remains a derived binary-relation index.  The canonical JSON
@@ -1254,6 +1293,8 @@ class CognitionStore:
             rec["evolution"].append(observation)
         if source_artifact:
             self._record_provenance(rec, [{"artifact_id": source_artifact, "locator": event.get("source_locator"), "locations": event.get("document_locations") or []}])
+        if not rec.get("summary") and event.get("summary"):
+            rec["summary"] = str(event["summary"]).strip()[:500]
         self._write_json(self._event_path(event_id), rec)
         self.db.add_event({"id": event_id, "description": rec["description"], "entities": rec["entities"], "timeline": pos.get("label") or timeline, "source_artifact": source_artifact, "source_locator": json.dumps(event.get("source_locator"), ensure_ascii=False) if isinstance(event.get("source_locator"), (dict, list)) else event.get("source_locator"), "created_at": rec["created_at"]})
         for eid in rec["entities"]:
