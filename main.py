@@ -1,6 +1,6 @@
-"""Entrypoint: `python -m ragapp` or `python main.py` opens the launcher menu."""
+def main():
+    print("Hello from cognitive-agent!")
 
-from ragapp.interfaces.launcher import main
 
 if __name__ == "__main__":
     main()
