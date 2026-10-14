@@ -1,7 +1,45 @@
 [project]
-name = "cognitive-agent"
-version = "0.1.0"
-description = "Add your description here"
+name = "cpa"
+dynamic = ["version"]  # single source: src/cpa/__init__.py
+description = "CPA: providers, service, API and UI"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic",
+    "fastapi",
+    "openai",
+    "python-dotenv",
+    "streamlit",
+    "uvicorn",
+]
+
+[project.scripts]
+cpa-api = "cpa.cli:api"
+cpa-ui = "cpa.cli:ui"
+
+[dependency-groups]
+dev = ["httpx", "pytest", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/cpa/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cpa"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"  # absolute imports only, so the layer test can read them
