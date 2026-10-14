@@ -65,6 +65,19 @@ def test_api_chat_round_trip(client):
     assert data["usage"]["total_tokens"] == 5
 
 
+def test_api_passes_extras_through_both_ways(client, fake_service):
+    body = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "x", "extras": {"gemini_parts": [{"text": "x"}]}},
+            {"role": "user", "content": "more"},
+        ]
+    }
+    assert client.post("/chat", json=body).status_code == 200
+    sent = fake_service.built[-1].seen
+    assert sent[1].extras == {"gemini_parts": [{"text": "x"}]}
+
+
 def test_api_rejects_a_tool_message_without_id(client):
     body = {"messages": [{"role": "tool", "content": "x"}]}
     assert client.post("/chat", json=body).status_code == 422

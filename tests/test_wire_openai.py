@@ -16,7 +16,7 @@ from cpa.providers import (
     wire_openai,
 )
 
-CFG = ProviderConfig(provider_id="openai", model="m", api_key="k")
+CFG = ProviderConfig(provider_id="openai", model="m", api_keys=("k",))
 
 
 class FakeClient:
@@ -61,7 +61,7 @@ def test_complete_text_and_usage():
 
 def test_complete_sends_tools_and_temperature_when_set():
     client = FakeClient(openai_response("ok"))
-    cfg = ProviderConfig(provider_id="openai", model="m", api_key="k", temperature=0.2)
+    cfg = ProviderConfig(provider_id="openai", model="m", api_keys=("k",), temperature=0.2)
     wire_openai.complete(client, cfg, [Message("user", "hi")], [ToolSpec("t", "d")])
     assert client.kwargs["tools"][0]["function"]["name"] == "t"
     assert client.kwargs["tool_choice"] == "auto" and client.kwargs["temperature"] == 0.2
@@ -86,3 +86,28 @@ def test_provider_failure_becomes_request_error():
     client = FakeClient(error=ValueError("boom"))
     with pytest.raises(RequestError, match="boom"):
         wire_openai.complete(client, CFG, [Message("user", "hi")], [])
+
+
+def test_extras_are_replayed_only_when_asked():
+    call = ToolCall("c1", "f", {})
+    turn = Message(
+        "assistant", None, [call], extras={"reasoning_details": [{"text": "t"}], "other": 1}
+    )
+    plain = wire_openai.to_messages([turn])[0]
+    replayed = wire_openai.to_messages([turn], ("reasoning_details",))[0]
+    assert "reasoning_details" not in plain and "other" not in replayed
+    assert replayed["reasoning_details"] == [{"text": "t"}]
+
+
+def test_parse_response_collects_requested_extras():
+    message = NS(content="ok", tool_calls=None, reasoning_details=[NS(text="t")])
+    response = NS(choices=[NS(message=message, finish_reason="stop")], usage=None, model="m")
+    result = wire_openai.parse_response(response, CFG, ("reasoning_details",))
+    assert result.extras == {"reasoning_details": [{"text": "t"}]}
+    assert result.message.extras == result.extras
+
+
+def test_no_choices_includes_provider_error_detail():
+    response = NS(choices=[], error=NS(message="no capacity"), usage=None, model="m")
+    with pytest.raises(RequestError, match="no capacity"):
+        wire_openai.parse_response(response, CFG)

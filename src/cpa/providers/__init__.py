@@ -2,8 +2,9 @@
 Azure OpenAI and Azure Anthropic."""
 
 from cpa.providers.factory import Provider, build_provider
-from cpa.providers.registry import DEFAULT_PROVIDER, SPECS, ProviderSpec, get_spec
+from cpa.providers.registry import DEFAULT_PROVIDER, SPECS, Option, ProviderSpec, get_spec
 from cpa.providers.types import (
+    Adapter,
     ChatResult,
     ConfigError,
     EmptyResponseError,
@@ -17,17 +18,19 @@ from cpa.providers.types import (
 )
 
 __all__ = [
+    "DEFAULT_PROVIDER",
+    "SPECS",
+    "Adapter",
     "ChatResult",
     "ConfigError",
-    "DEFAULT_PROVIDER",
     "EmptyResponseError",
     "Message",
+    "Option",
     "Provider",
     "ProviderConfig",
     "ProviderError",
     "ProviderSpec",
     "RequestError",
-    "SPECS",
     "ToolCall",
     "ToolSpec",
     "Usage",

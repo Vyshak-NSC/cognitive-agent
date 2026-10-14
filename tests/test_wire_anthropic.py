@@ -14,7 +14,7 @@ from cpa.providers import (
     wire_anthropic,
 )
 
-CFG = ProviderConfig(provider_id="anthropic", model="m", api_key="k", max_tokens=777)
+CFG = ProviderConfig(provider_id="anthropic", model="m", api_keys=("k",), max_tokens=777)
 
 
 class FakeClient:

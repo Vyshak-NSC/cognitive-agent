@@ -51,11 +51,21 @@ class Settings:
     def _value(self, name: str | None) -> str:
         return (self.env.get(name) or "").strip() if name else ""
 
+    def keys(self, provider_id: str) -> tuple[str, ...]:
+        """API keys for a provider, in order. Multi-key providers read KEY, KEY_2 .. KEY_9."""
+        spec = get_spec(provider_id)
+        names = [spec.key_env]
+        if spec.multi_key:
+            names += [f"{spec.key_env}_{n}" for n in range(2, 10)]
+        return tuple(v for v in (self._value(n) for n in names) if v)
+
     def missing(self, provider_id: str) -> list[str]:
         """Names of required variables that are not set for this provider."""
         spec = get_spec(provider_id)
-        needed = [spec.key_env] + ([spec.endpoint_env] if spec.endpoint_env else [])
-        return [name for name in needed if not self._value(name)]
+        missing = [] if self.keys(provider_id) else [spec.key_env]
+        if spec.endpoint_env and not self._value(spec.endpoint_env):
+            missing.append(spec.endpoint_env)
+        return missing
 
     def default_model(self, provider_id: str) -> str:
         spec = get_spec(provider_id)
@@ -68,9 +78,10 @@ class Settings:
         return ProviderConfig(
             provider_id=provider_id,
             model=(model or "").strip() or self.default_model(provider_id),
-            api_key=self._value(spec.key_env),
+            api_keys=self.keys(provider_id),
             endpoint=self._value(spec.endpoint_env) or None,
             timeout=self.timeout,
             max_tokens=self.max_tokens,
             temperature=temperature,
+            options={o.name: self._value(o.env) or o.default for o in spec.options},
         )

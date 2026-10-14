@@ -1,7 +1,8 @@
 """OpenAI chat-completions wire format.
 
-Used by OpenAI, Azure OpenAI, Gemini and OpenRouter. They differ only in how the
-client is built (see factory.py), not in how a request or response looks.
+Shared by every adapter that speaks this dialect: OpenAI, Azure OpenAI and
+OpenRouter. They differ in client, auth and extras, not in what a message,
+tool or response looks like, so the translation is written once here.
 """
 
 from __future__ import annotations
@@ -20,31 +21,39 @@ from cpa.providers.types import (
     ToolSpec,
     Usage,
 )
-from cpa.providers.util import parse_arguments
+from cpa.providers.util import parse_arguments, to_plain
 
 
-def to_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
+def to_messages(
+    messages: Sequence[Message], extras_keys: Sequence[str] = ()
+) -> list[dict[str, Any]]:
+    """Canonical messages -> wire messages.
+
+    `extras_keys` names Message.extras entries to copy onto assistant tool-call
+    turns (OpenRouter replays its reasoning blocks this way). Other providers
+    pass nothing, so data from another provider is never sent to them.
+    """
     out: list[dict[str, Any]] = []
     for m in messages:
         if m.role == "assistant":
             if m.tool_calls:
-                out.append(
-                    {
-                        "role": "assistant",
-                        "content": m.content,
-                        "tool_calls": [
-                            {
-                                "id": c.id,
-                                "type": "function",
-                                "function": {
-                                    "name": c.name,
-                                    "arguments": json.dumps(c.arguments, ensure_ascii=False),
-                                },
-                            }
-                            for c in m.tool_calls
-                        ],
-                    }
-                )
+                turn: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": m.content,
+                    "tool_calls": [
+                        {
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.name,
+                                "arguments": json.dumps(c.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for c in m.tool_calls
+                    ],
+                }
+                turn.update({k: m.extras[k] for k in extras_keys if m.extras.get(k)})
+                out.append(turn)
             elif m.content:  # empty assistant turns are dropped
                 out.append({"role": "assistant", "content": m.content})
         elif m.role == "tool":
@@ -83,35 +92,33 @@ def _tool_calls(message: Any) -> list[ToolCall]:
     return calls
 
 
-def complete(
-    client: Any, cfg: ProviderConfig, messages: Sequence[Message], tools: Sequence[ToolSpec]
+def parse_response(
+    response: Any, cfg: ProviderConfig, extras_keys: Sequence[str] = ()
 ) -> ChatResult:
-    kwargs: dict[str, Any] = {"model": cfg.model, "messages": to_messages(messages)}
-    if tools:
-        kwargs["tools"] = to_tools(tools)
-        kwargs["tool_choice"] = "auto"
-    if cfg.temperature is not None:
-        kwargs["temperature"] = cfg.temperature
-
-    try:
-        response = client.chat.completions.create(**kwargs)
-    except Exception as exc:
+    """A chat-completions response (any SDK's object or a plain namespace) -> ChatResult."""
+    if not getattr(response, "choices", None):
+        detail = getattr(response, "error", None)
         raise RequestError(
-            f"{cfg.provider_id} request failed for model '{cfg.model}': {exc}"
-        ) from exc
-
-    if not response.choices:
-        raise RequestError(f"{cfg.provider_id} returned no choices for model '{cfg.model}'.")
+            f"{cfg.provider_id} returned no choices for model '{cfg.model}'."
+            + (f" Provider error: {to_plain(detail)}" if detail else "")
+        )
     choice = response.choices[0]
     text = getattr(choice.message, "content", None)
     calls = _tool_calls(choice.message)
     finish = getattr(choice, "finish_reason", None)
+    finish = None if finish is None else str(finish)
 
     if not calls and not (text or "").strip():
         raise EmptyResponseError(
-            f"{cfg.provider_id} returned an empty response for model '{cfg.model}' "
-            f"(finish_reason={finish})."
+            f"{cfg.provider_id} returned an empty response for model "
+            f"'{getattr(response, 'model', None) or cfg.model}' (finish_reason={finish})."
         )
+
+    extras = {}
+    for key in extras_keys:
+        value = getattr(choice.message, key, None)
+        if value:
+            extras[key] = to_plain(value)
 
     u = getattr(response, "usage", None)
     return ChatResult(
@@ -127,4 +134,25 @@ def complete(
         if u is not None
         else None,
         finish_reason=finish,
+        extras=extras,
     )
+
+
+def complete(
+    client: Any, cfg: ProviderConfig, messages: Sequence[Message], tools: Sequence[ToolSpec]
+) -> ChatResult:
+    """One request through an OpenAI-SDK-style client (OpenAI, Azure OpenAI)."""
+    kwargs: dict[str, Any] = {"model": cfg.model, "messages": to_messages(messages)}
+    if tools:
+        kwargs["tools"] = to_tools(tools)
+        kwargs["tool_choice"] = "auto"
+    if cfg.temperature is not None:
+        kwargs["temperature"] = cfg.temperature
+
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        raise RequestError(
+            f"{cfg.provider_id} request failed for model '{cfg.model}': {exc}"
+        ) from exc
+    return parse_response(response, cfg)

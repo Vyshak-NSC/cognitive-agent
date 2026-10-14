@@ -7,8 +7,9 @@ any provider.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 Role = Literal["system", "user", "assistant", "tool"]
 
@@ -58,6 +59,9 @@ class Message:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)  # assistant only
     tool_call_id: str | None = None  # tool only
+    # Provider-specific data that must come back unchanged on the next request
+    # (Gemini thought signatures, OpenRouter reasoning blocks). Other providers ignore it.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.role == "tool" and not self.tool_call_id:
@@ -79,11 +83,12 @@ class ChatResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: Usage | None = None
     finish_reason: str | None = None
+    extras: dict[str, Any] = field(default_factory=dict)  # see Message.extras
 
     @property
     def message(self) -> Message:
         """The assistant message to append to the conversation history."""
-        return Message("assistant", self.text, list(self.tool_calls))
+        return Message("assistant", self.text, list(self.tool_calls), extras=dict(self.extras))
 
 
 # ---------------------------------------------------------------- config
@@ -95,8 +100,19 @@ class ProviderConfig:
 
     provider_id: str
     model: str
-    api_key: str = field(repr=False)
+    api_keys: tuple[str, ...] = field(repr=False)  # first is primary; more are fallbacks
     endpoint: str | None = None
     timeout: float = 120.0
     max_tokens: int = 8192  # only sent where the API requires it (Anthropic)
     temperature: float | None = None
+    options: dict[str, str] = field(default_factory=dict)  # provider-specific, from the registry
+
+    @property
+    def api_key(self) -> str:
+        return self.api_keys[0] if self.api_keys else ""
+
+
+class Adapter(Protocol):
+    """What every provider adapter offers. One adapter per provider."""
+
+    def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] = ()) -> ChatResult: ...

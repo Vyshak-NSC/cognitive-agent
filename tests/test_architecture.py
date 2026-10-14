@@ -10,9 +10,18 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 
 # Lowest first. A module may import only modules in a strictly lower layer.
 LAYERS = [
-    ["cpa", "cpa.providers.types"],
+    ["cpa", "cpa.providers.types", "cpa.providers.adapters"],
     ["cpa.providers.registry", "cpa.providers.util"],
     ["cpa.providers.wire_openai", "cpa.providers.wire_anthropic"],
+    ["cpa.providers.adapters.base"],
+    [
+        "cpa.providers.adapters.azure",
+        "cpa.providers.adapters.openai",
+        "cpa.providers.adapters.anthropic",
+        "cpa.providers.adapters.gemini",
+        "cpa.providers.adapters.openrouter",
+    ],
+    ["cpa.providers.adapters.azure_openai", "cpa.providers.adapters.azure_anthropic"],
     ["cpa.providers.factory"],
     ["cpa.providers"],  # the package's public exports
     ["cpa.settings"],
@@ -64,11 +73,9 @@ def test_imports_only_go_downwards():
 
 
 def test_provider_env_names_live_only_in_the_registry():
-    names = re.findall(
-        r'(?:key_env|model_env|endpoint_env)\s*=\s*"([A-Z_]+)"',
-        (SRC / "cpa/providers/registry.py").read_text(),
-    )
-    names += ["AZURE_FOUNDRY_API_KEY", "AZURE_FOUNDRY_ENDPOINT"]
+    registry = (SRC / "cpa/providers/registry.py").read_text(encoding="utf-8")
+    names = set(re.findall(r'"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"', registry))
+    assert {"GEMINI_API_KEY", "OPENROUTER_ROUTING", "AZURE_FOUNDRY_ENDPOINT"} <= names
     for name, path in modules().items():
         if name == "cpa.providers.registry":
             continue
