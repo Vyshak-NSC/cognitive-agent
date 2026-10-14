@@ -43,29 +43,37 @@ beforeEach(() => {
 async function ready() {
   const user = userEvent.setup();
   render(<App />);
-  await screen.findByRole("button", { name: /Gemini/ });
+  await screen.findByRole("button", { name: "Settings" });
+  await screen.findByText("Chat workspace");
   return user;
 }
 
 describe("provider list", () => {
   it("selects the first set-up provider and says what an unset one needs", async () => {
     await ready();
-    expect(screen.getByRole("button", { name: /Gemini/ })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByText("Add OPENAI_API_KEY")).toBeInTheDocument();
-    expect(screen.getByText("Version 11.0.2")).toBeInTheDocument();
+    expect(screen.getByText("Gemini · gemini-x")).toBeInTheDocument();
+    expect(screen.getByText("v11.0.2")).toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("combobox", { name: "Provider" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Provider" }), "openai");
+    expect(screen.getByText(/OpenAI \(GPT\) needs configuration: OPENAI_API_KEY/)).toBeInTheDocument();
   });
 
   it("blocks sending to a provider that is not set up, and names the missing variable", async () => {
     const user = await ready();
-    await user.click(screen.getByRole("button", { name: /^OpenAI \(GPT\)/ }));
-    expect(screen.getByText(/OpenAI \(GPT\) isn't set up\. Add OPENAI_API_KEY/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Provider" }), "openai");
+    expect(screen.getByText(/OpenAI \(GPT\) needs configuration: OPENAI_API_KEY/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Done · Back to chat/ }));
     await user.type(screen.getByLabelText("Message"), "hi");
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
   });
 
   it("uses the provider's own label for the model field", async () => {
     const user = await ready();
-    await user.click(screen.getByRole("button", { name: /Azure OpenAI/ }));
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Provider" }), "azure_openai");
     expect(screen.getByLabelText("Deployment name")).toHaveValue("dep");
   });
 });
@@ -110,7 +118,9 @@ describe("chatting", () => {
     await user.type(screen.getByLabelText("Message"), "one{Enter}");
     await screen.findByText("Hello from the model");
 
-    await user.click(screen.getByRole("button", { name: /Azure OpenAI/ }));
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Provider" }), "azure_openai");
+    await user.click(screen.getByRole("button", { name: /Done · Back to chat/ }));
     chatHandler = () => json(200, reply({ provider: "azure_openai", model: "dep-served", text: "Second voice" }));
     await user.type(screen.getByLabelText("Message"), "two{Enter}");
     await screen.findByText("Second voice");
@@ -123,8 +133,10 @@ describe("chatting", () => {
 
   it("sends the system prompt and temperature when set", async () => {
     const user = await ready();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
     await user.type(screen.getByLabelText("System prompt"), "Be brief");
     await user.click(screen.getByLabelText("Set temperature"));
+    await user.click(screen.getByRole("button", { name: /Done · Back to chat/ }));
     await user.type(screen.getByLabelText("Message"), "hi{Enter}");
     await screen.findByText("Hello from the model");
     expect(chatCalls[0]).toMatchObject({ system: "Be brief", temperature: 1 });
