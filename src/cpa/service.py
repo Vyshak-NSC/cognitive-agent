@@ -31,6 +31,7 @@ class ProviderInfo:
     model_label: str
     configured: bool
     missing: list[str]  # environment variables still to set
+    default: bool = False  # True for the provider named by CPA_PROVIDER
 
 
 @dataclass
@@ -61,6 +62,7 @@ class Service:
                 model_label=spec.model_label,
                 configured=not (missing := self.settings.missing(spec.id)),
                 missing=missing,
+                default=spec.id == self.settings.default_provider
             )
             for spec in SPECS.values()
         ]

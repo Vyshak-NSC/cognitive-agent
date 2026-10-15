@@ -57,6 +57,15 @@ def test_complete_always_sends_max_tokens_and_parses_blocks():
     assert result.usage.total_tokens == 6 and result.finish_reason == "tool_use"
 
 
+def test_complete_sends_temperature_only_when_set():
+    client = FakeClient(anthropic_response([NS(type="text", text="ok")]))
+    wire_anthropic.complete(client, CFG, [Message("user", "x")], [])
+    assert "temperature" not in client.kwargs
+    warm = ProviderConfig(provider_id="anthropic", model="m", api_keys=("k",), temperature=0.3)
+    wire_anthropic.complete(client, warm, [Message("user", "x")], [])
+    assert client.kwargs["temperature"] == 0.3
+
+
 def test_empty_response_raises():
     client = FakeClient(anthropic_response([NS(type="text", text="")]))
     with pytest.raises(EmptyResponseError):

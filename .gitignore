@@ -12,4 +12,6 @@ projects/
 .streamlit/secrets.toml
 *.zip
 *.egg-info/
-*/node_modules/
+**/node_modules/
+dist/
+frontend/*

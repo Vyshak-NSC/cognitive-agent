@@ -36,7 +36,7 @@ class ProviderSpec:
     endpoint_env: str | None = None  # user-supplied resource endpoint (Azure)
     endpoint_suffix: str = ""  # appended to that endpoint's origin
     options: tuple[Option, ...] = ()
-
+    
 
 _AZURE_KEY = "AZURE_FOUNDRY_API_KEY"  # both Azure providers share one Foundry resource
 _AZURE_ENDPOINT = "AZURE_FOUNDRY_ENDPOINT"
@@ -104,7 +104,7 @@ _SPECS = (
         model_env="AZURE_ANTHROPIC_MODEL",
         model_label="Deployment name",
         endpoint_env=_AZURE_ENDPOINT,
-        endpoint_suffix="/anthropic",
+        endpoint_suffix="/anthropic"
     ),
 )
 

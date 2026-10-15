@@ -53,7 +53,7 @@ def test_provider_options_come_from_the_environment_with_defaults():
     assert options["fallback_models"] == "a/b, c/d" and options["site_name"] == "Mine"
     assert options["require_parameters"] == "false" and options["retry_budget_seconds"] == "45"
     assert s.provider_config("openai").options == {}
-
+    
 
 def test_bad_default_provider_fails_early():
     with pytest.raises(ConfigError):

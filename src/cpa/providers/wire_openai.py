@@ -11,6 +11,7 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from cpa.providers.temperature import call_with_temperature_fallback
 from cpa.providers.types import (
     ChatResult,
     EmptyResponseError,
@@ -150,7 +151,10 @@ def complete(
         kwargs["temperature"] = cfg.temperature
 
     try:
-        response = client.chat.completions.create(**kwargs)
+        response = call_with_temperature_fallback(
+            client.chat.completions.create,
+            kwargs,
+        )
     except Exception as exc:
         raise RequestError(
             f"{cfg.provider_id} request failed for model '{cfg.model}': {exc}"

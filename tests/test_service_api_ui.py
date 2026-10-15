@@ -9,7 +9,7 @@ from streamlit.testing.v1 import AppTest
 import cpa.service as service_module
 from conftest import FakeProvider
 from cpa import api as api_module
-from cpa.providers import ConfigError, EmptyResponseError, Message, RequestError
+from cpa.providers import SPECS, ConfigError, EmptyResponseError, Message, RequestError
 from cpa.service import ChatRequest, Service
 from cpa.settings import Settings
 
@@ -33,6 +33,12 @@ def test_service_lists_providers_with_status():
     service = Service(Settings.load({"GEMINI_API_KEY": "k"}))
     status = {p.id: p.configured for p in service.providers()}
     assert status["gemini"] is True and status["openai"] is False
+
+
+def test_service_marks_the_default_provider():
+    service = Service(Settings.load({"CPA_PROVIDER": "openai"}))
+    flags = {p.id: p.default for p in service.providers()}
+    assert flags["openai"] is True and sum(flags.values()) == 1
 
 
 def test_service_uses_default_provider_and_adds_system(fake_service):
@@ -105,20 +111,46 @@ def test_api_maps_errors(settings, error, status):
 
 
 # -------------------------------------------------------------------- UI
-
-
 def test_ui_chat_flow(monkeypatch, fake_service):
     monkeypatch.setattr(service_module, "get_service", lambda: fake_service)
     app = AppTest.from_file(UI, default_timeout=30).run()
     assert not app.exception
-    assert len(app.sidebar.selectbox[0].options) == 6
 
     app.chat_input[0].set_value("hi there").run()
     assert not app.exception
-    roles = [m.name for m in app.chat_message]
-    assert roles == ["user", "assistant"]
+    assert [m.name for m in app.chat_message] == ["user", "assistant"]
     assert "hello" in app.chat_message[1].markdown[0].value
     assert fake_service.built[-1].seen[-1].content == "hi there"
+    assert app.session_state["chats"][0]["title"] == "hi there"
+
+
+def test_ui_settings_start_on_the_default_provider(monkeypatch, fake_service):
+    monkeypatch.setattr(service_module, "get_service", lambda: fake_service)
+    app = AppTest.from_file(UI, default_timeout=30).run()
+    app.radio[0].set_value("settings").run()
+    assert not app.exception
+    provider = app.selectbox[1]  # the first selectbox is the header's project picker
+    assert len(provider.options) == 6
+    assert provider.value == "gemini"
+
+
+def test_ui_opens_on_cpa_provider_even_when_it_is_not_first(monkeypatch):
+    service = Service(Settings.load({"CPA_PROVIDER": "azure_openai"}))
+    monkeypatch.setattr(service_module, "get_service", lambda: service)
+    app = AppTest.from_file(UI, default_timeout=30).run()
+    app.radio[0].set_value("settings").run()
+    assert app.selectbox[1].value == "azure_openai"
+    assert "needs configuration" in app.warning[0].value
+
+
+def test_ui_settings_survive_leaving_the_settings_page(monkeypatch, fake_service):
+    monkeypatch.setattr(service_module, "get_service", lambda: fake_service)
+    app = AppTest.from_file(UI, default_timeout=30).run()
+    app.radio[0].set_value("settings").run()
+    app.text_area[0].set_value("Be brief").run()
+    app.radio[0].set_value("chat").run()
+    app.chat_input[0].set_value("hi").run()
+    assert fake_service.built[-1].seen[0].content == "Be brief"
 
 
 def test_ui_shows_error_and_keeps_history_clean(monkeypatch, settings):
@@ -129,4 +161,4 @@ def test_ui_shows_error_and_keeps_history_clean(monkeypatch, settings):
     app = AppTest.from_file(UI, default_timeout=30).run()
     app.chat_input[0].set_value("hi").run()
     assert "provider down" in app.error[0].value
-    assert app.session_state["turns"] == []
+    assert app.session_state["chats"][0]["turns"] == []

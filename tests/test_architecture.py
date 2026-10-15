@@ -11,7 +11,7 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 # Lowest first. A module may import only modules in a strictly lower layer.
 LAYERS = [
     ["cpa", "cpa.providers.types", "cpa.providers.adapters"],
-    ["cpa.providers.registry", "cpa.providers.util"],
+    ["cpa.providers.registry", "cpa.providers.util", "cpa.providers.temperature"],
     ["cpa.providers.wire_openai", "cpa.providers.wire_anthropic"],
     ["cpa.providers.adapters.base"],
     [
