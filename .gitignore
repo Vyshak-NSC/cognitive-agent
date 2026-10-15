@@ -15,3 +15,4 @@ projects/
 **/node_modules/
 dist/
 frontend/*
+.ruff_cache
